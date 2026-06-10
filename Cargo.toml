@@ -1,0 +1,22 @@
+[package]
+name = "libzstd-bitexact"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pure-Rust reimplementation of Zstandard, aiming for bit-exact parity with the C libzstd"
+license = "BSD-3-Clause"
+repository = "https://github.com/danifunker/libzstd-bitexact-rs"
+keywords = ["zstd", "zstandard", "compression", "decompression"]
+categories = ["compression"]
+
+[dependencies]
+# Intentionally empty: the implementation is dependency-free.
+
+[dev-dependencies]
+# The real C libzstd, used exclusively as the differential-testing oracle.
+zstd = "0.13"
+
+[profile.dev]
+# The decoder is exercised on megabytes of data in tests; opt-level 1 keeps
+# debug test runs fast without hurting compile times much.
+opt-level = 1

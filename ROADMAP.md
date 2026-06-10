@@ -20,10 +20,18 @@ decisions — is bit-identical to the C implementation.
 
 ## M2 — Decompression completeness
 
-- [ ] Streaming decompression (`ZSTD_decompressStream` semantics, window
-      enforcement, `windowLogMax` parameter).
-- [ ] Dictionaries: raw-content and trained (entropy-table + rep-offset
-      initialization from `ZDICT` format), `dictID` validation.
+- [x] Dictionaries: raw-content and trained (entropy-table + rep-offset
+      initialization from `ZDICT` format), `dictID` validation. Matches that
+      reach back into the dictionary window (the `extDict` case) are handled
+      across the dict/output seam. Exposed via `DecodeOptions::dictionary`.
+- [x] `windowLogMax` parameter (`DecodeOptions::window_log_max`), enforced on
+      both windowed and single-segment frames and clamped to the format
+      maximum. Accept/reject parity is differential-tested against C's
+      streaming decoder (the one-shot `ZSTD_decompressDCtx` path ignores the
+      parameter and always allows up to `ZSTD_WINDOWLOG_MAX`, which our default
+      matches).
+- [ ] Streaming decompression (`ZSTD_decompressStream` semantics: incremental
+      input/output, window-buffer eviction beyond the kept history).
 - [ ] Long-distance matching frames (windows beyond 128 MiB).
 - [ ] Error-code parity audit: map every C `ZSTD_ErrorCode` path and assert
       matching rejection in differential fuzzing.

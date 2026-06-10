@@ -18,6 +18,7 @@ pub(crate) struct FseEntry {
     pub base: u16,
 }
 
+#[derive(Clone)]
 pub(crate) struct FseTable {
     pub table_log: u32,
     pub entries: Vec<FseEntry>,

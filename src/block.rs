@@ -5,6 +5,7 @@
 //! `ZSTD_decompressSequences` decode/execute loop.
 
 use crate::bits::ReverseBitReader;
+use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::fse::{self, FseState, FseTable};
 use crate::huffman::{self, HuffmanTable};
@@ -86,28 +87,28 @@ const OF_DEFAULT_NORM: [i16; 29] = [
 ];
 const OF_DEFAULT_LOG: u32 = 5;
 
-struct SeqTableSpec {
+pub(crate) struct SeqTableSpec {
     default_norm: &'static [i16],
     default_log: u32,
     /// Largest valid symbol (`MaxLL` / `MaxOff` / `MaxML`).
-    max_symbol: u32,
+    pub(crate) max_symbol: u32,
     /// Largest valid accuracy log (`LLFSELog` / `OffFSELog` / `MLFSELog`).
-    max_log: u32,
+    pub(crate) max_log: u32,
 }
 
-const LL_SPEC: SeqTableSpec = SeqTableSpec {
+pub(crate) const LL_SPEC: SeqTableSpec = SeqTableSpec {
     default_norm: &LL_DEFAULT_NORM,
     default_log: LL_DEFAULT_LOG,
     max_symbol: 35,
     max_log: 9,
 };
-const OF_SPEC: SeqTableSpec = SeqTableSpec {
+pub(crate) const OF_SPEC: SeqTableSpec = SeqTableSpec {
     default_norm: &OF_DEFAULT_NORM,
     default_log: OF_DEFAULT_LOG,
     max_symbol: 31,
     max_log: 8,
 };
-const ML_SPEC: SeqTableSpec = SeqTableSpec {
+pub(crate) const ML_SPEC: SeqTableSpec = SeqTableSpec {
     default_norm: &ML_DEFAULT_NORM,
     default_log: ML_DEFAULT_LOG,
     max_symbol: 52,
@@ -136,18 +137,41 @@ impl FrameContext {
             rep: [1, 4, 8],
         }
     }
+
+    /// Seed a frame context from a dictionary (`ZSTD_decompress_insertDictionary`).
+    ///
+    /// A formatted dictionary supplies the Huffman and FSE tables (so the
+    /// first block may use `Repeat_Mode`) and the dictionary-relative repeat
+    /// offsets; a raw-content dictionary supplies neither and behaves like
+    /// [`FrameContext::new`]. With no dictionary, this is exactly
+    /// [`FrameContext::new`].
+    pub(crate) fn with_dictionary(dict: Option<&Dictionary>) -> Self {
+        match dict {
+            None => Self::new(),
+            Some(d) => FrameContext {
+                huffman: d.huffman().cloned(),
+                ll: d.ll().cloned(),
+                of: d.of().cloned(),
+                ml: d.ml().cloned(),
+                rep: d.rep(),
+            },
+        }
+    }
 }
 
 /// Decode one compressed block into `out`.
 ///
 /// `frame_base` is the offset in `out` where the current frame started:
-/// matches may not reach back across it. `block_size_max` is
-/// `min(window_size, 128 KiB)`; `limit` caps `out.len()` overall.
+/// matches reaching past it draw from `dict_content` (the dictionary window
+/// preceding the frame), and may not reach past the start of that.
+/// `block_size_max` is `min(window_size, 128 KiB)`; `limit` caps `out.len()`
+/// overall.
 pub(crate) fn decode_compressed_block(
     ctx: &mut FrameContext,
     src: &[u8],
     out: &mut Vec<u8>,
     frame_base: usize,
+    dict_content: &[u8],
     block_size_max: usize,
     limit: usize,
 ) -> Result<(), Error> {
@@ -158,6 +182,7 @@ pub(crate) fn decode_compressed_block(
         &literals,
         out,
         frame_base,
+        dict_content,
         block_size_max,
         limit,
     )
@@ -329,36 +354,71 @@ fn resolve_offset(of_value: u64, lit_len: u64, rep: &mut [u64; 3]) -> Result<u64
     }
 }
 
-/// Append `len` bytes copied from `offset` bytes back, handling overlap with
-/// the run-extending semantics matches require.
-fn copy_match(out: &mut Vec<u8>, offset: usize, len: usize) {
-    debug_assert!(offset >= 1 && offset <= out.len());
-    if offset == 1 {
-        let byte = out[out.len() - 1];
-        let new_len = out.len() + len;
-        out.resize(new_len, byte);
+/// Append `len` bytes of a match into `out`.
+///
+/// The match source lies `offset` bytes back in the virtual history
+/// `dict_content` followed by `out[frame_base..]`. `cur` is the frame output
+/// already produced (`out.len() - frame_base`). When the match reaches no
+/// further than the frame's own output (`offset <= cur`) it is a pure
+/// in-buffer copy with the usual run-extending overlap; otherwise it begins in
+/// the dictionary window and is copied byte by byte (this only happens near
+/// the start of a dictionary-compressed frame).
+fn copy_match(
+    out: &mut Vec<u8>,
+    frame_base: usize,
+    dict_content: &[u8],
+    offset: usize,
+    len: usize,
+) {
+    let cur = out.len() - frame_base;
+    debug_assert!(offset >= 1 && offset <= cur + dict_content.len());
+
+    if offset <= cur {
+        if offset == 1 {
+            let byte = out[out.len() - 1];
+            out.resize(out.len() + len, byte);
+            return;
+        }
+        if offset >= len {
+            let start = out.len() - offset;
+            out.extend_from_within(start..start + len);
+            return;
+        }
+        let mut remaining = len;
+        while remaining > 0 {
+            let chunk = remaining.min(offset);
+            let start = out.len() - offset;
+            out.extend_from_within(start..start + chunk);
+            remaining -= chunk;
+        }
         return;
     }
-    if offset >= len {
-        let start = out.len() - offset;
-        out.extend_from_within(start..start + len);
-        return;
-    }
-    let mut remaining = len;
-    while remaining > 0 {
-        let chunk = remaining.min(offset);
-        let start = out.len() - offset;
-        out.extend_from_within(start..start + chunk);
-        remaining -= chunk;
+
+    // The match starts inside the dictionary window. Index `i` of the match
+    // reads virtual byte `dict_content.len() + cur - offset + i`, where the
+    // virtual buffer is `dict_content ++ out[frame_base..]` and grows as we
+    // append — a standard overlapping copy spanning the dict/output seam.
+    let dlen = dict_content.len();
+    let start_v = dlen + cur - offset;
+    for i in 0..len {
+        let s = start_v + i;
+        let b = if s < dlen {
+            dict_content[s]
+        } else {
+            out[frame_base + (s - dlen)]
+        };
+        out.push(b);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_and_execute_sequences(
     ctx: &mut FrameContext,
     src: &[u8],
     literals: &[u8],
     out: &mut Vec<u8>,
     frame_base: usize,
+    dict_content: &[u8],
     block_size_max: usize,
     limit: usize,
 ) -> Result<(), Error> {
@@ -454,11 +514,19 @@ fn decode_and_execute_sequences(
         out.extend_from_slice(&literals[lit_pos..lit_pos + lit_len]);
         lit_pos += lit_len;
 
-        let history = (out.len() - frame_base) as u64;
+        // Available history is the frame output so far plus the dictionary
+        // window that precedes it (`oLitEnd - virtualStart` in the C decoder).
+        let history = (out.len() - frame_base) as u64 + dict_content.len() as u64;
         if offset > history {
             return Err(Error::Corrupted("match offset beyond frame history"));
         }
-        copy_match(out, offset as usize, match_len as usize);
+        copy_match(
+            out,
+            frame_base,
+            dict_content,
+            offset as usize,
+            match_len as usize,
+        );
 
         if out.len() - block_start > block_size_max {
             return Err(Error::Corrupted("block output exceeds block size limit"));
@@ -491,16 +559,42 @@ mod tests {
     #[test]
     fn copy_match_handles_overlap() {
         let mut out = b"abc".to_vec();
-        copy_match(&mut out, 3, 7);
+        copy_match(&mut out, 0, &[], 3, 7);
         assert_eq!(out, b"abcabcabca");
 
         let mut out = b"xy".to_vec();
-        copy_match(&mut out, 1, 4);
+        copy_match(&mut out, 0, &[], 1, 4);
         assert_eq!(out, b"xyyyyy");
 
         let mut out = b"hello world".to_vec();
-        copy_match(&mut out, 11, 5);
+        copy_match(&mut out, 0, &[], 11, 5);
         assert_eq!(out, b"hello worldhello");
+    }
+
+    #[test]
+    fn copy_match_reaches_into_dictionary() {
+        // Virtual history is `dict ++ out[frame_base..]`. Here frame_base = 2
+        // (the leading "XX" is prior-frame output, off limits); the dictionary
+        // holds "DICT", and the frame output so far is "ab", so the virtual
+        // buffer is "DICTab".
+        let dict = b"DICT";
+
+        // Straddle the seam: offset 4 from position 6 starts at 'C', copying
+        // "CT" from the dictionary and "ab" from the frame output.
+        let mut out = b"XXab".to_vec();
+        copy_match(&mut out, 2, dict, 4, 4);
+        assert_eq!(&out[2..], b"abCTab");
+
+        // A match wholly inside the dictionary.
+        let mut out = b"XX".to_vec();
+        copy_match(&mut out, 2, dict, 4, 4);
+        assert_eq!(&out[2..], b"DICT");
+
+        // A match straddling the seam that then run-extends over itself:
+        // "CT" from the dictionary, then the freshly written bytes repeat.
+        let mut out = b"XX".to_vec();
+        copy_match(&mut out, 2, dict, 2, 5);
+        assert_eq!(&out[2..], b"CTCTC");
     }
 
     #[test]

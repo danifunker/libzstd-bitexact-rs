@@ -27,9 +27,16 @@ pub enum Error {
     /// The frame's XXH64 content checksum did not match
     /// (`ZSTD_error_checksum_wrong`).
     ChecksumMismatch { expected: u32, actual: u32 },
-    /// The frame was compressed with a dictionary, which this decoder does
-    /// not support yet (`ZSTD_error_dictionary_wrong`).
+    /// The frame was compressed with a dictionary, but none was supplied to
+    /// the decoder (`ZSTD_error_dictionary_wrong`). The payload is the
+    /// dictionary ID the frame asks for.
     DictionaryRequired(u32),
+    /// A dictionary was supplied, but its ID does not match the one the frame
+    /// requires (`ZSTD_error_dictionary_wrong`).
+    DictionaryWrong { expected: u32, actual: u32 },
+    /// A supplied dictionary buffer began with the `ZDICT` magic but could not
+    /// be parsed (`ZSTD_error_dictionary_corrupted`).
+    DictionaryCorrupted,
     /// The frame declared a content size that does not match the number of
     /// bytes actually regenerated (`ZSTD_error_corruption_detected`).
     FrameContentSizeMismatch,
@@ -52,11 +59,13 @@ impl fmt::Display for Error {
                 "content checksum mismatch: stored {expected:#010x}, computed {actual:#010x}"
             ),
             Error::DictionaryRequired(id) => {
-                write!(
-                    f,
-                    "frame requires dictionary {id} (dictionaries are not supported yet)"
-                )
+                write!(f, "frame requires dictionary {id}, but none was supplied")
             }
+            Error::DictionaryWrong { expected, actual } => write!(
+                f,
+                "wrong dictionary: frame requires ID {expected}, supplied dictionary has ID {actual}"
+            ),
+            Error::DictionaryCorrupted => write!(f, "supplied dictionary is malformed"),
             Error::FrameContentSizeMismatch => {
                 write!(
                     f,

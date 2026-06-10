@@ -1,9 +1,7 @@
 //! Frame header parsing (`ZSTD_getFrameHeader`).
 
+use crate::decompress::WINDOW_LOG_MAX;
 use crate::error::Error;
-
-/// `ZSTD_WINDOWLOG_MAX` on 64-bit targets.
-const WINDOW_LOG_MAX: u64 = 31;
 
 pub(crate) struct FrameHeader {
     /// Declared decompressed size of the frame, when present.
@@ -18,7 +16,12 @@ pub(crate) struct FrameHeader {
 }
 
 /// Parse a frame header. `src` starts immediately after the magic number.
-pub(crate) fn parse(src: &[u8]) -> Result<FrameHeader, Error> {
+///
+/// `window_log_max` is the largest window log to accept (`ZSTD_d_windowLogMax`);
+/// it is clamped to [`WINDOW_LOG_MAX`], the hard format limit, so a larger
+/// value never accepts an invalid window.
+pub(crate) fn parse(src: &[u8], window_log_max: u32) -> Result<FrameHeader, Error> {
+    let max_log = u64::from(window_log_max.min(WINDOW_LOG_MAX));
     let descriptor = *src.first().ok_or(Error::SrcSizeWrong)?;
     let dict_id_flag = (descriptor & 3) as usize;
     let has_checksum = descriptor & 0x04 != 0;
@@ -35,7 +38,7 @@ pub(crate) fn parse(src: &[u8]) -> Result<FrameHeader, Error> {
         pos += 1;
         let exponent = wd >> 3;
         let mantissa = wd & 7;
-        if 10 + exponent > WINDOW_LOG_MAX {
+        if 10 + exponent > max_log {
             return Err(Error::WindowTooLarge);
         }
         let base = 1u64 << (10 + exponent);
@@ -60,8 +63,12 @@ pub(crate) fn parse(src: &[u8]) -> Result<FrameHeader, Error> {
 
     if single_segment {
         // No window descriptor: the whole frame is one segment and the
-        // window is the content size itself.
+        // window is the content size itself, still subject to the window
+        // limit (`windowSize > maxWindowSize` in `ZSTD_decompressFrame`).
         window_size = content_size.expect("single-segment frames always carry a content size");
+        if window_size > 1u64 << max_log {
+            return Err(Error::WindowTooLarge);
+        }
     }
 
     Ok(FrameHeader {
@@ -90,7 +97,7 @@ mod tests {
     #[test]
     fn single_segment_with_one_byte_fcs() {
         // Descriptor 0x20: single segment, FCS flag 0 -> 1-byte content size.
-        let h = parse(&[0x20, 0x05]).unwrap();
+        let h = parse(&[0x20, 0x05], WINDOW_LOG_MAX).unwrap();
         assert_eq!(h.content_size, Some(5));
         assert_eq!(h.window_size, 5);
         assert_eq!(h.dict_id, 0);
@@ -102,7 +109,7 @@ mod tests {
     fn windowed_with_checksum() {
         // Descriptor 0x04: checksum, window descriptor follows.
         // Window byte 0x08: exponent 1, mantissa 0 -> 2 KiB.
-        let h = parse(&[0x04, 0x08]).unwrap();
+        let h = parse(&[0x04, 0x08], WINDOW_LOG_MAX).unwrap();
         assert_eq!(h.content_size, None);
         assert_eq!(h.window_size, 2048);
         assert!(h.has_checksum);
@@ -112,15 +119,30 @@ mod tests {
     #[test]
     fn two_byte_fcs_is_biased() {
         // Descriptor 0x60: single segment + FCS flag 1 -> 2-byte FCS + 256.
-        let h = parse(&[0x60, 0x00, 0x01]).unwrap();
+        let h = parse(&[0x60, 0x00, 0x01], WINDOW_LOG_MAX).unwrap();
         assert_eq!(h.content_size, Some(256 + 256));
     }
 
     #[test]
     fn rejects_reserved_bit() {
         assert!(matches!(
-            parse(&[0x08, 0x00]),
+            parse(&[0x08, 0x00], WINDOW_LOG_MAX),
             Err(Error::FrameHeaderInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn window_log_max_bounds_the_window_descriptor() {
+        // Window byte 0x90: exponent 18 -> window log 28.
+        assert!(parse(&[0x00, 0x90], 28).is_ok());
+        assert!(matches!(
+            parse(&[0x00, 0x90], 27),
+            Err(Error::WindowTooLarge)
+        ));
+        // Values above the format maximum are clamped, never widened.
+        assert!(matches!(
+            parse(&[0x00, 0xF8], 60),
+            Err(Error::WindowTooLarge)
         ));
     }
 }

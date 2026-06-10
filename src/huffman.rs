@@ -21,6 +21,7 @@ struct HufEntry {
     nb_bits: u8,
 }
 
+#[derive(Clone)]
 pub(crate) struct HuffmanTable {
     table_log: u32,
     entries: Vec<HufEntry>,

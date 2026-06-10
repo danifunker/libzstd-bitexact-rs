@@ -18,9 +18,10 @@ libzstd, not by review.
 | Decompression (frames, raw/RLE/compressed blocks) | ✅ implemented |
 | FSE, Huffman (1- and 4-stream), sequences, repeat offsets | ✅ implemented |
 | Content checksums (XXH64), skippable frames, multi-frame input | ✅ implemented |
+| Dictionaries (raw-content and trained/ZDICT) | ✅ implemented |
+| `windowLogMax` enforcement | ✅ implemented |
 | Differential test harness vs. C libzstd | ✅ in CI |
 | Streaming decompression API | ⬜ planned |
-| Dictionaries | ⬜ planned |
 | Compression (bit-exact with C, all levels) | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ## Usage
@@ -30,6 +31,16 @@ let data = libzstd_bitexact::decompress(&compressed_bytes)?;
 
 // On untrusted input, cap the output size to defuse decompression bombs:
 let data = libzstd_bitexact::decompress_with_limit(&compressed_bytes, 64 << 20)?;
+
+// Dictionaries, output limits, and a maximum window log compose through the
+// DecodeOptions builder:
+use libzstd_bitexact::{DecodeOptions, Dictionary};
+let dict = Dictionary::new(&dictionary_bytes)?;
+let data = DecodeOptions::new()
+    .dictionary(&dict)
+    .limit(64 << 20)
+    .window_log_max(27)
+    .decompress(&compressed_bytes)?;
 ```
 
 ## Design principles
@@ -42,7 +53,9 @@ let data = libzstd_bitexact::decompress_with_limit(&compressed_bytes, 64 << 20)?
 - **Differential testing as ground truth.** The test suite compresses a
   spread of datasets with the real libzstd (via the `zstd` crate's C
   bindings) at levels 1–22, in bulk and streaming modes, with and without
-  checksums, and requires byte-identical round-trips. Random-input probes
+  checksums and dictionaries (raw-content and trained), and requires
+  byte-identical round-trips. The `windowLogMax` knob is checked for
+  accept/reject parity against C's streaming decoder. Random-input probes
   assert we never accept data the C decoder rejects.
 - **No `unsafe`, no dependencies.** The library is `#![forbid(unsafe_code)]`
   and dependency-free; the C oracle appears only as a dev-dependency.

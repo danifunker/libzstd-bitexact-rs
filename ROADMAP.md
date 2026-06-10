@@ -69,7 +69,11 @@ not just emitting valid streams. Bottom-up:
       Verified by round-tripping normalized distributions — including zstd's
       own predefined LL/OF tables — through the decoder's `read_ncount`, since
       the NCount bit-encoding is canonical for a given `(counts, tableLog)`.
-- [ ] FSE compression tables (`FSE_buildCTable`) and encoding loop.
+- [x] FSE compression tables (`FSE_buildCTable`) and the encoding loop
+      (`BIT_CStream` writer + `FSE_compress_usingCTable`). Verified by the
+      strongest available check: a full FSE encode→decode round-trip, decoding
+      our output with the C-tested `decode_interleaved` — an exact
+      `FSE_compress`/`FSE_decompress` pair — across every parity/join branch.
 - [ ] Huffman tree construction (`HUF_buildCTable`, including the
       `maxTableLog` adjustment and rank rules) and 1/4-stream encoding.
 - [ ] Literals-section encoder, including the C heuristics for choosing

@@ -346,6 +346,237 @@ pub(crate) fn write_ncount(
     Ok(out)
 }
 
+// --- FSE compression table + encoding -------------------------------------
+//
+// Ports of `FSE_buildCTable`, the `BIT_CStream` forward bit-writer, and
+// `FSE_compress_usingCTable_generic`. The encoder writes bits LSB-first into a
+// 64-bit container (the static size-dependent join structure below is fixed to
+// the 64-bit container we use); the resulting byte stream is exactly what the
+// decoder's `decode_interleaved` (a port of `FSE_decompress_usingDTable`)
+// reads back. Round-trip tests rely on that pairing.
+
+/// One symbol's `FSE_symbolCompressionTransform`.
+#[derive(Clone, Copy)]
+struct SymbolTransform {
+    /// Stored as the C `U32` (it encodes a biased bit count); used via wrapping
+    /// adds, so keep it `u32`.
+    delta_nb_bits: u32,
+    delta_find_state: i32,
+}
+
+/// An FSE compression table (`FSE_CTable`): the next-state lookup plus the
+/// per-symbol transforms.
+pub(crate) struct FseCTable {
+    table_log: u32,
+    next_state: Vec<u16>,
+    symbol_tt: Vec<SymbolTransform>,
+}
+
+/// `FSE_buildCTable`: lay out the encoding table for a normalized distribution.
+pub(crate) fn build_ctable(norm: &[i16], max_symbol: u32, table_log: u32) -> FseCTable {
+    let table_size = 1usize << table_log;
+    let table_mask = table_size - 1;
+    // FSE_TABLESTEP — the same spread step as the decoder's table build.
+    let step = (table_size >> 1) + (table_size >> 3) + 3;
+    let mut high_threshold = table_size - 1;
+
+    // Symbol start positions; low-probability (-1) symbols are parked at the
+    // top of the table, descending from high_threshold.
+    let mut cumul = vec![0u32; (max_symbol + 2) as usize];
+    let mut table_symbol = vec![0u8; table_size];
+    for u in 1..=(max_symbol as usize + 1) {
+        if norm[u - 1] == -1 {
+            cumul[u] = cumul[u - 1] + 1;
+            table_symbol[high_threshold] = (u - 1) as u8;
+            high_threshold -= 1;
+        } else {
+            cumul[u] = cumul[u - 1] + norm[u - 1] as u32;
+        }
+    }
+    cumul[(max_symbol + 1) as usize] = (table_size + 1) as u32;
+
+    // Spread the symbols over the table with the normative step.
+    let mut position = 0usize;
+    for symbol in 0..=max_symbol as usize {
+        let freq = norm[symbol].max(0);
+        for _ in 0..freq {
+            table_symbol[position] = symbol as u8;
+            position = (position + step) & table_mask;
+            while position > high_threshold {
+                position = (position + step) & table_mask; // low-proba area
+            }
+        }
+    }
+    debug_assert_eq!(position, 0, "spread must cover the whole table");
+
+    // Next-state table, in symbol order.
+    let mut next_state = vec![0u16; table_size];
+    for u in 0..table_size {
+        let s = table_symbol[u] as usize;
+        next_state[cumul[s] as usize] = (table_size + u) as u16;
+        cumul[s] += 1;
+    }
+
+    // Symbol transforms (deltaNbBits uses wrapping arithmetic, as in C).
+    let mut symbol_tt = vec![
+        SymbolTransform {
+            delta_nb_bits: 0,
+            delta_find_state: 0,
+        };
+        (max_symbol + 1) as usize
+    ];
+    let mut total: i32 = 0;
+    for s in 0..=max_symbol as usize {
+        match norm[s] {
+            0 => {
+                // Filled for FSE_getMaxNbBits compatibility; never encoded.
+                symbol_tt[s].delta_nb_bits =
+                    ((table_log + 1) << 16).wrapping_sub(1u32 << table_log);
+            }
+            -1 | 1 => {
+                symbol_tt[s].delta_nb_bits = (table_log << 16).wrapping_sub(1u32 << table_log);
+                symbol_tt[s].delta_find_state = total - 1;
+                total += 1;
+            }
+            n => {
+                let max_bits_out = table_log - highbit32((n - 1) as u32);
+                let min_state_plus = (n as u32) << max_bits_out;
+                symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
+                symbol_tt[s].delta_find_state = total - n as i32;
+                total += n as i32;
+            }
+        }
+    }
+
+    FseCTable {
+        table_log,
+        next_state,
+        symbol_tt,
+    }
+}
+
+/// `BIT_CStream_t`: forward LSB-first bit writer over a 64-bit container.
+struct BitCStream {
+    container: u64,
+    bit_pos: usize,
+    out: Vec<u8>,
+}
+
+impl BitCStream {
+    fn new() -> Self {
+        BitCStream {
+            container: 0,
+            bit_pos: 0,
+            out: Vec::new(),
+        }
+    }
+
+    /// `BIT_addBits`: append the low `nb_bits` of `value` at the current
+    /// position.
+    fn add_bits(&mut self, value: u64, nb_bits: u32) {
+        self.container |= (value & crate::bits::mask64(nb_bits)) << self.bit_pos;
+        self.bit_pos += nb_bits as usize;
+    }
+
+    /// `BIT_flushBits`: emit the whole bytes accumulated, keeping the remainder.
+    fn flush_bits(&mut self) {
+        let nb_bytes = self.bit_pos >> 3;
+        let bytes = self.container.to_le_bytes();
+        self.out.extend_from_slice(&bytes[..nb_bytes]);
+        self.bit_pos &= 7;
+        self.container >>= (nb_bytes * 8) as u32;
+    }
+
+    /// `BIT_closeCStream`: write the end-mark bit (the decoder's padding bit),
+    /// flush, and emit any final partial byte.
+    fn close(mut self) -> Vec<u8> {
+        self.add_bits(1, 1);
+        self.flush_bits();
+        if self.bit_pos > 0 {
+            self.out.push(self.container as u8);
+        }
+        self.out
+    }
+}
+
+/// `FSE_initCState2`: seed a state from the first (last-consumed) symbol.
+fn init_cstate2(ct: &FseCTable, symbol: usize) -> i64 {
+    let stt = ct.symbol_tt[symbol];
+    let nb_bits_out = (stt.delta_nb_bits.wrapping_add(1 << 15)) >> 16;
+    let value0 = (nb_bits_out << 16).wrapping_sub(stt.delta_nb_bits);
+    let idx = ((value0 >> nb_bits_out) as i64 + stt.delta_find_state as i64) as usize;
+    ct.next_state[idx] as i64
+}
+
+/// `FSE_encodeSymbol`: emit the bits for `symbol` and advance `state`.
+fn encode_symbol(bitc: &mut BitCStream, ct: &FseCTable, state: &mut i64, symbol: usize) {
+    let stt = ct.symbol_tt[symbol];
+    let nb_bits_out = ((*state + stt.delta_nb_bits as i64) >> 16) as u32;
+    bitc.add_bits(*state as u64, nb_bits_out);
+    let idx = ((*state >> nb_bits_out) + stt.delta_find_state as i64) as usize;
+    *state = ct.next_state[idx] as i64;
+}
+
+/// `FSE_flushCState`: write the final state value.
+fn flush_cstate(bitc: &mut BitCStream, ct: &FseCTable, state: i64) {
+    bitc.add_bits(state as u64, ct.table_log);
+    bitc.flush_bits();
+}
+
+/// `FSE_compress_usingCTable`: encode `src` with `ct`, returning the bitstream.
+///
+/// The join structure is fixed to the 64-bit container (`64 > FSE_MAX_TABLELOG*4+7`),
+/// so each loop encodes four symbols between flushes. `src` must be longer than
+/// two bytes and contain only symbols with a nonzero normalized count.
+pub(crate) fn fse_compress_using_ctable(ct: &FseCTable, src: &[u8]) -> Vec<u8> {
+    let n = src.len();
+    debug_assert!(n > 2);
+    let mut bitc = BitCStream::new();
+    let mut ip = n;
+    let take = |i: &mut usize| {
+        *i -= 1;
+        src[*i] as usize
+    };
+
+    let (mut cstate1, mut cstate2);
+    if n & 1 == 1 {
+        cstate1 = init_cstate2(ct, take(&mut ip));
+        cstate2 = init_cstate2(ct, take(&mut ip));
+        let s = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate1, s);
+        bitc.flush_bits();
+    } else {
+        cstate2 = init_cstate2(ct, take(&mut ip));
+        cstate1 = init_cstate2(ct, take(&mut ip));
+    }
+
+    // Join to a multiple of four (the `srcSize & 2` test is on n-2).
+    if ((n - 2) & 2) != 0 {
+        let s2 = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate2, s2);
+        let s1 = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate1, s1);
+        bitc.flush_bits();
+    }
+
+    // Four symbols per iteration on a 64-bit container.
+    while ip > 0 {
+        let a = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate2, a);
+        let b = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate1, b);
+        let c = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate2, c);
+        let d = take(&mut ip);
+        encode_symbol(&mut bitc, ct, &mut cstate1, d);
+        bitc.flush_bits();
+    }
+
+    flush_cstate(&mut bitc, ct, cstate2);
+    flush_cstate(&mut bitc, ct, cstate1);
+    bitc.close()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +676,54 @@ mod tests {
         match normalize_count(&hist, 42, 3, 6, true).unwrap() {
             Normalized::Rle(s) => assert_eq!(s, 1),
             Normalized::Table(_) => panic!("expected RLE"),
+        }
+    }
+
+    /// Build matching compression and decompression tables, FSE-encode a symbol
+    /// stream, then decode it with the (C-verified) `decode_interleaved`. The
+    /// encoder and that decoder are an exact `FSE_compress`/`FSE_decompress`
+    /// pair, so a faithful encoder round-trips byte-for-byte.
+    #[test]
+    fn fse_encode_decode_round_trip() {
+        let mut state = 0x243F_6A88_85A3_08D3u64; // deterministic xorshift
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        let histograms: &[&[u32]] = &[
+            &[100, 50, 25, 12, 6, 3, 2, 1],
+            &[5, 5, 5, 5, 5, 5, 5, 5],
+            &[400, 1, 1, 1, 1, 1, 200, 50, 3, 9],
+        ];
+        for hist in histograms {
+            let total: usize = hist.iter().map(|&c| c as usize).sum();
+            let max_symbol = hist.len() as u32 - 1;
+            let table_log = optimal_table_log(9, total, max_symbol);
+            let norm = match normalize_count(hist, total, max_symbol, table_log, true).unwrap() {
+                Normalized::Table(n) => n,
+                Normalized::Rle(_) => unreachable!(),
+            };
+            let ct = build_ctable(&norm, max_symbol, table_log);
+            let dt = fse::build_dtable(&norm, table_log).unwrap();
+
+            // Only symbols with a nonzero normalized count are encodable.
+            let encodable: Vec<u8> = (0..=max_symbol as usize)
+                .filter(|&s| norm[s] != 0)
+                .map(|s| s as u8)
+                .collect();
+
+            // Lengths covering every parity / join branch of the encoder.
+            for &len in &[3usize, 4, 5, 6, 7, 8, 9, 64, 257, 1000] {
+                let symbols: Vec<u8> = (0..len)
+                    .map(|_| encodable[(next() % encodable.len() as u64) as usize])
+                    .collect();
+                let encoded = fse_compress_using_ctable(&ct, &symbols);
+                let decoded = fse::decode_interleaved(&dt, &encoded, len + 16).unwrap();
+                assert_eq!(decoded, symbols, "round-trip mismatch at len {len}");
+            }
         }
     }
 }

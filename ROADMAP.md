@@ -35,7 +35,11 @@ decisions — is bit-identical to the C implementation.
       arbitrary chunk boundaries and keeps a bounded sliding window, evicting
       output once it passes out of match range (memory bounded by the frame's
       window, not its content). Content checksums are verified incrementally.
-- [ ] Long-distance matching frames (windows beyond 128 MiB).
+- [x] Long-distance matching frames (windows beyond 128 MiB). LDM is an
+      encoder-side decision; the decoder only sees larger offsets and window
+      descriptors, both already handled, so this needed no new decoder code —
+      confirmed by differential round-trips of LDM-enabled frames and frames
+      whose window log exceeds 27.
 - [ ] Error-code parity audit: map every C `ZSTD_ErrorCode` path and assert
       matching rejection in differential fuzzing.
 - [ ] Fuzzing: `cargo-fuzz` targets comparing against the C decoder

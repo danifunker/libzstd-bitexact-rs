@@ -41,11 +41,21 @@ fn min_table_log(src_size: usize, max_symbol: u32) -> u32 {
 
 /// `FSE_optimalTableLog` (with the default `minus = 2`).
 pub(crate) fn optimal_table_log(max_table_log: u32, src_size: usize, max_symbol: u32) -> u32 {
+    optimal_table_log_internal(max_table_log, src_size, max_symbol, 2)
+}
+
+/// `FSE_optimalTableLog_internal`. Huffman uses `minus = 1`; FSE uses `2`.
+pub(crate) fn optimal_table_log_internal(
+    max_table_log: u32,
+    src_size: usize,
+    max_symbol: u32,
+    minus: u32,
+) -> u32 {
     debug_assert!(src_size > 1);
     // The subtraction underflows for tiny sources exactly as in C; the wrapped
     // (huge) value then loses the `< table_log` comparison, leaving table_log
     // untouched — which is the intended behavior.
-    let max_bits_src = highbit32((src_size - 1) as u32).wrapping_sub(2);
+    let max_bits_src = highbit32((src_size - 1) as u32).wrapping_sub(minus);
     let mut table_log = if max_table_log == 0 {
         FSE_DEFAULT_TABLELOG
     } else {

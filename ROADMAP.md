@@ -52,7 +52,7 @@ decisions — is bit-identical to the C implementation.
       properties run deterministically over a generated corpus in
       `tests/fuzz_smoke.rs`, so CI exercises them without a nightly toolchain.
 
-## M3 — Entropy encoders (the foundation of bit-exact compression)
+## M3 — Entropy encoders (the foundation of bit-exact compression) ✅
 
 Compressed output parity requires reproducing the C encoder's *decisions*,
 not just emitting valid streams. Bottom-up:

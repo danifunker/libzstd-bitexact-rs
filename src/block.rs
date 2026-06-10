@@ -190,7 +190,7 @@ pub(crate) fn decode_compressed_block(
 
 /// Decode the literals section. Returns the literals and the number of bytes
 /// consumed from `src`.
-fn decode_literals(
+pub(crate) fn decode_literals(
     ctx: &mut FrameContext,
     src: &[u8],
     block_size_max: usize,

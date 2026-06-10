@@ -595,6 +595,78 @@ pub(crate) fn write_ctable(ct: &HufCTable) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// The outcome of trying to Huffman-compress a literals payload, mirroring the
+/// `HUF_compress_internal` return signals (no table reuse).
+pub(crate) enum HufOutput {
+    /// Not worth compressing — caller emits raw literals (`return 0`).
+    Raw,
+    /// A single symbol fills the input — caller emits an RLE block (`return 1`).
+    Rle,
+    /// The Huffman payload: table description followed by the coded stream(s).
+    Compressed(Vec<u8>),
+}
+
+/// Port of `HUF_compress_internal` without the repeat/old-table paths: build a
+/// fresh table and emit `table description || stream(s)`, applying the same
+/// incompressibility short-circuits. `single_stream` selects 1- vs 4-stream
+/// coding. Uses the cheap FSE-based table-log estimate (the `optimalDepth`
+/// search used at the highest strategies is a later refinement; it changes the
+/// chosen log, not validity).
+pub(crate) fn huf_compress(src: &[u8], single_stream: bool) -> HufOutput {
+    let src_size = src.len();
+    if src_size == 0 {
+        return HufOutput::Raw;
+    }
+    let mut count = [0u32; HUF_SYMBOLVALUE_MAX + 1];
+    for &b in src {
+        count[b as usize] += 1;
+    }
+    let mut max_symbol = 0u32;
+    let mut largest = 0u32;
+    for (s, &c) in count.iter().enumerate() {
+        if c != 0 {
+            max_symbol = s as u32;
+        }
+        largest = largest.max(c);
+    }
+    if largest as usize == src_size {
+        return HufOutput::Rle; // single symbol
+    }
+    if (largest as usize) <= (src_size >> 7) + 4 {
+        return HufOutput::Raw; // heuristic: not compressible enough
+    }
+
+    let huff_log = fse_encode::optimal_table_log_internal(
+        HUF_TABLELOG_DEFAULT,
+        src_size,
+        max_symbol,
+        1, // HUF uses minus = 1
+    );
+    let ct = match build_ctable(&count, max_symbol, huff_log) {
+        Ok(ct) => ct,
+        Err(_) => return HufOutput::Raw,
+    };
+    let table = match write_ctable(&ct) {
+        Ok(t) => t,
+        Err(_) => return HufOutput::Raw,
+    };
+    if table.len() + 12 >= src_size {
+        return HufOutput::Raw;
+    }
+    let streams = if single_stream {
+        compress1x(&ct, src)
+    } else {
+        compress4x(&ct, src)
+    };
+    let mut out = table;
+    out.extend_from_slice(&streams);
+    // HUF_compressCTable_internal: reject if it didn't actually shrink.
+    if out.len() >= src_size - 1 {
+        return HufOutput::Raw;
+    }
+    HufOutput::Compressed(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

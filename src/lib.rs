@@ -31,6 +31,7 @@ mod dictionary;
 mod error;
 mod frame;
 mod fse;
+mod fse_encode;
 mod huffman;
 mod stream;
 mod xxhash;

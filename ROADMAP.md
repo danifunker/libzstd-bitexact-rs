@@ -57,7 +57,18 @@ decisions — is bit-identical to the C implementation.
 Compressed output parity requires reproducing the C encoder's *decisions*,
 not just emitting valid streams. Bottom-up:
 
-- [ ] `FSE_normalizeCount` (exact rounding rules) and `FSE_writeNCount`.
+> Verification note: the `zstd` crate oracle exposes only whole-frame
+> compress/decompress, not the FSE/Huffman internals, so the M3 primitives
+> cannot be bit-exact-checked against C in isolation — that happens
+> end-to-end once a full block can be emitted (M4). In the meantime each
+> primitive is a line-by-line C port verified by round-tripping through the
+> decoder (which *is* differential-tested against C) plus invariant checks.
+
+- [x] `FSE_optimalTableLog`, `FSE_normalizeCount` (exact `rtbTable` rounding +
+      the `normalizeM2` fallback) and `FSE_writeNCount` in `src/fse_encode.rs`.
+      Verified by round-tripping normalized distributions — including zstd's
+      own predefined LL/OF tables — through the decoder's `read_ncount`, since
+      the NCount bit-encoding is canonical for a given `(counts, tableLog)`.
 - [ ] FSE compression tables (`FSE_buildCTable`) and encoding loop.
 - [ ] Huffman tree construction (`HUF_buildCTable`, including the
       `maxTableLog` adjustment and rank rules) and 1/4-stream encoding.

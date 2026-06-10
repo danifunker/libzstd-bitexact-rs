@@ -43,6 +43,11 @@ pub enum Error {
     /// Decoding would exceed the output limit given to
     /// [`decompress_with_limit`](crate::decompress_with_limit).
     OutputTooLarge,
+    /// An internal invariant was violated while encoding — e.g. a table log
+    /// out of range, or a distribution that does not normalize
+    /// (`ZSTD_error_GENERIC` on the compression path). Reserved for the
+    /// in-progress compressor.
+    Encode(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -73,6 +78,7 @@ impl fmt::Display for Error {
                 )
             }
             Error::OutputTooLarge => write!(f, "decompressed output exceeds the configured limit"),
+            Error::Encode(why) => write!(f, "encoding error: {why}"),
         }
     }
 }

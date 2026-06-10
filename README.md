@@ -21,7 +21,7 @@ libzstd, not by review.
 | Dictionaries (raw-content and trained/ZDICT) | ✅ implemented |
 | `windowLogMax` enforcement | ✅ implemented |
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
-| Differential test harness vs. C libzstd | ✅ in CI |
+| Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
 | Compression (bit-exact with C, all levels) | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ## Usage
@@ -81,6 +81,19 @@ cargo test --release  # same, optimized (used in CI)
 The differential suite (`tests/differential.rs`) needs to build the bundled C
 libzstd, so a C compiler is required for development — but not to use the
 crate.
+
+There are also `cargo-fuzz` targets under `fuzz/` that compare against the C
+decoder — `decode_never_panic` (arbitrary input must never panic or run away
+on memory) and `decode_equivalence` (anything we accept, C must accept and
+decode identically):
+
+```sh
+cargo +nightly fuzz run decode_equivalence
+```
+
+Both properties also run deterministically over a generated corpus in
+`tests/fuzz_smoke.rs`, so plain `cargo test` exercises them without a nightly
+toolchain.
 
 ## License
 

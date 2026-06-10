@@ -18,7 +18,7 @@ decisions — is bit-identical to the C implementation.
 - [x] XXH64 content checksums.
 - [x] Differential round-trips vs. C libzstd, levels 1–22, bulk + streaming.
 
-## M2 — Decompression completeness
+## M2 — Decompression completeness ✅
 
 - [x] Dictionaries: raw-content and trained (entropy-table + rep-offset
       initialization from `ZDICT` format), `dictID` validation. Matches that
@@ -47,8 +47,10 @@ decisions — is bit-identical to the C implementation.
       window too large, reserved block type, content-size mismatch, checksum
       mismatch, dictionary required/wrong/corrupted, truncation) to the
       specific `Error` variant we report.
-- [ ] Fuzzing: `cargo-fuzz` targets comparing against the C decoder
-      (decode-equivalence and never-panic).
+- [x] Fuzzing: `cargo-fuzz` targets in `fuzz/` (`decode_never_panic` and
+      `decode_equivalence`) comparing against the C decoder. The same two
+      properties run deterministically over a generated corpus in
+      `tests/fuzz_smoke.rs`, so CI exercises them without a nightly toolchain.
 
 ## M3 — Entropy encoders (the foundation of bit-exact compression)
 

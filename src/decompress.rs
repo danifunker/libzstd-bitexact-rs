@@ -7,9 +7,9 @@ use crate::error::Error;
 use crate::frame;
 use crate::xxhash::xxh64;
 
-const ZSTD_MAGIC: u32 = 0xFD2F_B528;
-const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
-const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+pub(crate) const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+pub(crate) const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
+pub(crate) const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 
 /// Cap on speculative preallocation from the declared content size, so a
 /// frame header lying about its size cannot trigger a huge allocation.
@@ -76,6 +76,18 @@ impl<'d> DecodeOptions<'d> {
     pub fn dictionary(mut self, dictionary: &'d Dictionary) -> Self {
         self.dictionary = Some(dictionary);
         self
+    }
+
+    pub(crate) fn limit_value(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) fn window_log_max_value(&self) -> u32 {
+        self.window_log_max
+    }
+
+    pub(crate) fn dictionary_value(&self) -> Option<&'d Dictionary> {
+        self.dictionary
     }
 
     /// Decompress a sequence of frames with these options.

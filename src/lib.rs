@@ -2,14 +2,18 @@
 //! built to be **bit-exact** with the reference C implementation.
 //!
 //! Decompression is implemented today, including dictionaries (raw-content and
-//! trained/`ZDICT`) and a configurable `windowLogMax`. Every decoding table
-//! and loop is a faithful port of its counterpart in the C sources, and the
-//! crate is continuously differential-tested against the real libzstd.
-//! Bit-exact compression is the project's larger goal — see `ROADMAP.md`.
+//! trained/`ZDICT`), a configurable `windowLogMax`, and a [`Read`]-based
+//! [`StreamDecoder`] with a bounded sliding window. Every decoding table and
+//! loop is a faithful port of its counterpart in the C sources, and the crate
+//! is continuously differential-tested against the real libzstd. Bit-exact
+//! compression is the project's larger goal — see `ROADMAP.md`.
 //!
-//! [`decompress`] and [`decompress_with_limit`] cover the common cases;
-//! [`DecodeOptions`] composes an output limit, a maximum window log, and a
-//! [`Dictionary`] for everything else.
+//! [`decompress`] and [`decompress_with_limit`] cover the common one-shot
+//! cases; [`DecodeOptions`] composes an output limit, a maximum window log,
+//! and a [`Dictionary`]; [`StreamDecoder`] decodes incrementally from any
+//! reader.
+//!
+//! [`Read`]: std::io::Read
 //!
 //! ```
 //! // A tiny handcrafted frame: single-segment, content size 5, one RLE
@@ -28,8 +32,10 @@ mod error;
 mod frame;
 mod fse;
 mod huffman;
+mod stream;
 mod xxhash;
 
 pub use decompress::{DecodeOptions, WINDOW_LOG_MAX, decompress, decompress_with_limit};
 pub use dictionary::Dictionary;
 pub use error::Error;
+pub use stream::StreamDecoder;

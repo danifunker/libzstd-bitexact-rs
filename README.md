@@ -20,8 +20,8 @@ libzstd, not by review.
 | Content checksums (XXH64), skippable frames, multi-frame input | ✅ implemented |
 | Dictionaries (raw-content and trained/ZDICT) | ✅ implemented |
 | `windowLogMax` enforcement | ✅ implemented |
+| Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
 | Differential test harness vs. C libzstd | ✅ in CI |
-| Streaming decompression API | ⬜ planned |
 | Compression (bit-exact with C, all levels) | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ## Usage
@@ -41,6 +41,13 @@ let data = DecodeOptions::new()
     .limit(64 << 20)
     .window_log_max(27)
     .decompress(&compressed_bytes)?;
+
+// Streaming: wrap any Read source; memory stays bounded by the frame's
+// window rather than its content.
+use std::io::Read;
+use libzstd_bitexact::StreamDecoder;
+let mut out = Vec::new();
+StreamDecoder::new(compressed_reader).read_to_end(&mut out)?;
 ```
 
 ## Design principles
@@ -54,8 +61,10 @@ let data = DecodeOptions::new()
   spread of datasets with the real libzstd (via the `zstd` crate's C
   bindings) at levels 1–22, in bulk and streaming modes, with and without
   checksums and dictionaries (raw-content and trained), and requires
-  byte-identical round-trips. The `windowLogMax` knob is checked for
-  accept/reject parity against C's streaming decoder. Random-input probes
+  byte-identical round-trips. The streaming decoder is fed the same frames
+  at chunk sizes from one byte up, and must reproduce identical output
+  regardless of how the input is split. The `windowLogMax` knob is checked
+  for accept/reject parity against C's streaming decoder. Random-input probes
   assert we never accept data the C decoder rejects.
 - **No `unsafe`, no dependencies.** The library is `#![forbid(unsafe_code)]`
   and dependency-free; the C oracle appears only as a dev-dependency.

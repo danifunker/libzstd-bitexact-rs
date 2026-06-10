@@ -30,8 +30,11 @@ decisions — is bit-identical to the C implementation.
       streaming decoder (the one-shot `ZSTD_decompressDCtx` path ignores the
       parameter and always allows up to `ZSTD_WINDOWLOG_MAX`, which our default
       matches).
-- [ ] Streaming decompression (`ZSTD_decompressStream` semantics: incremental
-      input/output, window-buffer eviction beyond the kept history).
+- [x] Streaming decompression (`ZSTD_decompressStream` semantics): a
+      `Read`-based `StreamDecoder` that buffers compressed input across
+      arbitrary chunk boundaries and keeps a bounded sliding window, evicting
+      output once it passes out of match range (memory bounded by the frame's
+      window, not its content). Content checksums are verified incrementally.
 - [ ] Long-distance matching frames (windows beyond 128 MiB).
 - [ ] Error-code parity audit: map every C `ZSTD_ErrorCode` path and assert
       matching rejection in differential fuzzing.

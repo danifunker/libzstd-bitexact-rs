@@ -33,6 +33,7 @@ mod frame;
 mod fse;
 mod fse_encode;
 mod huffman;
+mod huffman_encode;
 mod stream;
 mod xxhash;
 

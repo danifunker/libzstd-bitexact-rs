@@ -74,8 +74,16 @@ not just emitting valid streams. Bottom-up:
       strongest available check: a full FSE encode→decode round-trip, decoding
       our output with the C-tested `decode_interleaved` — an exact
       `FSE_compress`/`FSE_decompress` pair — across every parity/join branch.
-- [ ] Huffman tree construction (`HUF_buildCTable`, including the
-      `maxTableLog` adjustment and rank rules) and 1/4-stream encoding.
+- [x] Huffman tree construction (`HUF_buildCTable` = `HUF_sort` +
+      `HUF_buildTree` + `HUF_setMaxHeight` + canonical-code assignment),
+      `HUF_writeCTable` (both the direct 4-bit and FSE-compressed-weights
+      paths), and the 1- and 4-stream encoders (`src/huffman_encode.rs`). The
+      modern `HUF_CStream` (top-packed container) is reproduced; the unrolled
+      dual-container loop is an ILP optimization that yields the same bytes as
+      a single-container reverse encode, so the simple form is used. Verified by
+      encode→decode round-trips through the C-tested decoder (including a
+      distribution that drives the height-limiting clamp) and a
+      `write_ctable`→`read_table` round-trip over both weight paths.
 - [ ] Literals-section encoder, including the C heuristics for choosing
       raw / RLE / compressed / treeless modes and stream counts.
 

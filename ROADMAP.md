@@ -40,8 +40,13 @@ decisions — is bit-identical to the C implementation.
       descriptors, both already handled, so this needed no new decoder code —
       confirmed by differential round-trips of LDM-enabled frames and frames
       whose window log exceeds 27.
-- [ ] Error-code parity audit: map every C `ZSTD_ErrorCode` path and assert
-      matching rejection in differential fuzzing.
+- [x] Error-code parity audit. A systematic single-byte-flip sweep over real
+      frames (including checksummed ones) requires our accept/reject decision —
+      and the output when accepted — to match C at every byte and bit, and
+      targeted cases pin each error class (bad magic, reserved descriptor bit,
+      window too large, reserved block type, content-size mismatch, checksum
+      mismatch, dictionary required/wrong/corrupted, truncation) to the
+      specific `Error` variant we report.
 - [ ] Fuzzing: `cargo-fuzz` targets comparing against the C decoder
       (decode-equivalence and never-panic).
 

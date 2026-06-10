@@ -11,7 +11,8 @@
 //! round-tripping distributions (including zstd's own predefined sequence
 //! tables) through the decoder's `read_ncount`, which is itself
 //! differential-tested against C.
-#![allow(dead_code)] // wired into the public compressor in a later milestone
+#![allow(dead_code)]
+// wired into the public compressor in a later milestone
 // The symbol loops index `count` and `norm` in lockstep and mirror the C
 // `for (s=0; s<=maxSymbolValue; s++)` exactly; an enumerate() rewrite would
 // only obscure the port and still need the second array by index.

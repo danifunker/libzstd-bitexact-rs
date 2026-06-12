@@ -4,12 +4,12 @@ A pure-Rust reimplementation of [Zstandard](https://github.com/facebook/zstd),
 built to be **bit-exact** with the reference C implementation.
 
 Most Rust compression ports settle for "produces valid output". This project
-holds itself to a stricter standard: for any input, the goal is behavior
-indistinguishable from C libzstd — identical decompressed bytes, matching
-accept/reject decisions on malformed data, and (the long-term goal) identical
-*compressed* bytes for every compression level. Bit-exactness is enforced
-mechanically, by differential-testing every code path against the real
-libzstd, not by review.
+holds itself to a stricter standard: for any input, behavior indistinguishable
+from C libzstd — identical decompressed bytes, matching accept/reject
+decisions on malformed data, and identical *compressed* bytes at **every
+compression level** (pinned to the zstd version bundled by `zstd-sys`,
+currently 1.5.7). Bit-exactness is enforced mechanically, by
+differential-testing every code path against the real libzstd, not by review.
 
 ## Status
 
@@ -22,8 +22,8 @@ libzstd, not by review.
 | `windowLogMax` enforcement | ✅ implemented |
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
 | Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
-| **Compression, bit-exact with C** — fast strategy (levels 1, 2, negatives) | ✅ byte-identical, differential-tested |
-| Compression — remaining strategies (`dfast` … `btultra2`) | ⬜ in progress — see [ROADMAP.md](ROADMAP.md) |
+| **Compression, bit-exact with C — every level (1–22 and negatives)** | ✅ byte-identical, differential-tested |
+| Streaming compression, dictionary compression | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ## Usage
 
@@ -49,6 +49,10 @@ use std::io::Read;
 use libzstd_bitexact::StreamDecoder;
 let mut out = Vec::new();
 StreamDecoder::new(compressed_reader).read_to_end(&mut out)?;
+
+// Compression: byte-identical to ZSTD_compress at every level (1-22,
+// and negative levels for faster-than-1 modes).
+let frame = libzstd_bitexact::compress(&data, 19)?;
 ```
 
 ## Design principles

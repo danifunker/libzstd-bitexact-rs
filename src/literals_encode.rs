@@ -117,12 +117,16 @@ pub(crate) fn compress_literals(
         single_stream = true;
     }
     let prefer_repeat = strategy < ZSTD_LAZY && n <= 1024;
+    // `HUF_flags_optimalDepth`: strategies >= btultra probe table depths.
+    const HUF_OPTIMAL_DEPTH_THRESHOLD: i32 = 8;
+    let optimal_depth = strategy >= HUF_OPTIMAL_DEPTH_THRESHOLD;
 
     let outcome = huffman_encode::huf_compress(
         src,
         single_stream,
         suspect_uncompressible,
         prefer_repeat,
+        optimal_depth,
         prev_huf.table.as_ref(),
         prev_huf.repeat,
     );

@@ -29,11 +29,11 @@ pub(crate) const MAX_OFF: u32 = 31;
 /// `MaxSeq`: the largest sequence code of any kind.
 pub(crate) const MAX_SEQ: usize = 52;
 /// `DefaultMaxOff`: the predefined offset table only covers codes 0..=28.
-const DEFAULT_MAX_OFF: u32 = 28;
+pub(crate) const DEFAULT_MAX_OFF: u32 = 28;
 const LL_FSE_LOG: u32 = 9;
 const ML_FSE_LOG: u32 = 9;
 const OFF_FSE_LOG: u32 = 8;
-const LONG_NB_SEQ: usize = 0x7F00;
+pub(crate) const LONG_NB_SEQ: usize = 0x7F00;
 pub(crate) const MIN_MATCH: u32 = 3;
 
 fn highbit32(x: u32) -> u32 {
@@ -109,6 +109,27 @@ impl SeqStore {
     pub(crate) fn store_last_literals(&mut self, literals: &[u8]) {
         self.literals.extend_from_slice(literals);
     }
+
+    /// The whole store as a [`SeqView`].
+    pub(crate) fn view(&self) -> SeqView<'_> {
+        SeqView {
+            sequences: &self.sequences,
+            literals: &self.literals,
+            long_length_type: self.long_length_type,
+            long_length_pos: self.long_length_pos,
+        }
+    }
+}
+
+/// A borrowed window over a [`SeqStore`] — either the whole store or one
+/// partition chunk of it (`ZSTD_deriveSeqStoreChunk`). The entropy shell and
+/// the block-splitter's estimator both operate on views.
+#[derive(Clone, Copy)]
+pub(crate) struct SeqView<'a> {
+    pub sequences: &'a [SeqDef],
+    pub literals: &'a [u8],
+    pub long_length_type: LongLengthType,
+    pub long_length_pos: u32,
 }
 
 // --- seqToCodes --------------------------------------------------------------
@@ -157,19 +178,19 @@ pub(crate) fn ml_code(ml_base: u32) -> u8 {
 
 /// `ZSTD_seqToCodes`: produce the per-sequence LL/OF/ML code tables, applying
 /// the long-length overrides. (On 64-bit, `longOffsets` is always false.)
-fn seq_to_codes(store: &SeqStore) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let nb_seq = store.sequences.len();
+fn seq_to_codes(view: &SeqView<'_>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let nb_seq = view.sequences.len();
     let mut ll = Vec::with_capacity(nb_seq);
     let mut of = Vec::with_capacity(nb_seq);
     let mut ml = Vec::with_capacity(nb_seq);
-    for s in &store.sequences {
+    for s in view.sequences {
         ll.push(ll_code(u32::from(s.lit_length)));
         of.push(highbit32(s.off_base) as u8);
         ml.push(ml_code(u32::from(s.ml_base)));
     }
-    match store.long_length_type {
-        LongLengthType::LiteralLength => ll[store.long_length_pos as usize] = MAX_LL as u8,
-        LongLengthType::MatchLength => ml[store.long_length_pos as usize] = MAX_ML as u8,
+    match view.long_length_type {
+        LongLengthType::LiteralLength => ll[view.long_length_pos as usize] = MAX_LL as u8,
+        LongLengthType::MatchLength => ml[view.long_length_pos as usize] = MAX_ML as u8,
         LongLengthType::None => {}
     }
     (ll, of, ml)
@@ -256,7 +277,7 @@ fn entropy_cost(count: &[u32], max: u32, total: usize) -> u64 {
 
 /// `ZSTD_crossEntropyCost`: bits to encode `count` under the distribution
 /// described by `norm` (a table with `accuracy_log` accuracy).
-fn cross_entropy_cost(norm: &[i16], accuracy_log: u32, count: &[u32], max: u32) -> u64 {
+pub(crate) fn cross_entropy_cost(norm: &[i16], accuracy_log: u32, count: &[u32], max: u32) -> u64 {
     let shift = 8 - accuracy_log;
     let mut cost = 0u64;
     for s in 0..=max as usize {
@@ -270,7 +291,7 @@ fn cross_entropy_cost(norm: &[i16], accuracy_log: u32, count: &[u32], max: u32) 
 
 /// `ZSTD_fseBitCost`: bits to encode `count` with the previous block's table,
 /// or `None` if that table cannot represent every needed symbol.
-fn fse_bit_cost(ct: &FseCTable, count: &[u32], max: u32) -> Option<u64> {
+pub(crate) fn fse_bit_cost(ct: &FseCTable, count: &[u32], max: u32) -> Option<u64> {
     const K_ACCURACY_LOG: u32 = 8;
     if ct.max_symbol() < max {
         return None;
@@ -533,9 +554,27 @@ pub(crate) fn entropy_compress_seq_store(
     disable_literal_compression: bool,
     block_size: usize,
 ) -> Result<Option<(Vec<u8>, FseEntropyState)>, Error> {
+    entropy_compress_seq_view(
+        &store.view(),
+        entropy,
+        strategy,
+        disable_literal_compression,
+        block_size,
+    )
+}
+
+/// View-based form of [`entropy_compress_seq_store`], used directly by the
+/// post-block splitter for partition chunks.
+pub(crate) fn entropy_compress_seq_view(
+    view: &SeqView<'_>,
+    entropy: &FseEntropyState,
+    strategy: i32,
+    disable_literal_compression: bool,
+    block_size: usize,
+) -> Result<Option<(Vec<u8>, FseEntropyState)>, Error> {
     let mut next = entropy.clone();
-    let result = entropy_compress_seq_store_internal(
-        store,
+    let result = entropy_compress_seq_view_internal(
+        view,
         &mut next,
         strategy,
         disable_literal_compression,
@@ -544,54 +583,34 @@ pub(crate) fn entropy_compress_seq_store(
     Ok(result.map(|body| (body, next)))
 }
 
-fn entropy_compress_seq_store_internal(
-    store: &SeqStore,
+/// The outcome of `ZSTD_buildSequencesStatistics`: per-component encoding
+/// types, the built tables, the serialized table descriptions, and the
+/// 1.3.4-workaround bookkeeping.
+pub(crate) struct SeqStats {
+    pub ll_type: SymbolEncodingType,
+    pub of_type: SymbolEncodingType,
+    pub ml_type: SymbolEncodingType,
+    pub ll_ct: FseCTable,
+    pub of_ct: FseCTable,
+    pub ml_ct: FseCTable,
+    /// LL || OF || ML table descriptions, in stream order.
+    pub table_bytes: Vec<u8>,
+    pub last_count_size: usize,
+    pub ll_codes: Vec<u8>,
+    pub of_codes: Vec<u8>,
+    pub ml_codes: Vec<u8>,
+}
+
+/// `ZSTD_buildSequencesStatistics`: histogram each component, select its
+/// encoding type, and build its table. Mutates `entropy`'s repeat flags and
+/// installs the new tables (the caller decides whether to commit the state).
+pub(crate) fn build_sequences_statistics(
+    view: &SeqView<'_>,
     entropy: &mut FseEntropyState,
     strategy: i32,
-    disable_literal_compression: bool,
-    block_size: usize,
-) -> Result<Option<Vec<u8>>, Error> {
-    let nb_seq = store.sequences.len();
-    let lit_size = store.literals.len();
-
-    // Literals section. Suspicion of uncompressibility is based on the
-    // literals-to-sequences ratio. The Huffman state advances only when the
-    // literals actually came out compressed or treeless.
-    let suspect_uncompressible =
-        nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
-    let (mut out, next_huf) = literals_encode::compress_literals(
-        &store.literals,
-        strategy,
-        suspect_uncompressible,
-        disable_literal_compression,
-        &entropy.huf,
-    );
-    if let Some(next_huf) = next_huf {
-        entropy.huf = next_huf;
-    }
-
-    // Sequences header.
-    if nb_seq < 128 {
-        out.push(nb_seq as u8);
-    } else if nb_seq < LONG_NB_SEQ {
-        out.push(((nb_seq >> 8) + 0x80) as u8);
-        out.push(nb_seq as u8);
-    } else {
-        out.push(0xFF);
-        out.extend_from_slice(&((nb_seq - LONG_NB_SEQ) as u16).to_le_bytes());
-    }
-    if nb_seq == 0 {
-        // Entropy tables carry over untouched, as if repeated.
-        return finish_block(out, strategy, block_size);
-    }
-
-    let (ll_codes, of_codes, ml_codes) = seq_to_codes(store);
-
-    // Per-component stats, encoding-type selection, and table building
-    // (`ZSTD_buildSequencesStatistics`).
-    let mut last_count_size = 0usize;
-    let modes_at = out.len();
-    out.push(0); // placeholder for the modes byte
+) -> Result<SeqStats, Error> {
+    let nb_seq = view.sequences.len();
+    let (ll_codes, of_codes, ml_codes) = seq_to_codes(view);
 
     let build = |codes: &[u8],
                  format_max: u32,
@@ -641,6 +660,9 @@ fn entropy_compress_seq_store_internal(
         Ok((enc_type, ctable, header))
     };
 
+    let mut last_count_size = 0usize;
+    let mut table_bytes = Vec::new();
+
     let (ll_type, ll_ct, ll_hdr) = build(
         &ll_codes,
         MAX_LL,
@@ -655,7 +677,7 @@ fn entropy_compress_seq_store_internal(
     if ll_type == SymbolEncodingType::Compressed {
         last_count_size = ll_hdr.len();
     }
-    out.extend_from_slice(&ll_hdr);
+    table_bytes.extend_from_slice(&ll_hdr);
 
     let (of_type, of_ct, of_hdr) = build(
         &of_codes,
@@ -671,7 +693,7 @@ fn entropy_compress_seq_store_internal(
     if of_type == SymbolEncodingType::Compressed {
         last_count_size = of_hdr.len();
     }
-    out.extend_from_slice(&of_hdr);
+    table_bytes.extend_from_slice(&of_hdr);
 
     let (ml_type, ml_ct, ml_hdr) = build(
         &ml_codes,
@@ -687,19 +709,85 @@ fn entropy_compress_seq_store_internal(
     if ml_type == SymbolEncodingType::Compressed {
         last_count_size = ml_hdr.len();
     }
-    out.extend_from_slice(&ml_hdr);
+    table_bytes.extend_from_slice(&ml_hdr);
 
-    out[modes_at] = ((ll_type as u8) << 6) | ((of_type as u8) << 4) | ((ml_type as u8) << 2);
+    // Install the new tables as the candidate state; repeat flags were
+    // already updated in place by the selection step.
+    entropy.ll = Some(ll_ct.clone());
+    entropy.of = Some(of_ct.clone());
+    entropy.ml = Some(ml_ct.clone());
+
+    Ok(SeqStats {
+        ll_type,
+        of_type,
+        ml_type,
+        ll_ct,
+        of_ct,
+        ml_ct,
+        table_bytes,
+        last_count_size,
+        ll_codes,
+        of_codes,
+        ml_codes,
+    })
+}
+
+fn entropy_compress_seq_view_internal(
+    view: &SeqView<'_>,
+    entropy: &mut FseEntropyState,
+    strategy: i32,
+    disable_literal_compression: bool,
+    block_size: usize,
+) -> Result<Option<Vec<u8>>, Error> {
+    let nb_seq = view.sequences.len();
+    let lit_size = view.literals.len();
+
+    // Literals section. Suspicion of uncompressibility is based on the
+    // literals-to-sequences ratio. The Huffman state advances only when the
+    // literals actually came out compressed or treeless.
+    let suspect_uncompressible =
+        nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
+    let (mut out, next_huf) = literals_encode::compress_literals(
+        view.literals,
+        strategy,
+        suspect_uncompressible,
+        disable_literal_compression,
+        &entropy.huf,
+    );
+    if let Some(next_huf) = next_huf {
+        entropy.huf = next_huf;
+    }
+
+    // Sequences header.
+    if nb_seq < 128 {
+        out.push(nb_seq as u8);
+    } else if nb_seq < LONG_NB_SEQ {
+        out.push(((nb_seq >> 8) + 0x80) as u8);
+        out.push(nb_seq as u8);
+    } else {
+        out.push(0xFF);
+        out.extend_from_slice(&((nb_seq - LONG_NB_SEQ) as u16).to_le_bytes());
+    }
+    if nb_seq == 0 {
+        // Entropy tables carry over untouched, as if repeated.
+        return finish_block(out, strategy, block_size);
+    }
+
+    let stats = build_sequences_statistics(view, entropy, strategy)?;
+    out.push(
+        ((stats.ll_type as u8) << 6) | ((stats.of_type as u8) << 4) | ((stats.ml_type as u8) << 2),
+    );
+    out.extend_from_slice(&stats.table_bytes);
 
     // The sequence bitstream itself.
     let bitstream = encode_sequences(
-        &ml_ct,
-        &ml_codes,
-        &of_ct,
-        &of_codes,
-        &ll_ct,
-        &ll_codes,
-        &store.sequences,
+        &stats.ml_ct,
+        &stats.ml_codes,
+        &stats.of_ct,
+        &stats.of_codes,
+        &stats.ll_ct,
+        &stats.ll_codes,
+        view.sequences,
     );
     let bitstream_size = bitstream.len();
     out.extend_from_slice(&bitstream);
@@ -707,17 +795,10 @@ fn entropy_compress_seq_store_internal(
     // Workaround for a zstd <= 1.3.4 decoder bug: a trailing 2-byte
     // set_compressed NCount plus a 1-byte bitstream triggers a false
     // corruption error there, so C emits the block uncompressed instead.
-    if last_count_size > 0 && last_count_size + bitstream_size < 4 {
-        debug_assert_eq!(last_count_size + bitstream_size, 3);
+    if stats.last_count_size > 0 && stats.last_count_size + bitstream_size < 4 {
+        debug_assert_eq!(stats.last_count_size + bitstream_size, 3);
         return Ok(None);
     }
-
-    // The new tables become the candidate next-block state; the repeat flags
-    // were already updated in place by the selection step (None for
-    // basic/RLE, Check for freshly compressed, untouched for repeat).
-    entropy.ll = Some(ll_ct);
-    entropy.of = Some(of_ct);
-    entropy.ml = Some(ml_ct);
 
     finish_block(out, strategy, block_size)
 }
@@ -756,7 +837,7 @@ mod tests {
     /// for tiny handcrafted blocks that a real compressor would emit raw.
     fn compress_ungated(store: &SeqStore, strategy: i32, block_size: usize) -> Vec<u8> {
         let mut entropy = FseEntropyState::new();
-        entropy_compress_seq_store_internal(store, &mut entropy, strategy, false, usize::MAX)
+        entropy_compress_seq_view_internal(&store.view(), &mut entropy, strategy, false, usize::MAX)
             .unwrap()
             .unwrap_or_else(|| panic!("ungated compression returned None ({block_size} bytes)"))
     }

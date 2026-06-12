@@ -78,7 +78,7 @@ pub(crate) enum HufRepeat {
 }
 
 /// `HUF_validateCTable`: the old table can encode the new histogram.
-fn validate_ctable(ct: &HufCTable, count: &[u32], max_symbol: u32) -> bool {
+pub(crate) fn validate_ctable(ct: &HufCTable, count: &[u32], max_symbol: u32) -> bool {
     if ct.max_symbol < max_symbol {
         return false;
     }
@@ -86,7 +86,7 @@ fn validate_ctable(ct: &HufCTable, count: &[u32], max_symbol: u32) -> bool {
 }
 
 /// `HUF_estimateCompressedSize`: stream bytes under `ct` for this histogram.
-fn estimate_compressed_size(ct: &HufCTable, count: &[u32], max_symbol: u32) -> usize {
+pub(crate) fn estimate_compressed_size(ct: &HufCTable, count: &[u32], max_symbol: u32) -> usize {
     let bits: u64 = (0..=max_symbol as usize)
         .map(|s| ct.nb_bits[s] as u64 * count[s] as u64)
         .sum();
@@ -629,6 +629,48 @@ pub(crate) fn write_ctable(ct: &HufCTable) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// `HUF_optimalTableLog`: the cheap FSE-based estimate for low strategies, or
+/// the probing depth search (`HUF_flags_optimalDepth`, strategies >= btultra):
+/// try every table log from the alphabet minimum upward, keeping the one with
+/// the smallest (estimated stream + table description) size, stopping once
+/// sizes regress.
+pub(crate) fn huf_optimal_table_log(
+    max_table_log: u32,
+    src_size: usize,
+    max_symbol: u32,
+    count: &[u32; HUF_SYMBOLVALUE_MAX + 1],
+    optimal_depth: bool,
+) -> u32 {
+    if !optimal_depth {
+        return fse_encode::optimal_table_log_internal(max_table_log, src_size, max_symbol, 1);
+    }
+    let cardinality = (0..=max_symbol as usize).filter(|&s| count[s] != 0).count() as u32;
+    let min_table_log = highbit32(cardinality) + 1;
+    let mut opt_size = usize::MAX - 1;
+    let mut opt_log = max_table_log;
+    for guess in min_table_log..=max_table_log {
+        let Ok(ct) = build_ctable(count, max_symbol, guess) else {
+            continue;
+        };
+        let max_bits = ct.table_log;
+        if max_bits < guess && guess > min_table_log {
+            break;
+        }
+        let Ok(desc) = write_ctable(&ct) else {
+            continue;
+        };
+        let new_size = estimate_compressed_size(&ct, count, max_symbol) + desc.len();
+        if new_size > opt_size + 1 {
+            break;
+        }
+        if new_size < opt_size {
+            opt_size = new_size;
+            opt_log = guess;
+        }
+    }
+    opt_log
+}
+
 /// The outcome of trying to Huffman-compress a literals payload, mirroring the
 /// `HUF_compress_internal` return signals.
 pub(crate) enum HufOutput {
@@ -679,6 +721,7 @@ pub(crate) fn huf_compress(
     single_stream: bool,
     suspect_uncompressible: bool,
     prefer_repeat: bool,
+    optimal_depth: bool,
     prev: Option<&HufCTable>,
     mut repeat: HufRepeat,
 ) -> HufOutput {
@@ -747,11 +790,12 @@ pub(crate) fn huf_compress(
         }
     }
 
-    let huff_log = fse_encode::optimal_table_log_internal(
+    let huff_log = huf_optimal_table_log(
         HUF_TABLELOG_DEFAULT,
         src_size,
         max_symbol,
-        1, // HUF uses minus = 1
+        &count,
+        optimal_depth,
     );
     let ct = match build_ctable(&count, max_symbol, huff_log) {
         Ok(ct) => ct,

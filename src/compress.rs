@@ -4,15 +4,14 @@
 //! (`ZSTD_writeFrameHeader` / `ZSTD_compress_frameChunk` /
 //! `ZSTD_compressBlock_internal`).
 //!
-//! Current scope: levels whose resolved strategy is `ZSTD_fast`, `ZSTD_dfast`,
-//! `ZSTD_greedy`, `ZSTD_lazy`, or `ZSTD_lazy2` (levels 1-12 and the
-//! negative/acceleration levels; the exact split depends on the srcSize
-//! class), any input size, no dictionary, no checksum — the `ZSTD_compress`
-//! defaults. The binary-tree strategies (levels 13+) return [`Error::Encode`]
-//! until their match finders are ported — except for inputs too small to run
-//! a match finder at all, which are exact at every level. Block boundaries
-//! follow `ZSTD_optimalBlockSize`, including the 1.5.7 pre-block splitter
-//! ([`crate::pre_split`]). The lazy framework lives in [`crate::lazy`].
+//! Current scope: **every compression level** (1-22 and the negative /
+//! acceleration levels), any input size, no dictionary, no checksum — the
+//! `ZSTD_compress` defaults. All nine strategies are implemented: fast and
+//! dfast here, greedy/lazy/lazy2/btlazy2 in [`crate::lazy`], and
+//! btopt/btultra/btultra2 in [`crate::opt`]. Block boundaries follow
+//! `ZSTD_optimalBlockSize` (the 1.5.7 pre-block splitter,
+//! [`crate::pre_split`]); the bt-opt strategies additionally run the
+//! post-block splitter ([`crate::post_split`]).
 
 use crate::error::Error;
 use crate::pre_split;
@@ -1072,7 +1071,7 @@ fn dfast_post_match(
 // --- Frame assembly ----------------------------------------------------------------
 
 /// `ZSTD_isRLE`.
-fn is_rle(src: &[u8]) -> bool {
+pub(crate) fn is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
 }
 
@@ -1104,7 +1103,7 @@ fn write_frame_header(out: &mut Vec<u8>, cparams: &CParams, pledged_src_size: u6
 }
 
 /// Append a block header (3 bytes LE: last flag, type, size).
-fn push_block_header(out: &mut Vec<u8>, last: bool, block_type: u32, size: usize) {
+pub(crate) fn push_block_header(out: &mut Vec<u8>, last: bool, block_type: u32, size: usize) {
     let v = (last as u32) | (block_type << 1) | ((size as u32) << 3);
     out.extend_from_slice(&v.to_le_bytes()[..3]);
 }
@@ -1120,21 +1119,9 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     // is exact. The bound mirrors the per-block check in the loop below.
     let min_block_for_matcher = MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1;
     let matcher_can_run = src.len() >= min_block_for_matcher;
-    if matcher_can_run
-        && !matches!(
-            cparams.strategy,
-            Strategy::Fast
-                | Strategy::Dfast
-                | Strategy::Greedy
-                | Strategy::Lazy
-                | Strategy::Lazy2
-                | Strategy::Btlazy2
-        )
-    {
-        return Err(Error::Encode(
-            "only strategies up to btlazy2 (levels <= 15) are implemented so far",
-        ));
-    }
+    // All nine strategies are implemented; the gate remains only as a guard
+    // for future configurations that might resolve outside them.
+    let _ = matcher_can_run;
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
         // Match indices are 32-bit; larger inputs need the C window-cycling
         // (overflow correction) machinery.
@@ -1157,6 +1144,9 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
         Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
             Matcher::Lazy(crate::lazy::LazyCtx::new(&cparams))
+        }
+        Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+            Matcher::Opt(Box::new(crate::opt::OptCtx::new(&cparams)))
         }
         _ => Matcher::Fast(FastCtx::new(&cparams)),
     };
@@ -1215,9 +1205,38 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
                     pos,
                     pos + block_size,
                 ),
+                Matcher::Opt(ctx) => crate::opt::compress_block_opt(
+                    ctx,
+                    &mut store,
+                    &mut next_rep,
+                    src,
+                    pos,
+                    pos + block_size,
+                ),
             };
             let lits_from = block_size - last_ll_size;
             store.store_last_literals(&block[lits_from..]);
+
+            // The post-block splitter (btopt+ with windowLog >= 17) takes over
+            // block emission entirely: it may emit several blocks from this
+            // one seqStore, with dRep/cRep repcode reconciliation.
+            if crate::post_split::block_splitter_enabled(&cparams) {
+                let c_size = crate::post_split::compress_block_split(
+                    &mut out,
+                    &mut store,
+                    &mut entropy,
+                    &mut rep,
+                    next_rep,
+                    cparams.strategy as i32,
+                    block,
+                    last_block,
+                    is_first_block,
+                )?;
+                savings += block_size as i64 - c_size as i64;
+                pos += block_size;
+                is_first_block = false;
+                continue;
+            }
 
             match sequences_encode::entropy_compress_seq_store(
                 &store,
@@ -1283,4 +1302,5 @@ enum Matcher {
     Fast(FastCtx),
     Dfast(DfastCtx),
     Lazy(crate::lazy::LazyCtx),
+    Opt(Box<crate::opt::OptCtx>),
 }

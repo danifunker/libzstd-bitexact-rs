@@ -37,6 +37,8 @@ mod huffman;
 mod huffman_encode;
 mod lazy;
 mod literals_encode;
+mod opt;
+mod post_split;
 mod pre_split;
 mod sequences_encode;
 mod stream;

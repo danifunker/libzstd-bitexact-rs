@@ -88,11 +88,13 @@ not just emitting valid streams. Bottom-up:
       heuristics for choosing raw / RLE / compressed / treeless modes and
       stream counts (treeless landed with the cross-block state in M4).
 
-## M4 — Block compression, level by level
+## M4 — Block compression, level by level ✅
 
 This is where byte-exact-vs-C parity is finally tested *end-to-end*: once a
 match finder and frame assembly exist, the differential tests compare our
-compressed bytes against the C oracle's directly.
+compressed bytes against the C oracle's directly. **Complete: one-shot
+`compress(src, level)` is byte-identical to C libzstd 1.5.7 for every level
+(1-22 and the negative levels), any input size.**
 
 - [x] Sequence emission and `ZSTD_entropyCompressSeqStore`
       (`src/sequences_encode.rs`): `ZSTD_seqToCodes` (LL/ML code tables +
@@ -146,9 +148,30 @@ compressed bytes against the C oracle's directly.
       chain, gain-adjusted best-match rule, and the `matchEndIdx - 8`
       repetition skip) as a third backend of the lazy driver at depth 2.
       Gated at the btlazy2 levels of every srcSize class plus multi-block.
-- [ ] Remaining match finders: `btopt`, `btultra`, `btultra2` (levels 16-22,
-      the optimal parser of `zstd_opt.c`) — gated the same way. Unsupported
-      configurations return `Error::Encode` rather than silently diverging.
+- [x] **`btopt` / `btultra` / `btultra2` — BIT-EXACT** (levels 13-22; **all
+      22 levels now produce byte-identical frames to C**). Three pieces landed
+      together (`src/opt.rs`, `src/post_split.rs`):
+      * The optimal parser: price model (`ZSTD_fracWeight`/`bitWeight`,
+        `rescaleFreqs` first-block init + cross-block scaling,
+        `updateStats`), `ZSTD_insertBt1`/`updateTree`,
+        `ZSTD_insertBtAndGetAllMatches` (speculative repcode scan, the
+        minMatch-3 hash table, sorted match collection), the stretch-pricing
+        forward pass with its exact gain rules, and btultra2's
+        first-block stats-seeding double pass (window rewind emulated by
+        index biasing). The 1.5.7 `} {` dead-branch quirk in the
+        shortest-path traversal is reproduced as its *effective* behavior.
+      * `HUF_optimalTableLog`'s probing depth search
+        (`HUF_flags_optimalDepth`, strategies >= btultra).
+      * The **post-block splitter** (`ZSTD_compressBlock_splitBlock`,
+        auto-on for btopt+ with windowLog >= 17): recursive
+        estimate-and-bisect over the seqStore
+        (`ZSTD_buildBlockEntropyStats` + `ZSTD_estimateBlockSize`),
+        partition emission with dRep/cRep repcode reconciliation
+        (`ZSTD_seqStore_resolveOffCodes`), per-partition entropy
+        commits, and RLE/raw partition fallbacks.
+      Gated by byte-exact differential tests at levels 13-22 over all four
+      srcSize classes, periodic/mixed/random corpora, and multi-block inputs
+      combining both splitters.
 - [x] Parameter tables (`ZSTD_defaultCParameters`, all four srcSize classes)
       and `ZSTD_adjustCParams_internal` (window resize, hash/chain clamping,
       cycle log), verified against the C `ZSTD_getCParams` via FFI probing and

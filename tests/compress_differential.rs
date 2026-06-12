@@ -1,7 +1,6 @@
 //! THE bit-exactness tests: our `compress` output must be **byte-identical**
 //! to the C libzstd 1.5.7 oracle (`ZSTD_compress` via `zstd::bulk::compress`)
-//! for the supported scope — fast-strategy levels, inputs that don't engage
-//! the (unported) pre-block splitter.
+//! at every compression level (1-22 and negatives), any input size.
 
 /// xorshift64* — deterministic test data generator.
 struct Rng(u64);
@@ -432,20 +431,64 @@ fn btlazy2_levels_are_bit_exact() {
     }
 }
 
+/// The optimal-parser strategies (btopt/btultra/btultra2), levels 13-22 across
+/// all srcSize classes — including the post-block splitter (multi-block and
+/// within-block partitioning), the optimal-depth Huffman search (>= btultra),
+/// the minMatch-3 hash, and btultra2's first-block double pass.
 #[test]
-fn unsupported_scope_errors_cleanly_instead_of_diverging() {
-    // Levels resolving to unported strategies are explicit errors, never
-    // silently different bytes — once the input is big enough to actually
-    // run a match finder. Level 16 resolves to btopt in the default class
-    // (and ≥13 maps to btopt/btultra in the ≤16K class).
-    let data = word_salad(0xE44, 1000);
-    assert!(matches!(
-        libzstd_bitexact::compress(&data, 13),
-        Err(libzstd_bitexact::Error::Encode(_))
-    ));
-    let big = word_salad(0xE45, 300_000);
-    assert!(matches!(
-        libzstd_bitexact::compress(&big, 16),
-        Err(libzstd_bitexact::Error::Encode(_))
-    ));
+fn opt_levels_are_bit_exact() {
+    let sizes_and_levels: &[(usize, &[i32])] = &[
+        (1_000, &[11, 13, 16, 19, 22]), // ≤16K: btopt@11-12, btultra@13+, ultra2@16+
+        (10_000, &[11, 13, 16, 19, 22]),
+        (60_000, &[13, 15, 16, 18, 19, 22]), // ≤128K: btopt@13-15, btultra@16-18, ultra2@19+
+        (131_072, &[13, 16, 19, 22]),
+        (200_000, &[13, 15, 16, 18, 22]), // ≤256K: btopt@13-15, btultra@16-17, ultra2@18+
+        (500_000, &[16, 17, 18, 19, 22]), // default: btopt@16-17, btultra@18, ultra2@19+
+    ];
+    for &(len, levels) in sizes_and_levels {
+        let text = word_salad(0x0B70 ^ len as u64, len);
+        let mut rng = Rng::new(0x0B70_3000 ^ len as u64);
+        let random = rng.bytes(len);
+        let mut mixed = Vec::new();
+        while mixed.len() < len {
+            if rng.below(2) == 0 {
+                let b = (rng.next_u64() & 0xFF) as u8;
+                mixed.extend(std::iter::repeat_n(b, 1 + rng.below(400)));
+            } else {
+                let n = 1 + rng.below(60);
+                let r = rng.bytes(n);
+                mixed.extend_from_slice(&r);
+            }
+        }
+        mixed.truncate(len);
+
+        for &level in levels {
+            assert_bit_exact(&text, level, &format!("opt-text-{len}"));
+            assert_bit_exact(&random, level, &format!("opt-random-{len}"));
+            assert_bit_exact(&mixed, level, &format!("opt-mixed-{len}"));
+        }
+    }
+    // Repetitive data: repcode pricing, the opt parser's rep-history carry,
+    // and the splitter's resolveOffCodes interplay.
+    for &period in &[1usize, 4, 7, 16] {
+        let unit: Vec<u8> = (0..period).map(|i| (i * 37 + 11) as u8).collect();
+        let mut data = Vec::with_capacity(60_000);
+        while data.len() < 60_000 {
+            data.extend_from_slice(&unit);
+        }
+        data.truncate(60_000);
+        for &level in &[13, 16, 19, 22] {
+            assert_bit_exact(&data, level, &format!("opt-period-{period}"));
+        }
+    }
+    // Tiny inputs (predef-stats path: srcSize <= 8 uses fixed pricing).
+    for &level in &[13, 16, 19, 22] {
+        assert_bit_exact(b"abcdefgh", level, "opt-eight");
+        assert_bit_exact(b"hello world hello world", level, "opt-short-repeat");
+    }
+    // Multi-block at max level: pre-splitter + post-splitter together.
+    let big = word_salad(0x0B70_B16C, 700_000);
+    for &level in &[19, 22] {
+        assert_bit_exact(&big, level, "opt-multiblock-700k");
+    }
 }

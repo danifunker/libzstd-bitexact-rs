@@ -1,15 +1,17 @@
 //! One-shot compression (`ZSTD_compress`), aiming for **byte-identical output
 //! to C libzstd 1.5.7**: parameter derivation (`ZSTD_getCParams` /
-//! `ZSTD_adjustCParams`), the `ZSTD_fast` match finder, and frame assembly
+//! `ZSTD_adjustCParams`), the match finders, and frame assembly
 //! (`ZSTD_writeFrameHeader` / `ZSTD_compress_frameChunk` /
 //! `ZSTD_compressBlock_internal`).
 //!
-//! Current scope: levels whose resolved strategy is `ZSTD_fast` (levels 1-2
-//! and the negative/acceleration levels), any input size, no dictionary, no
+//! Current scope: levels whose resolved strategy is `ZSTD_fast` or
+//! `ZSTD_dfast` (levels 1-4 and the negative/acceleration levels; the exact
+//! split depends on the srcSize class), any input size, no dictionary, no
 //! checksum — the `ZSTD_compress` defaults. Other strategies return
-//! [`Error::Encode`] until their match finders are ported. Block boundaries
-//! follow `ZSTD_optimalBlockSize`, including the 1.5.7 pre-block splitter
-//! ([`crate::pre_split`]).
+//! [`Error::Encode`] until their match finders are ported — except for inputs
+//! too small to run a match finder at all, which are exact at every level.
+//! Block boundaries follow `ZSTD_optimalBlockSize`, including the 1.5.7
+//! pre-block splitter ([`crate::pre_split`]).
 
 use crate::error::Error;
 use crate::pre_split;
@@ -269,17 +271,19 @@ fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) -> usize {
     a - start
 }
 
-/// `ZSTD_hashPtr` for `mls` in 4..=7 (the fast strategy's range), hashing the
-/// bytes of `data` at `at`.
+/// `ZSTD_hashPtr` for `mls` in 4..=8 (8 is the double-fast long hash), hashing
+/// the bytes of `data` at `at`.
 fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
     const PRIME4: u32 = 2654435761;
     const PRIME5: u64 = 889523592379;
     const PRIME6: u64 = 227718039650203;
     const PRIME7: u64 = 58295818150454627;
+    const PRIME8: u64 = 0xCF1B_BCDC_B7A5_6463;
     match mls {
         5 => ((read64(data, at) << (64 - 40)).wrapping_mul(PRIME5) >> (64 - hlog)) as usize,
         6 => ((read64(data, at) << (64 - 48)).wrapping_mul(PRIME6) >> (64 - hlog)) as usize,
         7 => ((read64(data, at) << (64 - 56)).wrapping_mul(PRIME7) >> (64 - hlog)) as usize,
+        8 => (read64(data, at).wrapping_mul(PRIME8) >> (64 - hlog)) as usize,
         _ => (read32(data, at).wrapping_mul(PRIME4) >> (32 - hlog)) as usize,
     }
 }
@@ -674,6 +678,385 @@ fn post_match(
     }
 }
 
+// --- The ZSTD_dfast match finder ----------------------------------------------------
+
+/// Double-fast keeps two tables: a long one hashing 8 bytes (`hashLog` bits)
+/// and a short one hashing `mls` bytes (`chainLog` bits). Indices are biased
+/// by [`WINDOW_START_INDEX`] like the fast matcher's.
+struct DfastCtx {
+    hash_long: Vec<u32>,
+    hash_small: Vec<u32>,
+    hlog_l: u32,
+    hlog_s: u32,
+    mls: u32,
+    window_log: u32,
+}
+
+impl DfastCtx {
+    fn new(cparams: &CParams) -> Self {
+        DfastCtx {
+            hash_long: vec![0u32; 1usize << cparams.hash_log],
+            hash_small: vec![0u32; 1usize << cparams.chain_log],
+            hlog_l: cparams.hash_log,
+            hlog_s: cparams.chain_log,
+            mls: cparams.min_match.clamp(4, 7),
+            window_log: cparams.window_log,
+        }
+    }
+}
+
+/// `ZSTD_compressBlock_doubleFast` (noDict path). Same conventions as
+/// [`compress_block_fast`]: biased indices, sequences into `store`, returns the
+/// trailing-literals size. The `ZSTD_selectAddr`/dummy-pointer constructs in C
+/// are branchless forms of plain `idx >= prefixLowestIndex` validity tests
+/// (the `+1` long probe is strictly `>`), which is how they appear here.
+fn compress_block_dfast(
+    ctx: &mut DfastCtx,
+    store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    data: &[u8],
+    block_start: usize,
+    block_end: usize,
+) -> usize {
+    let src_size = block_end - block_start;
+    let hlog_l = ctx.hlog_l;
+    let hlog_s = ctx.hlog_s;
+    let mls = ctx.mls;
+
+    let max_distance = 1usize << ctx.window_log;
+    let end_index = block_end + WINDOW_START_INDEX;
+    let prefix_start_index = if end_index - WINDOW_START_INDEX > max_distance {
+        end_index - max_distance
+    } else {
+        WINDOW_START_INDEX
+    };
+    // kStepIncr = 1 << kSearchStrength (256) — twice the fast matcher's.
+    let k_step_incr: usize = 1 << K_SEARCH_STRENGTH;
+
+    let bias = WINDOW_START_INDEX;
+    let to_pos = |idx: usize| idx - bias;
+    let istart = block_start + bias;
+    let iend = block_end + bias;
+    if src_size < HASH_READ_SIZE {
+        return src_size;
+    }
+    let ilimit = iend - HASH_READ_SIZE;
+
+    let mut anchor = istart;
+    let mut ip = istart;
+    let mut ip1: usize;
+
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+    let mut offset_saved1 = 0u32;
+    let mut offset_saved2 = 0u32;
+
+    // init: skip the very first window position.
+    ip += (ip == prefix_start_index) as usize;
+    {
+        let max_rep = (ip - prefix_start_index) as u32;
+        if offset_2 > max_rep {
+            offset_saved2 = offset_2;
+            offset_2 = 0;
+        }
+        if offset_1 > max_rep {
+            offset_saved1 = offset_1;
+            offset_1 = 0;
+        }
+    }
+
+    'outer: loop {
+        let mut step = 1usize;
+        let mut next_step = ip + k_step_incr;
+        ip1 = ip + step;
+
+        if ip1 > ilimit {
+            break 'outer;
+        }
+
+        let mut hl0 = hash_ptr(data, to_pos(ip), hlog_l, 8);
+        let mut idxl0 = ctx.hash_long[hl0];
+
+        loop {
+            let hs0 = hash_ptr(data, to_pos(ip), hlog_s, mls);
+            let idxs0 = ctx.hash_small[hs0];
+            let curr = ip;
+
+            ctx.hash_long[hl0] = curr as u32;
+            ctx.hash_small[hs0] = curr as u32;
+
+            // Sequence bookkeeping shared by every match exit.
+            let m_length: usize;
+            let m_ip: usize;
+            let hl1_for_writeback: Option<(usize, usize)>; // (hl1, ip1) when step < 4
+
+            // Check noDict repcode at ip+1.
+            if offset_1 > 0
+                && read32(data, to_pos(ip + 1 - offset_1 as usize)) == read32(data, to_pos(ip + 1))
+            {
+                let len = count_eq(
+                    data,
+                    to_pos(ip + 1) + 4,
+                    to_pos(ip + 1 - offset_1 as usize) + 4,
+                    to_pos(iend),
+                ) + 4;
+                let seq_ip = ip + 1;
+                store.store_seq(&data[to_pos(anchor)..to_pos(seq_ip)], 1, len as u32);
+                m_length = len;
+                m_ip = seq_ip;
+                // (no hl1 write on the repcode path)
+                ip = m_ip + m_length;
+                anchor = ip;
+                dfast_post_match(
+                    ctx,
+                    store,
+                    data,
+                    &mut ip,
+                    &mut anchor,
+                    curr,
+                    &mut offset_1,
+                    &mut offset_2,
+                    ilimit,
+                    iend,
+                    bias,
+                );
+                continue 'outer;
+            }
+
+            let hl1 = hash_ptr(data, to_pos(ip1), hlog_l, 8);
+
+            // Check prefix long match at ip (validity is `>=`, via selectAddr).
+            if idxl0 as usize >= prefix_start_index
+                && read64(data, to_pos(idxl0 as usize)) == read64(data, to_pos(ip))
+            {
+                let mut matchl0 = idxl0 as usize;
+                let mut len = count_eq(data, to_pos(ip) + 8, to_pos(matchl0) + 8, to_pos(iend)) + 8;
+                let offset = (ip - matchl0) as u32;
+                while ip > anchor
+                    && matchl0 > prefix_start_index
+                    && data[to_pos(ip) - 1] == data[to_pos(matchl0) - 1]
+                {
+                    ip -= 1;
+                    matchl0 -= 1;
+                    len += 1;
+                }
+                m_length = len;
+                m_ip = ip;
+                hl1_for_writeback = if step < 4 { Some((hl1, ip1)) } else { None };
+                dfast_match_found(
+                    ctx,
+                    store,
+                    data,
+                    &mut ip,
+                    &mut anchor,
+                    curr,
+                    &mut offset_1,
+                    &mut offset_2,
+                    offset,
+                    m_ip,
+                    m_length,
+                    hl1_for_writeback,
+                    ilimit,
+                    iend,
+                    bias,
+                );
+                continue 'outer;
+            }
+
+            let idxl1 = ctx.hash_long[hl1];
+
+            // Check prefix short match at ip (validity `>=`).
+            if idxs0 as usize >= prefix_start_index
+                && read32(data, to_pos(idxs0 as usize)) == read32(data, to_pos(ip))
+            {
+                // _search_next_long: extend the short match, then probe the
+                // long table at ip1 for something better (validity strictly `>`).
+                let mut matchs0 = idxs0 as usize;
+                let mut len = count_eq(data, to_pos(ip) + 4, to_pos(matchs0) + 4, to_pos(iend)) + 4;
+                let mut offset = (ip - matchs0) as u32;
+
+                if idxl1 as usize > prefix_start_index
+                    && read64(data, to_pos(idxl1 as usize)) == read64(data, to_pos(ip1))
+                {
+                    let l1len = count_eq(
+                        data,
+                        to_pos(ip1) + 8,
+                        to_pos(idxl1 as usize) + 8,
+                        to_pos(iend),
+                    ) + 8;
+                    if l1len > len {
+                        ip = ip1;
+                        len = l1len;
+                        offset = (ip - idxl1 as usize) as u32;
+                        matchs0 = idxl1 as usize;
+                    }
+                }
+
+                while ip > anchor
+                    && matchs0 > prefix_start_index
+                    && data[to_pos(ip) - 1] == data[to_pos(matchs0) - 1]
+                {
+                    ip -= 1;
+                    matchs0 -= 1;
+                    len += 1;
+                }
+
+                m_length = len;
+                m_ip = ip;
+                hl1_for_writeback = if step < 4 { Some((hl1, ip1)) } else { None };
+                dfast_match_found(
+                    ctx,
+                    store,
+                    data,
+                    &mut ip,
+                    &mut anchor,
+                    curr,
+                    &mut offset_1,
+                    &mut offset_2,
+                    offset,
+                    m_ip,
+                    m_length,
+                    hl1_for_writeback,
+                    ilimit,
+                    iend,
+                    bias,
+                );
+                continue 'outer;
+            }
+
+            if ip1 >= next_step {
+                step += 1;
+                next_step += k_step_incr;
+            }
+            ip = ip1;
+            ip1 += step;
+
+            hl0 = hl1;
+            idxl0 = idxl1;
+
+            if ip1 > ilimit {
+                break 'outer;
+            }
+        }
+    }
+
+    // _cleanup: rotate restored offsets exactly as the fast matcher does.
+    offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
+        offset_saved1
+    } else {
+        offset_saved2
+    };
+    rep[0] = if offset_1 != 0 {
+        offset_1
+    } else {
+        offset_saved1
+    };
+    rep[1] = if offset_2 != 0 {
+        offset_2
+    } else {
+        offset_saved2
+    };
+
+    to_pos(iend) - to_pos(anchor)
+}
+
+/// `_match_found` + `_match_stored` for an ordinary double-fast match: update
+/// the offset history, optionally write back the ip1 long hash, store the
+/// sequence, then run the shared post-match tail.
+#[allow(clippy::too_many_arguments)]
+fn dfast_match_found(
+    ctx: &mut DfastCtx,
+    store: &mut SeqStore,
+    data: &[u8],
+    ip: &mut usize,
+    anchor: &mut usize,
+    curr: usize,
+    offset_1: &mut u32,
+    offset_2: &mut u32,
+    offset: u32,
+    m_ip: usize,
+    m_length: usize,
+    hl1_writeback: Option<(usize, usize)>,
+    ilimit: usize,
+    iend: usize,
+    bias: usize,
+) {
+    let to_pos = |idx: usize| idx - bias;
+    *offset_2 = *offset_1;
+    *offset_1 = offset;
+
+    if let Some((hl1, ip1)) = hl1_writeback {
+        ctx.hash_long[hl1] = ip1 as u32;
+    }
+
+    store.store_seq(
+        &data[to_pos(*anchor)..to_pos(m_ip)],
+        offset + 3, // OFFSET_TO_OFFBASE
+        m_length as u32,
+    );
+    *ip = m_ip + m_length;
+    *anchor = *ip;
+
+    dfast_post_match(
+        ctx, store, data, ip, anchor, curr, offset_1, offset_2, ilimit, iend, bias,
+    );
+}
+
+/// The `_match_stored` tail: complementary insertion into both tables, then
+/// the greedy immediate-repcode loop.
+#[allow(clippy::too_many_arguments)]
+fn dfast_post_match(
+    ctx: &mut DfastCtx,
+    store: &mut SeqStore,
+    data: &[u8],
+    ip: &mut usize,
+    anchor: &mut usize,
+    curr: usize,
+    offset_1: &mut u32,
+    offset_2: &mut u32,
+    ilimit: usize,
+    iend: usize,
+    bias: usize,
+) {
+    let to_pos = |idx: usize| idx - bias;
+    let hlog_l = ctx.hlog_l;
+    let hlog_s = ctx.hlog_s;
+    let mls = ctx.mls;
+    if *ip <= ilimit {
+        // Complementary insertion: candidates could be > iend-8 before this.
+        let index_to_insert = curr + 2;
+        let h = hash_ptr(data, to_pos(index_to_insert), hlog_l, 8);
+        ctx.hash_long[h] = index_to_insert as u32;
+        let h = hash_ptr(data, to_pos(*ip - 2), hlog_l, 8);
+        ctx.hash_long[h] = (*ip - 2) as u32;
+        let h = hash_ptr(data, to_pos(index_to_insert), hlog_s, mls);
+        ctx.hash_small[h] = index_to_insert as u32;
+        let h = hash_ptr(data, to_pos(*ip - 1), hlog_s, mls);
+        ctx.hash_small[h] = (*ip - 1) as u32;
+
+        // Immediate repcode loop.
+        while *ip <= ilimit
+            && *offset_2 > 0
+            && read32(data, to_pos(*ip)) == read32(data, to_pos(*ip - *offset_2 as usize))
+        {
+            let r_length = count_eq(
+                data,
+                to_pos(*ip) + 4,
+                to_pos(*ip - *offset_2 as usize) + 4,
+                to_pos(iend),
+            ) + 4;
+            std::mem::swap(offset_1, offset_2);
+            let h = hash_ptr(data, to_pos(*ip), hlog_s, mls);
+            ctx.hash_small[h] = *ip as u32;
+            let h = hash_ptr(data, to_pos(*ip), hlog_l, 8);
+            ctx.hash_long[h] = *ip as u32;
+            store.store_seq(&[], 1, r_length as u32);
+            *ip += r_length;
+            *anchor = *ip;
+        }
+    }
+}
+
 // --- Frame assembly ----------------------------------------------------------------
 
 /// `ZSTD_isRLE`.
@@ -720,9 +1103,14 @@ fn push_block_header(out: &mut Vec<u8>, last: bool, block_type: u32, size: usize
 /// unsupported configurations return [`Error::Encode`] rather than diverging.
 pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     let cparams = get_cparams(level, src.len() as u64);
-    if cparams.strategy != Strategy::Fast {
+    // Inputs too small to reach ZSTD_buildSeqStore never run a match finder:
+    // every strategy produces the same trivial raw-block frame, so any level
+    // is exact. The bound mirrors the per-block check in the loop below.
+    let min_block_for_matcher = MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1;
+    let matcher_can_run = src.len() >= min_block_for_matcher;
+    if matcher_can_run && !matches!(cparams.strategy, Strategy::Fast | Strategy::Dfast) {
         return Err(Error::Encode(
-            "only the fast strategy (levels <= 2) is implemented so far",
+            "only the fast and dfast strategies (levels <= 4) are implemented so far",
         ));
     }
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
@@ -741,7 +1129,12 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     write_frame_header(&mut out, &cparams, src.len() as u64);
 
     let block_size_max = BLOCK_SIZE_MAX.min(1usize << cparams.window_log);
-    let mut ctx = FastCtx::new(&cparams);
+    let mut matcher = match cparams.strategy {
+        // For unsupported strategies this is only reachable when the matcher
+        // can never run (gate above); the Fast ctx is an unused placeholder.
+        Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
+        _ => Matcher::Fast(FastCtx::new(&cparams)),
+    };
     let mut rep: [u32; 3] = [1, 4, 8];
     let mut entropy = FseEntropyState::new();
     let mut savings: i64 = 0;
@@ -782,14 +1175,14 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
         } else {
             let mut store = SeqStore::new();
             let mut next_rep = rep;
-            let last_ll_size = compress_block_fast(
-                &mut ctx,
-                &mut store,
-                &mut next_rep,
-                src,
-                pos,
-                pos + block_size,
-            );
+            let last_ll_size = match &mut matcher {
+                Matcher::Fast(ctx) => {
+                    compress_block_fast(ctx, &mut store, &mut next_rep, src, pos, pos + block_size)
+                }
+                Matcher::Dfast(ctx) => {
+                    compress_block_dfast(ctx, &mut store, &mut next_rep, src, pos, pos + block_size)
+                }
+            };
             let lits_from = block_size - last_ll_size;
             store.store_last_literals(&block[lits_from..]);
 
@@ -850,4 +1243,10 @@ enum BlockKind {
     Raw,
     Rle,
     Compressed,
+}
+
+/// The per-strategy match-finder state held across a frame's blocks.
+enum Matcher {
+    Fast(FastCtx),
+    Dfast(DfastCtx),
 }

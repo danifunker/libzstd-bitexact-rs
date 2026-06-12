@@ -143,17 +143,78 @@ fn incompressible_inputs_are_bit_exact_including_multiblock() {
     for &len in &[100usize, 4096, 131_072, 200_000, 400_000] {
         let data = rng.bytes(len);
         for level in FAST_LEVELS {
-            // Level 2 resolves to dfast (not yet ported) in the
-            // 128 KiB < srcSize <= 256 KiB class.
-            if level == 2 && (131_072 + 1..=262_144).contains(&len) {
-                assert!(matches!(
-                    libzstd_bitexact::compress(&data, level),
-                    Err(libzstd_bitexact::Error::Encode(_))
-                ));
-                continue;
-            }
             assert_bit_exact(&data, level, &format!("random-{len}"));
         }
+    }
+}
+
+/// Levels resolving to the dfast strategy, across all four srcSize classes
+/// (≤16 KiB, ≤128 KiB, ≤256 KiB, default) — each class flips dfast on at
+/// different levels and with different minMatch/log parameters.
+#[test]
+fn dfast_levels_are_bit_exact() {
+    let sizes_and_levels: &[(usize, &[i32])] = &[
+        (1_000, &[3]),        // ≤16K class: row 3 is dfast (mls 4)
+        (10_000, &[3]),       // ≤16K class
+        (60_000, &[3, 4]),    // ≤128K class: rows 3-4 (mls 5, 4)
+        (131_072, &[3, 4]),   // boundary: still ≤128K class
+        (200_000, &[2, 3]),   // ≤256K class: rows 2-3 are dfast (mls 5, 4)
+        (500_000, &[3, 4]),   // default class: rows 3-4 (mls 5)
+        (1_000_000, &[3, 4]), // multi-block + pre-splitter (byChunks level 1)
+    ];
+    for &(len, levels) in sizes_and_levels {
+        let text = word_salad(0xDFA5 ^ len as u64, len);
+        let mut rng = Rng::new(0xDFA5_7000 ^ len as u64);
+        let random = rng.bytes(len);
+        // Mixed runs exercise RLE literals, repcodes, and the long/short
+        // table interplay.
+        let mut mixed = Vec::new();
+        while mixed.len() < len {
+            if rng.below(2) == 0 {
+                let b = (rng.next_u64() & 0xFF) as u8;
+                mixed.extend(std::iter::repeat_n(b, 1 + rng.below(400)));
+            } else {
+                let n = 1 + rng.below(60);
+                let r = rng.bytes(n);
+                mixed.extend_from_slice(&r);
+            }
+        }
+        mixed.truncate(len);
+
+        for &level in levels {
+            assert_bit_exact(&text, level, &format!("dfast-text-{len}"));
+            assert_bit_exact(&random, level, &format!("dfast-random-{len}"));
+            assert_bit_exact(&mixed, level, &format!("dfast-mixed-{len}"));
+        }
+    }
+    // Period edges drive the repcode-at-ip+1 path and backward extension.
+    for &period in &[1usize, 3, 4, 8, 16] {
+        let unit: Vec<u8> = (0..period).map(|i| (i * 37 + 11) as u8).collect();
+        let mut data = Vec::with_capacity(50_000);
+        while data.len() < 50_000 {
+            data.extend_from_slice(&unit);
+        }
+        data.truncate(50_000);
+        for level in [3, 4] {
+            assert_bit_exact(&data, level, &format!("dfast-period-{period}"));
+        }
+    }
+    // Tiny inputs: in the ≤16 KiB class only level 3 is dfast (level 4 is
+    // greedy there).
+    assert_bit_exact(b"", 3, "dfast-empty");
+    assert_bit_exact(b"a", 3, "dfast-one");
+    assert_bit_exact(b"abcdefgh", 3, "dfast-eight");
+    assert_bit_exact(b"hello world hello world", 3, "dfast-short-repeat");
+}
+
+/// Inputs below the buildSeqStore minimum (7 bytes) never run a match finder,
+/// so every level — including the unported strategies — is trivially exact.
+#[test]
+fn sub_seven_byte_inputs_are_bit_exact_at_every_level() {
+    for level in [4, 5, 9, 13, 19, 22, -1] {
+        assert_bit_exact(b"", level, "trivial-empty");
+        assert_bit_exact(b"a", level, "trivial-one");
+        assert_bit_exact(b"abcdef", level, "trivial-six");
     }
 }
 
@@ -250,9 +311,10 @@ fn multiblock_compressible_inputs_are_bit_exact() {
 #[test]
 fn unsupported_scope_errors_cleanly_instead_of_diverging() {
     // Levels resolving to unported strategies are explicit errors, never
-    // silently different bytes.
+    // silently different bytes — once the input is big enough to actually
+    // run a match finder. Level 5 resolves to greedy in every class.
     assert!(matches!(
-        libzstd_bitexact::compress(b"hello", 3),
+        libzstd_bitexact::compress(b"hello world, long enough to need a matcher", 5),
         Err(libzstd_bitexact::Error::Encode(_))
     ));
 }

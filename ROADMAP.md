@@ -118,7 +118,16 @@ compressed bytes against the C oracle's directly.
       `fast && targetLength > 0`). Gated by `tests/compress_differential.rs`:
       byte-for-byte equality with `ZSTD_compress` across text, runs, periods,
       structured records, random multi-block data, and size edges.
-- [ ] Remaining match finders, in C-strategy order: `dfast`, `greedy`,
+- [x] **`dfast` — BIT-EXACT.** `ZSTD_compressBlock_doubleFast` (noDict): the
+      two-table long/short search with its `>=`/`>` validity asymmetry, the
+      repcode-at-`ip+1` probe, the long-match-at-`ip1` upgrade, step
+      acceleration at `1 << kSearchStrength`, conditional `hl1` write-back,
+      and the dual-table complementary insertions. Gated by byte-exact
+      differential tests at every dfast level of all four srcSize classes
+      (levels 2-4 depending on class), including 1 MB multi-block inputs that
+      engage the `byChunks` pre-splitter. Inputs too small to run any match
+      finder (< 7 bytes) are now exact at *every* level.
+- [ ] Remaining match finders, in C-strategy order: `greedy`,
       `lazy`, `lazy2`, `btlazy2`, `btopt`, `btultra`, `btultra2` — each gated
       the same way. Unsupported configurations return `Error::Encode` rather
       than silently diverging.

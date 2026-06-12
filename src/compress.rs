@@ -4,14 +4,15 @@
 //! (`ZSTD_writeFrameHeader` / `ZSTD_compress_frameChunk` /
 //! `ZSTD_compressBlock_internal`).
 //!
-//! Current scope: levels whose resolved strategy is `ZSTD_fast` or
-//! `ZSTD_dfast` (levels 1-4 and the negative/acceleration levels; the exact
-//! split depends on the srcSize class), any input size, no dictionary, no
-//! checksum — the `ZSTD_compress` defaults. Other strategies return
-//! [`Error::Encode`] until their match finders are ported — except for inputs
-//! too small to run a match finder at all, which are exact at every level.
-//! Block boundaries follow `ZSTD_optimalBlockSize`, including the 1.5.7
-//! pre-block splitter ([`crate::pre_split`]).
+//! Current scope: levels whose resolved strategy is `ZSTD_fast`, `ZSTD_dfast`,
+//! `ZSTD_greedy`, `ZSTD_lazy`, or `ZSTD_lazy2` (levels 1-12 and the
+//! negative/acceleration levels; the exact split depends on the srcSize
+//! class), any input size, no dictionary, no checksum — the `ZSTD_compress`
+//! defaults. The binary-tree strategies (levels 13+) return [`Error::Encode`]
+//! until their match finders are ported — except for inputs too small to run
+//! a match finder at all, which are exact at every level. Block boundaries
+//! follow `ZSTD_optimalBlockSize`, including the 1.5.7 pre-block splitter
+//! ([`crate::pre_split`]). The lazy framework lives in [`crate::lazy`].
 
 use crate::error::Error;
 use crate::pre_split;
@@ -245,24 +246,35 @@ pub(crate) fn get_cparams(level: i32, src_size: u64) -> CParams {
     if cp.window_log < WINDOWLOG_ABSOLUTEMIN {
         cp.window_log = WINDOWLOG_ABSOLUTEMIN;
     }
-    // The row-match-finder hashLog cap only applies to greedy/lazy/lazy2
-    // strategies; not the fast path.
+    // Row-match-finder hashLog cap: (hashLog - rowLog + 8) <= 32. At this
+    // point C conservatively assumes row mode is on for the strategies that
+    // support it (greedy..lazy2).
+    if matches!(
+        cp.strategy,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    ) {
+        let row_log = cp.search_log.clamp(4, 6);
+        let max_hash_log = (32 - 8) + row_log;
+        if cp.hash_log > max_hash_log {
+            cp.hash_log = max_hash_log;
+        }
+    }
     cp
 }
 
 // --- Small shared helpers ------------------------------------------------------
 
-fn read32(data: &[u8], at: usize) -> u32 {
+pub(crate) fn read32(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
 }
 
-fn read64(data: &[u8], at: usize) -> u64 {
+pub(crate) fn read64(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(data[at..at + 8].try_into().unwrap())
 }
 
 /// `ZSTD_count`: length of the common run of `data[a..]` and `data[b..]`,
 /// reading no further than `limit` for the `a` cursor.
-fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) -> usize {
+pub(crate) fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) -> usize {
     let start = a;
     while a < limit && data[a] == data[b] {
         a += 1;
@@ -273,7 +285,7 @@ fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) -> usize {
 
 /// `ZSTD_hashPtr` for `mls` in 4..=8 (8 is the double-fast long hash), hashing
 /// the bytes of `data` at `at`.
-fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
+pub(crate) fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
     const PRIME4: u32 = 2654435761;
     const PRIME5: u64 = 889523592379;
     const PRIME6: u64 = 227718039650203;
@@ -1108,9 +1120,14 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     // is exact. The bound mirrors the per-block check in the loop below.
     let min_block_for_matcher = MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1;
     let matcher_can_run = src.len() >= min_block_for_matcher;
-    if matcher_can_run && !matches!(cparams.strategy, Strategy::Fast | Strategy::Dfast) {
+    if matcher_can_run
+        && !matches!(
+            cparams.strategy,
+            Strategy::Fast | Strategy::Dfast | Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+        )
+    {
         return Err(Error::Encode(
-            "only the fast and dfast strategies (levels <= 4) are implemented so far",
+            "only strategies up to lazy2 (levels <= 12) are implemented so far",
         ));
     }
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
@@ -1133,6 +1150,9 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
         // For unsupported strategies this is only reachable when the matcher
         // can never run (gate above); the Fast ctx is an unused placeholder.
         Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+            Matcher::Lazy(crate::lazy::LazyCtx::new(&cparams))
+        }
         _ => Matcher::Fast(FastCtx::new(&cparams)),
     };
     let mut rep: [u32; 3] = [1, 4, 8];
@@ -1182,6 +1202,14 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
                 Matcher::Dfast(ctx) => {
                     compress_block_dfast(ctx, &mut store, &mut next_rep, src, pos, pos + block_size)
                 }
+                Matcher::Lazy(ctx) => crate::lazy::compress_block_lazy(
+                    ctx,
+                    &mut store,
+                    &mut next_rep,
+                    src,
+                    pos,
+                    pos + block_size,
+                ),
             };
             let lits_from = block_size - last_ll_size;
             store.store_last_literals(&block[lits_from..]);
@@ -1249,4 +1277,5 @@ enum BlockKind {
 enum Matcher {
     Fast(FastCtx),
     Dfast(DfastCtx),
+    Lazy(crate::lazy::LazyCtx),
 }

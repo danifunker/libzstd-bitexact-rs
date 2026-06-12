@@ -127,10 +127,22 @@ compressed bytes against the C oracle's directly.
       (levels 2-4 depending on class), including 1 MB multi-block inputs that
       engage the `byChunks` pre-splitter. Inputs too small to run any match
       finder (< 7 bytes) are now exact at *every* level.
-- [ ] Remaining match finders, in C-strategy order: `greedy`,
-      `lazy`, `lazy2`, `btlazy2`, `btopt`, `btultra`, `btultra2` — each gated
-      the same way. Unsupported configurations return `Error::Encode` rather
-      than silently diverging.
+- [x] **`greedy` / `lazy` / `lazy2` — BIT-EXACT** (levels up to 12). The
+      shared `ZSTD_compressBlock_lazy_generic` driver (`src/lazy.rs`, depths
+      0/1/2: the depth ladder with its exact gain comparisons, lazy-skipping
+      step acceleration, catch-up, and immediate-repcode loop) over both
+      search backends: `ZSTD_HcFindBestMatch` (hash chains, used when the
+      adjusted windowLog ≤ 14) and the row-based `ZSTD_RowFindBestMatch`
+      (tag table with circular row heads, hash cache, the 384/96/32 update
+      skip, and the salted hash — the one-shot salt is the deterministic
+      `bitmix(0,8)^bitmix(0,4)` of a fresh CCtx). The row finder's SIMD paths
+      are accelerators only; the scalar port produces identical bytes.
+      Includes the row-mode hashLog cap in `ZSTD_adjustCParams`. Gated by
+      byte-exact differential tests at every greedy/lazy/lazy2 level of all
+      four srcSize classes, both backends, plus multi-block 1 MB inputs.
+- [ ] Remaining match finders: `btlazy2`, `btopt`, `btultra`, `btultra2`
+      (levels 13-22) — each gated the same way. Unsupported configurations
+      return `Error::Encode` rather than silently diverging.
 - [x] Parameter tables (`ZSTD_defaultCParameters`, all four srcSize classes)
       and `ZSTD_adjustCParams_internal` (window resize, hash/chain clamping,
       cycle log), verified against the C `ZSTD_getCParams` via FFI probing and

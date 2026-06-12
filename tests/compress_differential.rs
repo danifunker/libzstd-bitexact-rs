@@ -308,13 +308,85 @@ fn multiblock_compressible_inputs_are_bit_exact() {
     assert_bit_exact(&lit_heavy, 1, "literal-heavy-500k");
 }
 
+/// Levels resolving to greedy/lazy/lazy2 across the srcSize classes. Small
+/// inputs (windowLog <= 14 after adjustment) use the hash-chain search;
+/// larger ones use the row matcher — both must be byte-exact.
+#[test]
+fn lazy_levels_are_bit_exact() {
+    // Greedy/lazy/lazy2 occupy different level bands per srcSize class; the
+    // bands below stop where btlazy2 begins in each class.
+    let sizes_and_levels: &[(usize, &[i32])] = &[
+        (800, &[4, 5, 6, 7, 8]), // ≤16K: greedy@4, lazy@5, lazy2@6-8
+        (5_000, &[4, 5, 6, 7, 8]),
+        (16_384, &[4, 5, 6, 7, 8]),
+        (60_000, &[5, 6, 7, 8, 9, 10]), // ≤128K: greedy@5, lazy@6, lazy2@7-10
+        (131_072, &[5, 6, 7, 8, 9, 10]),
+        (200_000, &[4, 5, 6, 7, 8, 9, 10]), // ≤256K: greedy@4-5, lazy@6-7, lazy2@8-10
+        (500_000, &[5, 6, 7, 8, 9, 10, 11, 12]), // default: lazy2 through 12
+    ];
+    for &(len, levels) in sizes_and_levels {
+        let text = word_salad(0x1A2_7000 ^ len as u64, len);
+        let mut rng = Rng::new(0x1A2_9000 ^ len as u64);
+        let random = rng.bytes(len);
+        let mut mixed = Vec::new();
+        while mixed.len() < len {
+            if rng.below(2) == 0 {
+                let b = (rng.next_u64() & 0xFF) as u8;
+                mixed.extend(std::iter::repeat_n(b, 1 + rng.below(400)));
+            } else {
+                let n = 1 + rng.below(60);
+                let r = rng.bytes(n);
+                mixed.extend_from_slice(&r);
+            }
+        }
+        mixed.truncate(len);
+
+        for &level in levels {
+            assert_bit_exact(&text, level, &format!("lazy-text-{len}"));
+            assert_bit_exact(&random, level, &format!("lazy-random-{len}"));
+            assert_bit_exact(&mixed, level, &format!("lazy-mixed-{len}"));
+        }
+    }
+    // Periodic data: repcode-heavy, exercises the depth ladder's rep checks
+    // (60K is the ≤128K class: greedy/lazy/lazy2 are levels 5..=10).
+    for &period in &[1usize, 4, 7, 16] {
+        let unit: Vec<u8> = (0..period).map(|i| (i * 37 + 11) as u8).collect();
+        let mut data = Vec::with_capacity(60_000);
+        while data.len() < 60_000 {
+            data.extend_from_slice(&unit);
+        }
+        data.truncate(60_000);
+        for &level in &[5, 6, 8, 10] {
+            assert_bit_exact(&data, level, &format!("lazy-period-{period}"));
+        }
+    }
+    // Tiny inputs at the ≤16K class's greedy/lazy/lazy2 levels.
+    for &level in &[4, 5, 8] {
+        assert_bit_exact(b"abcdefgh", level, "lazy-eight");
+        assert_bit_exact(b"hello world hello world", level, "lazy-short-repeat");
+    }
+}
+
+/// Multi-block lazy: the pre-splitter at byChunks levels 2-3 plus cross-block
+/// table state (nextToUpdate catch-up across block boundaries).
+#[test]
+fn lazy_multiblock_is_bit_exact() {
+    for &len in &[300_000usize, 1_000_000] {
+        let data = word_salad(0x1A2_B10C ^ len as u64, len);
+        for &level in &[5, 9, 12] {
+            assert_bit_exact(&data, level, &format!("lazy-multiblock-{len}"));
+        }
+    }
+}
+
 #[test]
 fn unsupported_scope_errors_cleanly_instead_of_diverging() {
     // Levels resolving to unported strategies are explicit errors, never
     // silently different bytes — once the input is big enough to actually
-    // run a match finder. Level 5 resolves to greedy in every class.
+    // run a match finder. Level 13 resolves to btlazy2 in the default class.
+    let data = word_salad(0xE44, 1000);
     assert!(matches!(
-        libzstd_bitexact::compress(b"hello world, long enough to need a matcher", 5),
+        libzstd_bitexact::compress(&data, 13),
         Err(libzstd_bitexact::Error::Encode(_))
     ));
 }

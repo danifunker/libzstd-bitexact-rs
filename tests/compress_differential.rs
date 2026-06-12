@@ -307,6 +307,50 @@ fn multiblock_compressible_inputs_are_bit_exact() {
     assert_bit_exact(&lit_heavy, 1, "literal-heavy-500k");
 }
 
+/// Repcode offsets just under the window size: `maxRep` at a block start is
+/// `curr - ZSTD_getLowestPrefixIndex(ms, curr, windowLog)` — evaluated at the
+/// *block start*, which allows one full block more than the block-end-derived
+/// prefix bound. The layout below installs a repcode of `offset` bytes (in
+/// that one-block margin) right at a sliding-window block boundary: an
+/// 8-byte marker repeats `offset` apart, the second copy just before the
+/// boundary, with zero filler whose repcode probes match trivially right
+/// after it. Deriving maxRep from the block end instead zeroes the rep and
+/// diverges from C.
+#[test]
+fn near_window_rep_offsets_at_block_boundaries_are_bit_exact() {
+    // (rep offset, boundary position, total, levels)
+    // Level 1 (and dfast levels 3-4) resolve in the "default" srcSize class:
+    // windowLog 19 (512 KiB window) and 21 (2 MiB) respectively. The
+    // boundary is the first block start whose index exceeds the window size;
+    // the offset lies in the one-block margin (window - blockSize, window].
+    let cases: &[(usize, usize, usize, &[i32])] = &[
+        (500_000, 5 * 131_072, 8 * 131_072, &[1, -1]),
+        (2_000_000, 17 * 131_072, 19 * 131_072, &[3, 4]),
+    ];
+    for &(offset, boundary, total, levels) in cases {
+        let marker: [u8; 8] = [0xD3, 0x1F, 0x8A, 0x47, 0xC6, 0x65, 0x29, 0xBE];
+        let mut data = vec![0u8; total];
+        // The marker pair: the second copy just before the boundary. Its
+        // match (found through the otherwise hash-quiet zeros) installs
+        // rep1 = offset in the block that ends at the boundary.
+        let a2 = boundary - 200;
+        data[a2 - offset..a2 - offset + 8].copy_from_slice(&marker);
+        data[a2..a2 + 8].copy_from_slice(&marker);
+        // The block after the boundary starts with zeros — so the kept
+        // repcode matches immediately — but must not be uniform, or the RLE
+        // block override would mask the divergent sequences. A two-byte
+        // cycle keeps it compressible without being RLE.
+        let mut i = boundary + 1024;
+        while i < (boundary + 131_072).min(total) {
+            data[i] = if i % 2 == 0 { 0x55 } else { 0xAA };
+            i += 1;
+        }
+        for &level in levels {
+            assert_bit_exact(&data, level, &format!("near-window-rep-{offset}"));
+        }
+    }
+}
+
 /// Levels resolving to greedy/lazy/lazy2 across the srcSize classes. Small
 /// inputs (windowLog <= 14 after adjustment) use the hash-chain search;
 /// larger ones use the row matcher — both must be byte-exact.

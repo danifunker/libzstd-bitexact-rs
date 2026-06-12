@@ -19,12 +19,14 @@
 //! content size) unless the size is pledged up front or the whole input is
 //! handed to the first [`StreamEncoder::finish`] call (the C auto-pledge).
 //!
-//! Current scope: when the staged stream outgrows the input buffer, the C
-//! window wraps and the previous segment becomes an *extDict* — the extDict
-//! match finders are not ported yet, so [`StreamEncoder`] reports a clean
-//! [`Error::Encode`] at that point instead of diverging. The buffer holds
-//! `windowSize + blockSize` bytes (640 KiB at level 1 up to 128 MiB+ at the
-//! top levels), so bounded streams below that always succeed.
+//! Current scope: when the staged stream outgrows the input buffer
+//! (`windowSize + blockSize` bytes — 640 KiB at level 1 up to 128 MiB+ at the
+//! top levels), the buffer wraps and the previous segment becomes an
+//! *extDict*. The fast strategy's extDict match finder is ported, so levels
+//! resolving to it (1, 2, and the negative levels) stream without length
+//! limits (up to the C overflow-correction threshold of 3500 MiB); the other
+//! strategies report a clean [`Error::Encode`] at the wrap point instead of
+//! diverging.
 
 use crate::compress::FrameCompressor;
 use crate::error::Error;
@@ -71,9 +73,6 @@ struct StreamState {
     in_to_compress: usize,
     in_buff_pos: usize,
     in_buff_target: usize,
-    /// Set when the input buffer has wrapped: the next chunk is
-    /// non-contiguous and needs the (unported) extDict match finders.
-    wrapped: bool,
 }
 
 impl StreamEncoder {
@@ -165,7 +164,6 @@ impl StreamEncoder {
             in_to_compress: 0,
             in_buff_pos: 0,
             in_buff_target,
-            wrapped: false,
         });
     }
 
@@ -199,12 +197,6 @@ impl StreamEncoder {
             }
 
             // Compress the staged chunk.
-            if st.wrapped {
-                return Err(Error::Encode(
-                    "stream exceeds windowSize+blockSize: extDict match finders \
-                     are not implemented yet",
-                ));
-            }
             let last_block = op == EndOp::End && input.is_empty();
             if last_block {
                 st.fc
@@ -220,13 +212,15 @@ impl StreamEncoder {
                 )?;
             }
 
-            // Prepare the next block; past the buffer end, wrap to the start
-            // (turning the live window into an extDict — see module docs).
+            // Prepare the next block; past the buffer end, wrap to the start.
+            // The wrapped chunk is non-contiguous, turning the live window
+            // into the extDict — supported by the fast strategy's match
+            // finder; other strategies report a clean error from
+            // `compress_continue` until their extDict variants are ported.
             st.in_buff_target = st.in_buff_pos + block_size;
             if st.in_buff_target > st.in_buff.len() {
                 st.in_buff_pos = 0;
                 st.in_buff_target = block_size;
-                st.wrapped = true;
             }
             st.in_to_compress = st.in_buff_pos;
             if self.frame_ended {

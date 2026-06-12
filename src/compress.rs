@@ -299,6 +299,130 @@ pub(crate) fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
     }
 }
 
+// --- The window (ZSTD_window_t) ----------------------------------------------------
+
+/// `ZSTD_window_t`, with the C `base`/`dictBase` pointers replaced by index
+/// biases into the caller's history buffer: index `i` of the *current*
+/// segment lives at `buf[i - seg_bias]` (so `base = buf - seg_bias`), and the
+/// previous segment — the extDict, `i` in `[low_limit, dict_limit)` — lives
+/// at `buf[i - dict_bias]`.
+///
+/// One-shot compression is a single contiguous segment with `seg_bias == 2`
+/// (`ZSTD_WINDOW_START_INDEX`). Streaming wraps its input buffer once full;
+/// the wrap makes the next chunk non-contiguous, which turns the whole live
+/// window into the extDict exactly as `ZSTD_window_update` does.
+pub(crate) struct Window {
+    pub(crate) seg_bias: u32,
+    pub(crate) dict_bias: u32,
+    /// `window.lowLimit`: lowest valid index overall (extDict start).
+    pub(crate) low_limit: u32,
+    /// `window.dictLimit`: first index of the current segment.
+    pub(crate) dict_limit: u32,
+    /// `window.nextSrc` as (buffer position, index): where the next chunk
+    /// must start to be contiguous, and the index it would get.
+    next_src_pos: usize,
+    next_src_idx: u32,
+}
+
+impl Window {
+    /// `ZSTD_window_init` (plus the first-update segment flip baked in: the
+    /// first chunk always starts a fresh segment at index 2 with an empty
+    /// dict, so the flip is a no-op).
+    fn new() -> Self {
+        Window {
+            seg_bias: WINDOW_START_INDEX as u32,
+            dict_bias: WINDOW_START_INDEX as u32,
+            low_limit: WINDOW_START_INDEX as u32,
+            dict_limit: WINDOW_START_INDEX as u32,
+            next_src_pos: 0,
+            next_src_idx: WINDOW_START_INDEX as u32,
+        }
+    }
+
+    /// `ZSTD_window_update`: register `buf[start..end]` as the next chunk.
+    /// Returns whether it was contiguous with the previous one; if not, the
+    /// current prefix becomes the extDict. Also shrinks the extDict when the
+    /// new chunk overwrites part of it in the (shared) buffer.
+    fn update(&mut self, start: usize, end: usize) -> bool {
+        if start == end {
+            return true;
+        }
+        let mut contiguous = true;
+        if start != self.next_src_pos {
+            self.low_limit = self.dict_limit;
+            self.dict_limit = self.next_src_idx;
+            self.dict_bias = self.seg_bias;
+            // base = ip - distanceFromBase, i.e. buf[start] gets the next index.
+            self.seg_bias = self.next_src_idx - start as u32;
+            if self.dict_limit - self.low_limit < HASH_READ_SIZE as u32 {
+                // Too small extDict: forget it.
+                self.low_limit = self.dict_limit;
+            }
+            contiguous = false;
+        }
+        self.next_src_pos = end;
+        self.next_src_idx = self.seg_bias + end as u32;
+        // If input and dictionary overlap (same buffer), reduce the
+        // dictionary to the part not overwritten by the input. Pointer
+        // comparisons in C; signed offsets here since the dict bias can
+        // exceed the buffer positions involved.
+        let dict_bias = i64::from(self.dict_bias);
+        if (end as i64 > i64::from(self.low_limit) - dict_bias)
+            && ((start as i64) < i64::from(self.dict_limit) - dict_bias)
+        {
+            let high_input_idx = end as i64 + dict_bias;
+            self.low_limit = if high_input_idx > i64::from(self.dict_limit) {
+                self.dict_limit
+            } else {
+                high_input_idx as u32
+            };
+        }
+        contiguous
+    }
+
+    /// `ZSTD_window_enforceMaxDist` (no dictionary): called before each
+    /// block; slides `lowLimit` to `idx - maxDist` and drags `dictLimit`
+    /// along once the extDict falls out of the window. (The C parameter is
+    /// named `blockEnd`, but `ZSTD_compress_frameChunk` anchors it at the
+    /// block *start* `ip`.)
+    fn enforce_max_dist(&mut self, idx: u32, max_dist: u32) {
+        if idx > max_dist {
+            let new_low_limit = idx - max_dist;
+            if self.low_limit < new_low_limit {
+                self.low_limit = new_low_limit;
+            }
+            if self.dict_limit < self.low_limit {
+                self.dict_limit = self.low_limit;
+            }
+        }
+    }
+
+    /// `ZSTD_window_hasExtDict`, which decides the dict mode
+    /// (`ZSTD_matchState_dictMode`): extDict iff `lowLimit < dictLimit`.
+    fn has_ext_dict(&self) -> bool {
+        self.low_limit < self.dict_limit
+    }
+}
+
+/// `ZSTD_count_2segments`: count the match length when `match` lives in the
+/// extDict segment — count up to `mend`, then continue comparing from
+/// `istart` (the prefix start). All arguments are buffer positions.
+fn count_2segments(
+    buf: &[u8],
+    ip: usize,
+    matched: usize,
+    iend: usize,
+    mend: usize,
+    istart: usize,
+) -> usize {
+    let v_end = (ip + (mend - matched)).min(iend);
+    let match_length = count_eq(buf, ip, matched, v_end);
+    if matched + match_length != mend {
+        return match_length;
+    }
+    match_length + count_eq(buf, ip + match_length, istart, iend)
+}
+
 // --- The ZSTD_fast match finder ---------------------------------------------------
 
 /// Position bias: index `i` of the input maps to match index `i + 2`
@@ -325,8 +449,13 @@ impl FastCtx {
     }
 }
 
-/// `ZSTD_compressBlock_fast` (noDict path), operating on the whole frame input
+/// `ZSTD_compressBlock_fast` (noDict path), operating on the history buffer
 /// `data` with the current block being `data[block_start..block_end]`.
+///
+/// `seg_bias` maps buffer positions to window indices (`idx = pos +
+/// seg_bias`; 2 for a frame's first segment) and `lowest_valid` is
+/// `window.dictLimit`, the lowest index of the current segment — both only
+/// differ from 2 after a streaming buffer wrap.
 ///
 /// Returns the size of the trailing literals; emits sequences into `store` and
 /// updates `rep`. The `useCmov`/branch variants of the candidate test are
@@ -339,26 +468,28 @@ fn compress_block_fast(
     data: &[u8],
     block_start: usize,
     block_end: usize,
+    seg_bias: usize,
+    lowest_valid: usize,
 ) -> usize {
     let src_size = block_end - block_start;
     let hlog = ctx.hlog;
     let mls = ctx.mls;
     let step_size = ctx.step_size;
-    // `ZSTD_getLowestPrefixIndex` after `ZSTD_window_enforceMaxDist`: once the
-    // frame outgrows the window, the lowest valid match index slides to
+    // `ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog)`: once the frame
+    // outgrows the window, the lowest valid match index slides to
     // blockEnd - windowSize. (Biased indices, like everything below.)
     let max_distance = 1usize << ctx.window_log;
-    let end_index = block_end + WINDOW_START_INDEX;
-    let prefix_start_index = if end_index - WINDOW_START_INDEX > max_distance {
+    let end_index = block_end + seg_bias;
+    let prefix_start_index = if end_index - lowest_valid > max_distance {
         end_index - max_distance
     } else {
-        WINDOW_START_INDEX
+        lowest_valid
     };
     let k_step_incr: usize = 1 << (K_SEARCH_STRENGTH - 1);
 
-    // All `ipN` variables are *biased* indices (input position + 2), matching
-    // the C pointer arithmetic `ip - base`.
-    let bias = WINDOW_START_INDEX;
+    // All `ipN` variables are *biased* indices (buffer position + seg_bias),
+    // matching the C pointer arithmetic `ip - base`.
+    let bias = seg_bias;
     let to_pos = |idx: usize| idx - bias; // biased index -> data position
     let istart = block_start + bias;
     let iend = block_end + bias;
@@ -395,8 +526,15 @@ fn compress_block_fast(
 
     ip0 += (ip0 == prefix_start_index) as usize; // skip the very first window position
     {
+        // `ZSTD_getLowestPrefixIndex(ms, curr, windowLog)` — at the *block
+        // start*, not the block end: when the window slides, maxRep is the
+        // full window size, one block more than prefix_start_index allows.
         let curr = ip0;
-        let window_low = prefix_start_index; // within-window for our scope
+        let window_low = if curr - lowest_valid > max_distance {
+            curr - max_distance
+        } else {
+            lowest_valid
+        };
         let max_rep = (curr - window_low) as u32;
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;
@@ -689,6 +827,445 @@ fn post_match(
     }
 }
 
+// --- The ZSTD_fast extDict match finder --------------------------------------------
+
+/// The per-block two-segment geometry of `ZSTD_compressBlock_fast_extDict`,
+/// shared by the matcher body and its match tail. Index space is the window's
+/// (`idx = pos + bias` per segment); `*_pos` fields are buffer positions.
+struct ExtDictView {
+    seg_bias: usize,
+    dict_bias: usize,
+    /// `prefixStartIndex` (== `dictLimit` while the extDict is live).
+    prefix_start_index: usize,
+    /// `dictStart`: lowest valid extDict byte, as a buffer position.
+    dict_start_pos: usize,
+    /// `dictEnd`: one-past-the-end of the extDict, as a buffer position.
+    dict_end_pos: usize,
+    prefix_start_pos: usize,
+    iend_pos: usize,
+    ilimit: usize,
+    hlog: u32,
+    mls: u32,
+}
+
+impl ExtDictView {
+    fn pos_p(&self, idx: usize) -> usize {
+        idx - self.seg_bias
+    }
+    /// Buffer position of `idx`, resolved through the segment the C code
+    /// would pick (`idx < prefixStartIndex ? dictBase : base`).
+    fn pos_seg(&self, idx: usize) -> usize {
+        if idx < self.prefix_start_index {
+            idx - self.dict_bias
+        } else {
+            idx - self.seg_bias
+        }
+    }
+    fn match_end_pos(&self, idx: usize) -> usize {
+        if idx < self.prefix_start_index {
+            self.dict_end_pos
+        } else {
+            self.iend_pos
+        }
+    }
+}
+
+/// `ZSTD_compressBlock_fast_extDict_generic`: the fast matcher over a
+/// two-segment window — matches may start in the extDict (the pre-wrap
+/// streaming history) and run across the seam into the prefix.
+fn compress_block_fast_extdict(
+    ctx: &mut FastCtx,
+    store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    data: &[u8],
+    block_start: usize,
+    block_end: usize,
+    win: &Window,
+) -> usize {
+    let src_size = block_end - block_start;
+    let hlog = ctx.hlog;
+    let mls = ctx.mls;
+    let step_size = ctx.step_size;
+    let k_step_incr: usize = 1 << (K_SEARCH_STRENGTH - 1);
+
+    let seg_bias = win.seg_bias as usize;
+    let istart = block_start + seg_bias;
+    let iend = block_end + seg_bias;
+    let end_index = iend;
+
+    // ZSTD_getLowestMatchIndex(ms, endIndex, windowLog): lowest valid index
+    // in either segment.
+    let max_distance = 1usize << ctx.window_log;
+    let lowest_valid = win.low_limit as usize;
+    let dict_start_index = if end_index - lowest_valid > max_distance {
+        end_index - max_distance
+    } else {
+        lowest_valid
+    };
+    let dict_limit = win.dict_limit as usize;
+    let prefix_start_index = dict_start_index.max(dict_limit);
+
+    // Switch to the "regular" variant if extDict is invalidated by maxDistance.
+    if prefix_start_index == dict_start_index {
+        return compress_block_fast(
+            ctx,
+            store,
+            rep,
+            data,
+            block_start,
+            block_end,
+            seg_bias,
+            dict_limit,
+        );
+    }
+    if src_size < HASH_READ_SIZE {
+        return src_size;
+    }
+
+    let w = ExtDictView {
+        seg_bias,
+        dict_bias: win.dict_bias as usize,
+        prefix_start_index,
+        dict_start_pos: dict_start_index - win.dict_bias as usize,
+        dict_end_pos: prefix_start_index - win.dict_bias as usize,
+        prefix_start_pos: prefix_start_index - seg_bias,
+        iend_pos: block_end,
+        ilimit: iend - HASH_READ_SIZE,
+        hlog,
+        mls,
+    };
+
+    let mut anchor = istart;
+    let mut ip0 = istart;
+    let mut ip1: usize;
+    let mut ip2: usize;
+    let mut ip3: usize;
+    let mut current0: u32;
+
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+    let mut offset_saved1 = 0u32;
+    let mut offset_saved2 = 0u32;
+
+    // No first-position skip here; note `>=` where the noDict variant uses `>`.
+    {
+        let curr = ip0 as u32;
+        let max_rep = curr - dict_start_index as u32;
+        if offset_2 >= max_rep {
+            offset_saved2 = offset_2;
+            offset_2 = 0;
+        }
+        if offset_1 >= max_rep {
+            offset_saved1 = offset_1;
+            offset_1 = 0;
+        }
+    }
+
+    let mut hash0: usize;
+    let mut hash1: usize;
+    let mut idx: u32;
+
+    let mut step: usize;
+    let mut next_step: usize;
+
+    'outer: loop {
+        // _start:
+        step = step_size;
+        next_step = ip0 + k_step_incr;
+        ip1 = ip0 + 1;
+        ip2 = ip0 + step;
+        ip3 = ip2 + 1;
+
+        if ip3 >= w.ilimit {
+            break 'outer;
+        }
+
+        hash0 = hash_ptr(data, w.pos_p(ip0), hlog, mls);
+        hash1 = hash_ptr(data, w.pos_p(ip1), hlog, mls);
+        idx = ctx.hash_table[hash0];
+
+        loop {
+            // Load the repcode match for ip[2]. The `(U32)(prefixStartIndex -
+            // repIndex) >= 4` intentional-underflow test admits prefix-side
+            // repcodes outright and dict-side ones only when the 4-byte read
+            // stays below the seam.
+            let current2 = ip2;
+            let rep_index = current2.wrapping_sub(offset_1 as usize);
+            let rval = if (prefix_start_index as u32).wrapping_sub(rep_index as u32) >= 4
+                && offset_1 > 0
+            {
+                read32(data, w.pos_seg(rep_index))
+            } else {
+                read32(data, w.pos_p(ip2)) ^ 1 // guaranteed to not match
+            };
+
+            // Write back hash table entry.
+            current0 = ip0 as u32;
+            ctx.hash_table[hash0] = current0;
+
+            // Check repcode at ip[2].
+            if read32(data, w.pos_p(ip2)) == rval {
+                ip0 = ip2;
+                let mut match0 = rep_index;
+                let match_seg_pos = w.pos_seg(match0);
+                let ext = (data[w.pos_p(ip0) - 1] == data[match_seg_pos - 1]) as usize;
+                let mut m_length = ext;
+                ip0 -= ext;
+                match0 -= ext;
+                m_length += 4;
+                extdict_match_tail(
+                    ctx,
+                    store,
+                    data,
+                    &mut ip0,
+                    &mut anchor,
+                    current0,
+                    &mut offset_1,
+                    &mut offset_2,
+                    m_length,
+                    1, // REPCODE1_TO_OFFBASE
+                    match0,
+                    hash1,
+                    ip1,
+                    &w,
+                );
+                continue 'outer;
+            }
+
+            {
+                // Load + check match for ip[0] (validity vs dictStartIndex,
+                // segment select vs prefixStartIndex, as in C).
+                let mval = if idx as usize >= dict_start_index {
+                    read32(data, w.pos_seg(idx as usize))
+                } else {
+                    read32(data, w.pos_p(ip0)) ^ 1
+                };
+                if read32(data, w.pos_p(ip0)) == mval {
+                    extdict_offset_and_match(
+                        ctx,
+                        store,
+                        data,
+                        &mut ip0,
+                        &mut anchor,
+                        current0,
+                        &mut offset_1,
+                        &mut offset_2,
+                        idx,
+                        hash1,
+                        ip1,
+                        &w,
+                    );
+                    continue 'outer;
+                }
+            }
+
+            // Lookup ip[1], hash ip[2], advance.
+            idx = ctx.hash_table[hash1];
+            hash0 = hash1;
+            hash1 = hash_ptr(data, w.pos_p(ip2), hlog, mls);
+            ip0 = ip1;
+            ip1 = ip2;
+            ip2 = ip3;
+
+            current0 = ip0 as u32;
+            ctx.hash_table[hash0] = current0;
+
+            {
+                let mval = if idx as usize >= dict_start_index {
+                    read32(data, w.pos_seg(idx as usize))
+                } else {
+                    read32(data, w.pos_p(ip0)) ^ 1
+                };
+                if read32(data, w.pos_p(ip0)) == mval {
+                    extdict_offset_and_match(
+                        ctx,
+                        store,
+                        data,
+                        &mut ip0,
+                        &mut anchor,
+                        current0,
+                        &mut offset_1,
+                        &mut offset_2,
+                        idx,
+                        hash1,
+                        ip1,
+                        &w,
+                    );
+                    continue 'outer;
+                }
+            }
+
+            idx = ctx.hash_table[hash1];
+            hash0 = hash1;
+            hash1 = hash_ptr(data, w.pos_p(ip2), hlog, mls);
+            ip0 = ip1;
+            ip1 = ip2;
+            ip2 = ip0 + step;
+            ip3 = ip1 + step;
+
+            if ip2 >= next_step {
+                step += 1;
+                next_step += k_step_incr;
+            }
+            if ip3 >= w.ilimit {
+                break 'outer;
+            }
+        }
+    }
+
+    // _cleanup: same saved-offset rotation as the noDict variant.
+    offset_saved2 = if offset_saved1 != 0 && offset_1 != 0 {
+        offset_saved1
+    } else {
+        offset_saved2
+    };
+    rep[0] = if offset_1 != 0 {
+        offset_1
+    } else {
+        offset_saved1
+    };
+    rep[1] = if offset_2 != 0 {
+        offset_2
+    } else {
+        offset_saved2
+    };
+
+    iend - anchor
+}
+
+/// The `_offset` tail: compute the offset from `idx`, extend backward within
+/// the match's segment, then fall into the shared `_match` tail.
+#[allow(clippy::too_many_arguments)]
+fn extdict_offset_and_match(
+    ctx: &mut FastCtx,
+    store: &mut SeqStore,
+    data: &[u8],
+    ip0: &mut usize,
+    anchor: &mut usize,
+    current0: u32,
+    offset_1: &mut u32,
+    offset_2: &mut u32,
+    idx: u32,
+    hash1: usize,
+    ip1: usize,
+    w: &ExtDictView,
+) {
+    let offset = current0 - idx;
+    let mut match0 = idx as usize;
+    let in_dict = match0 < w.prefix_start_index;
+    let low_match_pos = if in_dict {
+        w.dict_start_pos
+    } else {
+        w.prefix_start_pos
+    };
+    let match_bias = if in_dict { w.dict_bias } else { w.seg_bias };
+
+    *offset_2 = *offset_1;
+    *offset_1 = offset;
+    let offcode = offset + 3; // OFFSET_TO_OFFBASE
+    let mut m_length = 4usize;
+
+    // Count the backwards match length (bounded by the match's segment).
+    while *ip0 > *anchor
+        && (match0 - match_bias) > low_match_pos
+        && data[w.pos_p(*ip0) - 1] == data[match0 - match_bias - 1]
+    {
+        *ip0 -= 1;
+        match0 -= 1;
+        m_length += 1;
+    }
+
+    extdict_match_tail(
+        ctx, store, data, ip0, anchor, current0, offset_1, offset_2, m_length, offcode, match0,
+        hash1, ip1, w,
+    );
+}
+
+/// The `_match` tail: two-segment forward count, sequence store, the
+/// conditional ip1 hash write-back, table fill, and the immediate-repcode
+/// loop with two-segment reads.
+#[allow(clippy::too_many_arguments)]
+fn extdict_match_tail(
+    ctx: &mut FastCtx,
+    store: &mut SeqStore,
+    data: &[u8],
+    ip0: &mut usize,
+    anchor: &mut usize,
+    current0: u32,
+    offset_1: &mut u32,
+    offset_2: &mut u32,
+    mut m_length: usize,
+    offcode: u32,
+    match0: usize,
+    hash1: usize,
+    ip1: usize,
+    w: &ExtDictView,
+) {
+    let hlog = w.hlog;
+    let mls = w.mls;
+
+    // Count the forward length across the dict/prefix seam.
+    m_length += count_2segments(
+        data,
+        w.pos_p(*ip0) + m_length,
+        w.pos_seg(match0) + m_length,
+        w.iend_pos,
+        w.match_end_pos(match0),
+        w.prefix_start_pos,
+    );
+    store.store_seq(
+        &data[w.pos_p(*anchor)..w.pos_p(*ip0)],
+        offcode,
+        m_length as u32,
+    );
+    *ip0 += m_length;
+    *anchor = *ip0;
+
+    // Write next hash table entry.
+    if ip1 < *ip0 {
+        ctx.hash_table[hash1] = ip1 as u32;
+    }
+
+    // Fill table and check for immediate repcode.
+    if *ip0 <= w.ilimit {
+        let c02 = current0 as usize + 2;
+        let h = hash_ptr(data, w.pos_p(c02), hlog, mls);
+        ctx.hash_table[h] = c02 as u32;
+        let h2 = hash_ptr(data, w.pos_p(*ip0 - 2), hlog, mls);
+        ctx.hash_table[h2] = (*ip0 - 2) as u32;
+
+        while *ip0 <= w.ilimit {
+            let rep_index2 = ip0.wrapping_sub(*offset_2 as usize);
+            // ZSTD_index_overlap_check: repIndex2 must not straddle the seam.
+            let no_overlap = (w.prefix_start_index as u32)
+                .wrapping_sub(1)
+                .wrapping_sub(rep_index2 as u32)
+                >= 3;
+            if !(no_overlap && *offset_2 > 0) {
+                break;
+            }
+            let rep_match2_pos = w.pos_seg(rep_index2);
+            if read32(data, rep_match2_pos) != read32(data, w.pos_p(*ip0)) {
+                break;
+            }
+            let rep_length2 = count_2segments(
+                data,
+                w.pos_p(*ip0) + 4,
+                rep_match2_pos + 4,
+                w.iend_pos,
+                w.match_end_pos(rep_index2),
+                w.prefix_start_pos,
+            ) + 4;
+            std::mem::swap(offset_1, offset_2);
+            store.store_seq(&[], 1, rep_length2 as u32);
+            let h = hash_ptr(data, w.pos_p(*ip0), hlog, mls);
+            ctx.hash_table[h] = *ip0 as u32;
+            *ip0 += rep_length2;
+            *anchor = *ip0;
+        }
+    }
+}
+
 // --- The ZSTD_dfast match finder ----------------------------------------------------
 
 /// Double-fast keeps two tables: a long one hashing 8 bytes (`hashLog` bits)
@@ -765,7 +1342,15 @@ fn compress_block_dfast(
     // init: skip the very first window position.
     ip += (ip == prefix_start_index) as usize;
     {
-        let max_rep = (ip - prefix_start_index) as u32;
+        // `ZSTD_getLowestPrefixIndex(ms, current, windowLog)` at the *block
+        // start* (not prefix_start_index, which derives from the block end):
+        // when the window slides, maxRep spans the full window.
+        let window_low = if ip - WINDOW_START_INDEX > max_distance {
+            ip - max_distance
+        } else {
+            WINDOW_START_INDEX
+        };
+        let max_rep = (ip - window_low) as u32;
         if offset_2 > max_rep {
             offset_saved2 = offset_2;
             offset_2 = 0;
@@ -1154,6 +1739,7 @@ pub(crate) struct FrameCompressor {
     xxh: crate::xxhash::Xxh64,
     stage: Stage,
     disable_literal_compression: bool,
+    window: Window,
 }
 
 impl FrameCompressor {
@@ -1197,6 +1783,7 @@ impl FrameCompressor {
             xxh: crate::xxhash::Xxh64::new(0),
             stage: Stage::Init,
             disable_literal_compression,
+            window: Window::new(),
         }
     }
 
@@ -1233,6 +1820,26 @@ impl FrameCompressor {
             self.produced += (out.len() - out_start) as u64;
             return Ok(());
         }
+
+        // Beyond ZSTD_CURRENT_MAX (3500 MiB of total index space) the C
+        // encoder starts running overflow correction, which is not ported.
+        const CURRENT_MAX: u64 = 3500 * (1 << 20);
+        if u64::from(self.window.next_src_idx) + (chunk_end - chunk_start) as u64 > CURRENT_MAX {
+            return Err(Error::Encode(
+                "total input beyond 3500 MiB needs index overflow correction, \
+                 which is not implemented yet",
+            ));
+        }
+        // `ZSTD_window_update`: a non-contiguous chunk (the streaming input
+        // buffer wrapped) turns the live window into the extDict, which only
+        // the fast strategy's match finder supports so far.
+        if !self.window.update(chunk_start, chunk_end) && self.cparams.strategy != Strategy::Fast {
+            return Err(Error::Encode(
+                "streaming beyond windowSize+blockSize requires the extDict \
+                 match finders, which are only ported for the fast strategy \
+                 (levels 1-2 and negative levels) so far",
+            ));
+        }
         if self.checksum {
             self.xxh.update(&data[chunk_start..chunk_end]);
         }
@@ -1258,6 +1865,15 @@ impl FrameCompressor {
             let last_block = last_frame_chunk && block_size == remaining;
             let block = &data[pos..pos + block_size];
 
+            // `ZSTD_window_enforceMaxDist` runs before every block, anchored
+            // at the *block start* (`ip`, not `ip + blockSize` — that one
+            // only feeds `ZSTD_checkDictValidity`); the dict mode below
+            // (extDict vs noDict) is decided on the result. The matchers
+            // tighten their own validity bound from the block end.
+            let block_start_idx = pos as u32 + self.window.seg_bias;
+            self.window
+                .enforce_max_dist(block_start_idx, 1u32 << cparams.window_log);
+
             // --- ZSTD_compressBlock_internal ---
             let mut c_size_kind: BlockKind;
             let mut body: Vec<u8> = Vec::new();
@@ -1269,14 +1885,32 @@ impl FrameCompressor {
                 let mut store = SeqStore::new();
                 let mut next_rep = self.rep;
                 let last_ll_size = match &mut self.matcher {
-                    Matcher::Fast(ctx) => compress_block_fast(
-                        ctx,
-                        &mut store,
-                        &mut next_rep,
-                        data,
-                        pos,
-                        pos + block_size,
-                    ),
+                    Matcher::Fast(ctx) => {
+                        // `ZSTD_selectBlockCompressor(strategy, ..,
+                        // ZSTD_matchState_dictMode(ms))`.
+                        if self.window.has_ext_dict() {
+                            compress_block_fast_extdict(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                &self.window,
+                            )
+                        } else {
+                            compress_block_fast(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                self.window.seg_bias as usize,
+                                self.window.dict_limit as usize,
+                            )
+                        }
+                    }
                     Matcher::Dfast(ctx) => compress_block_dfast(
                         ctx,
                         &mut store,

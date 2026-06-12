@@ -84,8 +84,9 @@ not just emitting valid streams. Bottom-up:
       encode→decode round-trips through the C-tested decoder (including a
       distribution that drives the height-limiting clamp) and a
       `write_ctable`→`read_table` round-trip over both weight paths.
-- [ ] Literals-section encoder, including the C heuristics for choosing
-      raw / RLE / compressed / treeless modes and stream counts.
+- [x] Literals-section encoder (`src/literals_encode.rs`), including the C
+      heuristics for choosing raw / RLE / compressed / treeless modes and
+      stream counts (treeless landed with the cross-block state in M4).
 
 ## M4 — Block compression, level by level
 

@@ -5,19 +5,14 @@
 //! `ZSTD_compressBlock_internal`).
 //!
 //! Current scope: levels whose resolved strategy is `ZSTD_fast` (levels 1-2
-//! and the negative/acceleration levels), no dictionary, no checksum — the
-//! `ZSTD_compress` defaults. Other strategies return
-//! [`Error::Encode`] until their match finders are ported.
-//!
-//! One genuine limitation is marked explicitly rather than silently diverging:
-//! zstd 1.5.7's `ZSTD_optimalBlockSize` engages a pre-block splitter
-//! (`ZSTD_splitBlock`) for blocks after the first once at least 3 bytes of
-//! savings have accumulated. That splitter is not ported yet, so inputs that
-//! would reach it (> 128 KiB and compressing) return `Error::Encode`. The
-//! paths that cannot reach it — any input ≤ 128 KiB, and larger
-//! non-compressing inputs — are exact.
+//! and the negative/acceleration levels), any input size, no dictionary, no
+//! checksum — the `ZSTD_compress` defaults. Other strategies return
+//! [`Error::Encode`] until their match finders are ported. Block boundaries
+//! follow `ZSTD_optimalBlockSize`, including the 1.5.7 pre-block splitter
+//! ([`crate::pre_split`]).
 
 use crate::error::Error;
+use crate::pre_split;
 use crate::sequences_encode::{self, FseEntropyState, SeqStore};
 
 /// `ZSTD_WINDOW_START_INDEX`: indices 0 and 1 are reserved, so a hash-table
@@ -299,6 +294,7 @@ struct FastCtx {
     hlog: u32,
     mls: u32,
     step_size: usize,
+    window_log: u32,
 }
 
 impl FastCtx {
@@ -309,6 +305,7 @@ impl FastCtx {
             // stepSize = targetLength + !targetLength + 1 (min 2).
             step_size: cparams.target_length as usize + (cparams.target_length == 0) as usize + 1,
             mls: cparams.min_match.clamp(4, 7),
+            window_log: cparams.window_log,
         }
     }
 }
@@ -332,7 +329,16 @@ fn compress_block_fast(
     let hlog = ctx.hlog;
     let mls = ctx.mls;
     let step_size = ctx.step_size;
-    let prefix_start_index = WINDOW_START_INDEX; // contiguous, window >= src
+    // `ZSTD_getLowestPrefixIndex` after `ZSTD_window_enforceMaxDist`: once the
+    // frame outgrows the window, the lowest valid match index slides to
+    // blockEnd - windowSize. (Biased indices, like everything below.)
+    let max_distance = 1usize << ctx.window_log;
+    let end_index = block_end + WINDOW_START_INDEX;
+    let prefix_start_index = if end_index - WINDOW_START_INDEX > max_distance {
+        end_index - max_distance
+    } else {
+        WINDOW_START_INDEX
+    };
     let k_step_incr: usize = 1 << (K_SEARCH_STRENGTH - 1);
 
     // All `ipN` variables are *biased* indices (input position + 2), matching
@@ -750,16 +756,18 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 
     while pos < src.len() {
         let remaining = src.len() - pos;
-        // ZSTD_optimalBlockSize: the pre-block splitter engages only for full
-        // 128 KiB blocks once savings >= 3; that path is not ported yet.
+        // ZSTD_optimalBlockSize: only full 128 KiB blocks are candidates for
+        // pre-splitting, and only once at least 3 bytes of savings are
+        // verified (so the first block is never split). The auto split level
+        // is `splitLevels[strategy]` — 0 (fromBorders) for the fast strategy.
         let block_size = if remaining < BLOCK_SIZE_MAX || block_size_max < BLOCK_SIZE_MAX {
             remaining.min(block_size_max)
         } else if savings < 3 {
             BLOCK_SIZE_MAX
         } else {
-            return Err(Error::Encode(
-                "pre-block splitting (>128 KiB compressible inputs) not yet ported",
-            ));
+            const SPLIT_LEVELS: [usize; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
+            let split_level = SPLIT_LEVELS[cparams.strategy as usize];
+            pre_split::split_block(&src[pos..pos + BLOCK_SIZE_MAX], split_level)
         };
         let last_block = block_size == remaining;
         let block = &src[pos..pos + block_size];

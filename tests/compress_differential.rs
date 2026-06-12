@@ -191,15 +191,66 @@ fn cycles_and_period_edges_are_bit_exact() {
 }
 
 #[test]
+fn multiblock_compressible_inputs_are_bit_exact() {
+    // Beyond 128 KiB with verified savings, block boundaries come from the
+    // pre-block splitter (`ZSTD_splitBlock`) — boundary choices must match C
+    // exactly for the frames to be identical.
+    for &len in &[150_000usize, 300_000, 1_000_000] {
+        let data = word_salad(0x5EED ^ len as u64, len);
+        for level in [1, -1, -3] {
+            assert_bit_exact(&data, level, &format!("text-multiblock-{len}"));
+        }
+    }
+    // Content that *shifts* statistics mid-stream actually triggers splits.
+    let mut shifting = Vec::new();
+    let mut rng = Rng::new(0x517F);
+    while shifting.len() < 700_000 {
+        let kind = rng.below(3);
+        let n = 30_000 + rng.below(150_000);
+        match kind {
+            0 => {
+                let from = shifting.len();
+                while shifting.len() < from + n {
+                    shifting.extend_from_slice(b"steady prose section with words ");
+                }
+            }
+            1 => {
+                let b = (rng.next_u64() & 0xFF) as u8;
+                shifting.extend(std::iter::repeat_n(b, n));
+            }
+            _ => {
+                let r = rng.bytes(n);
+                shifting.extend_from_slice(&r);
+            }
+        }
+    }
+    shifting.truncate(700_000);
+    for level in [1, -1, -3] {
+        assert_bit_exact(&shifting, level, "shifting-content");
+    }
+    // Level 2 beyond 256 KiB resolves to the fast strategy again.
+    let big = word_salad(0xB16, 400_000);
+    assert_bit_exact(&big, 2, "text-multiblock-level2-400k");
+
+    // Literal-heavy: 6-bit random bytes yield few matches but Huffman-friendly
+    // literals with stationary statistics — the habitat of treeless
+    // (`set_repeat`) literals sections in later blocks.
+    let mut rng = Rng::new(0x111E);
+    let mut lit_heavy = Vec::with_capacity(500_000 + 8);
+    while lit_heavy.len() < 500_000 {
+        let r = rng.next_u64();
+        for k in 0..8 {
+            lit_heavy.push(((r >> (8 * k)) as u8) & 0x3F);
+        }
+    }
+    lit_heavy.truncate(500_000);
+    assert_bit_exact(&lit_heavy, 1, "literal-heavy-500k");
+}
+
+#[test]
 fn unsupported_scope_errors_cleanly_instead_of_diverging() {
-    // Compressible input beyond one block reaches the unported pre-splitter:
-    // must be a clean error, never silently different bytes.
-    let big = word_salad(0x5EED, 300_000);
-    assert!(matches!(
-        libzstd_bitexact::compress(&big, 1),
-        Err(libzstd_bitexact::Error::Encode(_))
-    ));
-    // Levels above the fast strategy are likewise explicit.
+    // Levels resolving to unported strategies are explicit errors, never
+    // silently different bytes.
     assert!(matches!(
         libzstd_bitexact::compress(b"hello", 3),
         Err(libzstd_bitexact::Error::Encode(_))

@@ -125,11 +125,17 @@ compressed bytes against the C oracle's directly.
       and `ZSTD_adjustCParams_internal` (window resize, hash/chain clamping,
       cycle log), verified against the C `ZSTD_getCParams` via FFI probing and
       end-to-end by the byte-exact frame headers.
-- [ ] Block splitter: `ZSTD_compressBlock` decision points (RLE/raw
-      fallbacks, the `cSize > 1` confirm rule, savings tracking) are done and
-      byte-exact; `ZSTD_splitBlock` (the 1.5.7 pre-block splitter for
-      compressible inputs beyond 128 KiB) is the missing piece — such inputs
-      error explicitly until it lands.
+- [x] Block splitter and multi-block parity: `ZSTD_splitBlock`
+      (`src/pre_split.rs`, both the `fromBorders` level used by fast and the
+      `byChunks` levels for higher strategies), the sliding-window match floor
+      (`ZSTD_window_enforceMaxDist` / `ZSTD_getLowestPrefixIndex` — the lowest
+      valid match index moves to `blockEnd − windowSize` once the frame
+      outgrows the window), and treeless literals (`set_repeat`: the
+      `HUF_repeat` validate/estimate reuse logic and the cross-block Huffman
+      state). With these, arbitrarily large inputs are byte-exact at the fast
+      levels — including 1 MB+ frames whose windows slide, content that
+      actually triggers pre-splits, and literal-heavy data that reuses
+      Huffman tables across blocks.
 
 ## M5 — Full API parity
 

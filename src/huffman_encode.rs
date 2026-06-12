@@ -60,11 +60,37 @@ struct NodeElt {
 
 /// A built Huffman compression table: per-symbol code length and canonical
 /// code value, plus the table log (= max code length).
+#[derive(Clone)]
 pub(crate) struct HufCTable {
     pub(crate) table_log: u32,
     pub(crate) max_symbol: u32,
     nb_bits: [u8; HUF_SYMBOLVALUE_MAX + 1],
     code: [u16; HUF_SYMBOLVALUE_MAX + 1],
+}
+
+/// `HUF_repeat`: whether a previous block's table may be reused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum HufRepeat {
+    #[default]
+    None,
+    Check,
+    Valid,
+}
+
+/// `HUF_validateCTable`: the old table can encode the new histogram.
+fn validate_ctable(ct: &HufCTable, count: &[u32], max_symbol: u32) -> bool {
+    if ct.max_symbol < max_symbol {
+        return false;
+    }
+    (0..=max_symbol as usize).all(|s| count[s] == 0 || ct.nb_bits[s] != 0)
+}
+
+/// `HUF_estimateCompressedSize`: stream bytes under `ct` for this histogram.
+fn estimate_compressed_size(ct: &HufCTable, count: &[u32], max_symbol: u32) -> usize {
+    let bits: u64 = (0..=max_symbol as usize)
+        .map(|s| ct.nb_bits[s] as u64 * count[s] as u64)
+        .sum();
+    (bits >> 3) as usize
 }
 
 /// A node array with the C `-1` barrier slot: logical index `i` (which ranges
@@ -491,8 +517,13 @@ pub(crate) fn compress1x(ct: &HufCTable, src: &[u8]) -> Vec<u8> {
 }
 
 /// `HUF_compress4X_usingCTable`: four streams with a 6-byte jump table holding
-/// the compressed sizes of the first three.
+/// the compressed sizes of the first three. Returns an empty vector (C's
+/// "return 0") when the input is too small for four streams or a sub-stream
+/// overflows the 16-bit jump-table field.
 pub(crate) fn compress4x(ct: &HufCTable, src: &[u8]) -> Vec<u8> {
+    if src.len() < 12 {
+        return Vec::new(); // no saving possible: too small for 4 streams
+    }
     let segment = src.len().div_ceil(4);
     let mut out = vec![0u8; 6];
     let bounds = [
@@ -503,6 +534,9 @@ pub(crate) fn compress4x(ct: &HufCTable, src: &[u8]) -> Vec<u8> {
     ];
     for (i, &(start, end)) in bounds.iter().enumerate() {
         let stream = compress1x(ct, &src[start..end]);
+        if stream.is_empty() || stream.len() > 65535 {
+            return Vec::new();
+        }
         if i < 3 {
             let size = stream.len() as u16;
             out[2 * i] = size as u8;
@@ -596,35 +630,71 @@ pub(crate) fn write_ctable(ct: &HufCTable) -> Result<Vec<u8>, Error> {
 }
 
 /// The outcome of trying to Huffman-compress a literals payload, mirroring the
-/// `HUF_compress_internal` return signals (no table reuse).
+/// `HUF_compress_internal` return signals.
 pub(crate) enum HufOutput {
     /// Not worth compressing — caller emits raw literals (`return 0`).
     Raw,
     /// A single symbol fills the input — caller emits an RLE block (`return 1`).
     Rle,
-    /// The Huffman payload: table description followed by the coded stream(s).
-    Compressed(Vec<u8>),
+    /// A fresh table was built: `table description || stream(s)`, plus the
+    /// table itself for the caller's next-block state.
+    Compressed(Vec<u8>, Box<HufCTable>),
+    /// The previous block's table was reused (`set_repeat`): stream(s) only.
+    Repeat(Vec<u8>),
 }
 
 /// `SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE` and its ratio gate.
 const SUSPECT_SAMPLE_SIZE: usize = 4096;
 const SUSPECT_SAMPLE_RATIO: usize = 10;
 
-/// Port of `HUF_compress_internal` without the repeat/old-table paths: build a
-/// fresh table and emit `table description || stream(s)`, applying the same
-/// incompressibility short-circuits. `single_stream` selects 1- vs 4-stream
-/// coding; `suspect_uncompressible` enables the sampling pre-check
-/// (`HUF_flags_suspectUncompressible`). Uses the cheap FSE-based table-log
-/// estimate (the `optimalDepth` search used at the highest strategies is a
-/// later refinement; it changes the chosen log, not validity).
+/// `HUF_compressCTable_internal`'s compressibility gate: encode and reject if
+/// the result didn't shrink.
+fn encode_gated(
+    ct: &HufCTable,
+    src: &[u8],
+    single_stream: bool,
+    prefix_len: usize,
+) -> Option<Vec<u8>> {
+    let streams = if single_stream {
+        compress1x(ct, src)
+    } else {
+        compress4x(ct, src)
+    };
+    if streams.is_empty() || prefix_len + streams.len() >= src.len() - 1 {
+        return None; // not compressible enough
+    }
+    Some(streams)
+}
+
+/// Port of `HUF_compress_internal`, including the previous-table reuse paths:
+/// build a fresh table and emit `table description || stream(s)`, or reuse
+/// `prev` when estimated cheaper (`set_repeat`), with the same
+/// incompressibility short-circuits as C. `single_stream` selects 1- vs
+/// 4-stream coding; `suspect_uncompressible` enables the sampling pre-check;
+/// `prefer_repeat` is `HUF_flags_preferRepeat` (low strategies, small inputs).
+/// Uses the cheap FSE-based table-log estimate (the `optimalDepth` search of
+/// the highest strategies is a later refinement).
 pub(crate) fn huf_compress(
     src: &[u8],
     single_stream: bool,
     suspect_uncompressible: bool,
+    prefer_repeat: bool,
+    prev: Option<&HufCTable>,
+    mut repeat: HufRepeat,
 ) -> HufOutput {
     let src_size = src.len();
     if src_size == 0 {
         return HufOutput::Raw;
+    }
+
+    // Heuristic: if the old table is valid, use it for small inputs.
+    if prefer_repeat && repeat == HufRepeat::Valid {
+        if let Some(prev) = prev {
+            return match encode_gated(prev, src, single_stream, 0) {
+                Some(streams) => HufOutput::Repeat(streams),
+                None => HufOutput::Raw,
+            };
+        }
     }
 
     // If uncompressible data is suspected, histogram a head and tail sample
@@ -663,6 +733,20 @@ pub(crate) fn huf_compress(
         return HufOutput::Raw; // heuristic: not compressible enough
     }
 
+    // Check validity of the previous table against this block's histogram.
+    if repeat == HufRepeat::Check && !prev.is_some_and(|p| validate_ctable(p, &count, max_symbol)) {
+        repeat = HufRepeat::None;
+    }
+    // Heuristic: use the existing table for small inputs.
+    if prefer_repeat && repeat != HufRepeat::None {
+        if let Some(prev) = prev {
+            return match encode_gated(prev, src, single_stream, 0) {
+                Some(streams) => HufOutput::Repeat(streams),
+                None => HufOutput::Raw,
+            };
+        }
+    }
+
     let huff_log = fse_encode::optimal_table_log_internal(
         HUF_TABLELOG_DEFAULT,
         src_size,
@@ -677,21 +761,33 @@ pub(crate) fn huf_compress(
         Ok(t) => t,
         Err(_) => return HufOutput::Raw,
     };
-    if table.len() + 12 >= src_size {
+    let h_size = table.len();
+
+    // Is reusing the previous table cheaper than describing the new one?
+    if repeat != HufRepeat::None {
+        if let Some(prev) = prev {
+            let old_size = estimate_compressed_size(prev, &count, max_symbol);
+            let new_size = estimate_compressed_size(&ct, &count, max_symbol);
+            if old_size <= h_size + new_size || h_size + 12 >= src_size {
+                return match encode_gated(prev, src, single_stream, 0) {
+                    Some(streams) => HufOutput::Repeat(streams),
+                    None => HufOutput::Raw,
+                };
+            }
+        }
+    }
+
+    if h_size + 12 >= src_size {
         return HufOutput::Raw;
     }
-    let streams = if single_stream {
-        compress1x(&ct, src)
-    } else {
-        compress4x(&ct, src)
-    };
-    let mut out = table;
-    out.extend_from_slice(&streams);
-    // HUF_compressCTable_internal: reject if it didn't actually shrink.
-    if out.len() >= src_size - 1 {
-        return HufOutput::Raw;
+    match encode_gated(&ct, src, single_stream, h_size) {
+        Some(streams) => {
+            let mut out = table;
+            out.extend_from_slice(&streams);
+            HufOutput::Compressed(out, Box::new(ct))
+        }
+        None => HufOutput::Raw,
     }
-    HufOutput::Compressed(out)
 }
 
 #[cfg(test)]

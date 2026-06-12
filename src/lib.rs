@@ -36,6 +36,7 @@ mod fse_encode;
 mod huffman;
 mod huffman_encode;
 mod literals_encode;
+mod pre_split;
 mod sequences_encode;
 mod stream;
 mod xxhash;

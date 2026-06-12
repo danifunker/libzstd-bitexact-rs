@@ -488,15 +488,17 @@ fn encode_sequences(
 
 // --- The entropy shell -----------------------------------------------------------
 
-/// The compressor's cross-block FSE state (`ZSTD_fseCTables_t`): one table and
-/// repeat flag per component. (The literals Huffman repeat state is deferred
-/// with treeless literals.)
+/// The compressor's cross-block entropy state (`ZSTD_entropyCTables_t`): the
+/// literals Huffman table + repeat flag, and one FSE table + repeat flag per
+/// sequence component.
 ///
 /// `FseRepeat::Valid` arises only from dictionary loading (`ZSTD_loadCEntropy`);
 /// a freshly built table leaves `Check`, which the cost-based selection branch
-/// validates with `ZSTD_fseBitCost` before reuse.
+/// validates with `ZSTD_fseBitCost` before reuse. The Huffman side follows the
+/// analogous `HUF_repeat` rules inside [`crate::literals_encode`].
 #[derive(Clone, Default)]
 pub(crate) struct FseEntropyState {
+    pub huf: literals_encode::HufState,
     pub ll: Option<FseCTable>,
     pub ll_repeat: FseRepeat,
     pub of: Option<FseCTable>,
@@ -553,15 +555,20 @@ fn entropy_compress_seq_store_internal(
     let lit_size = store.literals.len();
 
     // Literals section. Suspicion of uncompressibility is based on the
-    // literals-to-sequences ratio.
+    // literals-to-sequences ratio. The Huffman state advances only when the
+    // literals actually came out compressed or treeless.
     let suspect_uncompressible =
         nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
-    let mut out = literals_encode::compress_literals(
+    let (mut out, next_huf) = literals_encode::compress_literals(
         &store.literals,
         strategy,
         suspect_uncompressible,
         disable_literal_compression,
+        &entropy.huf,
     );
+    if let Some(next_huf) = next_huf {
+        entropy.huf = next_huf;
+    }
 
     // Sequences header.
     if nb_seq < 128 {

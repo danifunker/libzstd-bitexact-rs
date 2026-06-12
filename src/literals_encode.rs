@@ -1,21 +1,28 @@
 //! Literals-section encoder (`ZSTD_compressLiterals` and its `set_basic` /
-//! `set_rle` special cases). Chooses among raw, RLE, and Huffman-compressed
-//! literals and writes the section header that [`crate::block::decode_literals`]
-//! reads back. Ports of `zstd_compress_literals.c` (bundled zstd 1.5.7).
+//! `set_rle` special cases). Chooses among raw, RLE, Huffman-compressed, and
+//! treeless (`set_repeat`, reusing the previous block's Huffman table)
+//! literals, and writes the section header that
+//! [`crate::block::decode_literals`] reads back. Ports of
+//! `zstd_compress_literals.c` (bundled zstd 1.5.7).
 //!
-//! `set_repeat` (treeless literals, reusing the previous block's Huffman table)
-//! is deferred to the block compressor (M4), since it needs cross-block state;
-//! this module always builds a fresh table for the compressed case.
-//!
-//! Verified by round-tripping the emitted section through the decoder.
-#![allow(dead_code)] // wired into the public compressor in a later milestone
+//! Verified by round-tripping the emitted section through the decoder, and
+//! end-to-end by the bit-exact compressor tests.
+#![allow(dead_code)] // some entry points reserved for later strategies
 
-use crate::huffman_encode::{self, HufOutput};
+use crate::huffman_encode::{self, HufCTable, HufOutput, HufRepeat};
 
 // Literals block types (the low 2 bits of the section header).
 const SET_BASIC: u32 = 0; // raw
 const SET_RLE: u32 = 1;
 const SET_COMPRESSED: u32 = 2;
+const SET_REPEAT: u32 = 3;
+
+/// The cross-block literals entropy state (`ZSTD_hufCTables_t`).
+#[derive(Clone, Default)]
+pub(crate) struct HufState {
+    pub table: Option<HufCTable>,
+    pub repeat: HufRepeat,
+}
 
 /// `ZSTD_noCompressLiterals`: a raw literals section.
 pub(crate) fn raw_literals(src: &[u8]) -> Vec<u8> {
@@ -54,9 +61,13 @@ fn write_basic_header(out: &mut Vec<u8>, set_type: u32, n: usize, fl_size: usize
     }
 }
 
-/// `ZSTD_minLiteralsToCompress` (no previous table): minimum literal count
-/// before compression is even attempted, tightening with strategy.
-fn min_literals_to_compress(strategy: i32) -> usize {
+/// `ZSTD_minLiteralsToCompress`: minimum literal count before compression is
+/// even attempted, tightening with strategy; much lower when a valid table is
+/// already on hand.
+fn min_literals_to_compress(strategy: i32, repeat: HufRepeat) -> usize {
+    if repeat == HufRepeat::Valid {
+        return 6;
+    }
     let shift = (9 - strategy).clamp(0, 3);
     8usize << shift
 }
@@ -73,7 +84,10 @@ pub(crate) fn min_gain(src_size: usize, strategy: i32) -> usize {
 }
 
 /// `ZSTD_compressLiterals`: pick the best literals representation for `src` at
-/// the given compression `strategy` (1..=9), returning the section bytes.
+/// the given compression `strategy` (1..=9), returning the section bytes and
+/// the candidate next-block Huffman state (`None` keeps the previous state, as
+/// C restores `nextHuf = prevHuf` on the raw/RLE outcomes).
+///
 /// `suspect_uncompressible` enables the sampling short-circuit for inputs the
 /// caller already believes are high-entropy (`HUF_flags_suspectUncompressible`);
 /// `disable_literal_compression` forces raw literals
@@ -84,35 +98,65 @@ pub(crate) fn compress_literals(
     strategy: i32,
     suspect_uncompressible: bool,
     disable_literal_compression: bool,
-) -> Vec<u8> {
+    prev_huf: &HufState,
+) -> (Vec<u8>, Option<HufState>) {
+    const ZSTD_LAZY: i32 = 4;
     let n = src.len();
     if disable_literal_compression {
-        return raw_literals(src);
+        return (raw_literals(src), None);
     }
-    if n < min_literals_to_compress(strategy) {
-        return raw_literals(src);
+    if n < min_literals_to_compress(strategy, prev_huf.repeat) {
+        return (raw_literals(src), None);
     }
 
-    // 4-stream coding for larger inputs (no table reuse here).
-    let single_stream = n < 256;
-
-    match huffman_encode::huf_compress(src, single_stream, suspect_uncompressible) {
-        HufOutput::Raw => raw_literals(src),
-        HufOutput::Rle => rle_literals(src),
-        HufOutput::Compressed(payload) => {
-            let c_lit_size = payload.len();
-            if c_lit_size >= n - min_gain(n, strategy) {
-                return raw_literals(src);
-            }
-            let mut out = compressed_header(n, c_lit_size, single_stream);
-            out.extend_from_slice(&payload);
-            out
-        }
+    let lh_size = 3 + (n >= 1024) as usize + (n >= 16384) as usize;
+    let mut single_stream = n < 256;
+    // With a dictionary-validated table on hand, a small block may reuse it
+    // in single-stream form.
+    if prev_huf.repeat == HufRepeat::Valid && lh_size == 3 {
+        single_stream = true;
     }
+    let prefer_repeat = strategy < ZSTD_LAZY && n <= 1024;
+
+    let outcome = huffman_encode::huf_compress(
+        src,
+        single_stream,
+        suspect_uncompressible,
+        prefer_repeat,
+        prev_huf.table.as_ref(),
+        prev_huf.repeat,
+    );
+    let (h_type, payload, next) = match outcome {
+        HufOutput::Raw => return (raw_literals(src), None),
+        HufOutput::Rle => return (rle_literals(src), None),
+        HufOutput::Repeat(streams) => (SET_REPEAT, streams, None),
+        HufOutput::Compressed(payload, new_table) => (
+            SET_COMPRESSED,
+            payload,
+            Some(HufState {
+                table: Some(*new_table),
+                repeat: HufRepeat::Check,
+            }),
+        ),
+    };
+
+    let c_lit_size = payload.len();
+    if c_lit_size >= n - min_gain(n, strategy) {
+        return (raw_literals(src), None);
+    }
+    let mut out = compressed_header(n, c_lit_size, single_stream, h_type);
+    out.extend_from_slice(&payload);
+    (out, next)
 }
 
-/// Write the `set_compressed` section header (`lhSize` of 3/4/5 bytes).
-fn compressed_header(src_size: usize, c_lit_size: usize, single_stream: bool) -> Vec<u8> {
+/// Write the `set_compressed` / `set_repeat` section header (`lhSize` of
+/// 3/4/5 bytes).
+fn compressed_header(
+    src_size: usize,
+    c_lit_size: usize,
+    single_stream: bool,
+    h_type: u32,
+) -> Vec<u8> {
     let lh_size = 3 + (src_size >= 1024) as usize + (src_size >= 16384) as usize;
     let four = (!single_stream) as u32;
     let srcs = src_size as u32;
@@ -121,17 +165,17 @@ fn compressed_header(src_size: usize, c_lit_size: usize, single_stream: bool) ->
     match lh_size {
         3 => {
             // 2 - 2 - 10 - 10
-            let lhc = SET_COMPRESSED + (four << 2) + (srcs << 4) + (clits << 14);
+            let lhc = h_type + (four << 2) + (srcs << 4) + (clits << 14);
             out.extend_from_slice(&lhc.to_le_bytes()[..3]);
         }
         4 => {
             // 2 - 2 - 14 - 14
-            let lhc = SET_COMPRESSED + (2 << 2) + (srcs << 4) + (clits << 18);
+            let lhc = h_type + (2 << 2) + (srcs << 4) + (clits << 18);
             out.extend_from_slice(&lhc.to_le_bytes());
         }
         _ => {
             // 2 - 2 - 18 - 18
-            let lhc = SET_COMPRESSED + (3 << 2) + (srcs << 4) + (clits << 22);
+            let lhc = h_type + (3 << 2) + (srcs << 4) + (clits << 22);
             out.extend_from_slice(&lhc.to_le_bytes());
             out.push((c_lit_size >> 10) as u8);
         }
@@ -147,7 +191,7 @@ mod tests {
     /// Decode an emitted section with a fresh context and require the literals
     /// back, with the whole section consumed.
     fn assert_round_trip(literals: &[u8]) {
-        let section = compress_literals(literals, 3, false, false);
+        let (section, _next) = compress_literals(literals, 3, false, false, &HufState::default());
         let mut ctx = FrameContext::new();
         let (decoded, used) = block::decode_literals(&mut ctx, &section, BLOCK_SIZE_MAX)
             .unwrap_or_else(|e| panic!("decode of {}-byte literals failed: {e}", literals.len()));

@@ -159,6 +159,17 @@ pub(crate) struct OptCtx {
 }
 
 impl OptCtx {
+    /// `ZSTD_buildSeqStore`'s "limited update after a very long match": pull
+    /// `nextToUpdate` to within 384+192 of the block start. `curr` is
+    /// computed with this context's own bias because the btultra2 initStats
+    /// pass slides it (`ZSTD_initStats_ultra` moves `window.base` in C).
+    pub(crate) fn limit_update(&mut self, block_start: usize) {
+        let curr = block_start + self.base_bias;
+        if curr > self.next_to_update + 384 {
+            self.next_to_update = curr - 192.min(curr - self.next_to_update - 384);
+        }
+    }
+
     pub(crate) fn new(cparams: &CParams) -> Self {
         let mls = cparams.min_match.clamp(3, 6);
         let hash_log3 = if mls == 3 {

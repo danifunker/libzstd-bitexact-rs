@@ -22,11 +22,11 @@
 //! Current scope: when the staged stream outgrows the input buffer
 //! (`windowSize + blockSize` bytes — 640 KiB at level 1 up to 128 MiB+ at the
 //! top levels), the buffer wraps and the previous segment becomes an
-//! *extDict*. The fast and dfast extDict match finders are ported, so levels
-//! resolving to them (1-4 and the negative levels) stream without length
-//! limits (up to the C overflow-correction threshold of 3500 MiB); the other
-//! strategies report a clean [`Error::Encode`] at the wrap point instead of
-//! diverging.
+//! *extDict*. The fast, dfast and greedy/lazy/lazy2 extDict match finders
+//! are ported, so levels resolving to them (1-12 and the negative levels)
+//! stream without length limits (up to the C overflow-correction threshold
+//! of 3500 MiB); the bt strategies (levels 13+) report a clean
+//! [`Error::Encode`] at the wrap point instead of diverging.
 
 use crate::compress::FrameCompressor;
 use crate::error::Error;
@@ -214,8 +214,8 @@ impl StreamEncoder {
 
             // Prepare the next block; past the buffer end, wrap to the start.
             // The wrapped chunk is non-contiguous, turning the live window
-            // into the extDict — supported by the fast and dfast match
-            // finders; other strategies report a clean error from
+            // into the extDict — supported by the fast/dfast/lazy match
+            // finders; the bt strategies report a clean error from
             // `compress_continue` until their extDict variants are ported.
             st.in_buff_target = st.in_buff_pos + block_size;
             if st.in_buff_target > st.in_buff.len() {

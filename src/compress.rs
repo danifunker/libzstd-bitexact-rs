@@ -407,7 +407,7 @@ impl Window {
 /// `ZSTD_count_2segments`: count the match length when `match` lives in the
 /// extDict segment — count up to `mend`, then continue comparing from
 /// `istart` (the prefix start). All arguments are buffer positions.
-fn count_2segments(
+pub(crate) fn count_2segments(
     buf: &[u8],
     ip: usize,
     matched: usize,
@@ -2111,14 +2111,28 @@ impl FrameCompressor {
         // `ZSTD_window_update`: a non-contiguous chunk (the streaming input
         // buffer wrapped) turns the live window into the extDict, which only
         // some strategies' match finders support so far.
-        if !self.window.update(chunk_start, chunk_end)
-            && !matches!(self.cparams.strategy, Strategy::Fast | Strategy::Dfast)
-        {
-            return Err(Error::Encode(
-                "streaming beyond windowSize+blockSize requires the extDict \
-                 match finders, which are only ported for the fast and dfast \
-                 strategies (levels 1-4 and negative levels) so far",
-            ));
+        if !self.window.update(chunk_start, chunk_end) {
+            // `ZSTD_compressContinue_internal`: a non-contiguous update
+            // restarts table insertion at the new segment
+            // (`ms->nextToUpdate = ms->window.dictLimit`).
+            if let Matcher::Lazy(ctx) = &mut self.matcher {
+                ctx.next_to_update = self.window.dict_limit as usize;
+            }
+            if !matches!(
+                self.cparams.strategy,
+                Strategy::Fast
+                    | Strategy::Dfast
+                    | Strategy::Greedy
+                    | Strategy::Lazy
+                    | Strategy::Lazy2
+            ) {
+                return Err(Error::Encode(
+                    "streaming beyond windowSize+blockSize requires the extDict \
+                     match finders, which are only ported for the fast, dfast \
+                     and greedy/lazy strategies (levels 1-12 and negative \
+                     levels) so far",
+                ));
+            }
         }
         if self.checksum {
             self.xxh.update(&data[chunk_start..chunk_end]);
@@ -2162,6 +2176,14 @@ impl FrameCompressor {
             if block_size < MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1 {
                 c_size_kind = BlockKind::Raw;
             } else {
+                // `ZSTD_buildSeqStore`: "limited update after a very long
+                // match" — cap how far nextToUpdate trails the block start.
+                // Only the matchers that track nextToUpdate are affected.
+                match &mut self.matcher {
+                    Matcher::Lazy(ctx) => ctx.limit_update(pos + self.window.seg_bias as usize),
+                    Matcher::Opt(ctx) => ctx.limit_update(pos),
+                    _ => {}
+                }
                 let mut store = SeqStore::new();
                 let mut next_rep = self.rep;
                 let last_ll_size = match &mut self.matcher {
@@ -2215,14 +2237,29 @@ impl FrameCompressor {
                             )
                         }
                     }
-                    Matcher::Lazy(ctx) => crate::lazy::compress_block_lazy(
-                        ctx,
-                        &mut store,
-                        &mut next_rep,
-                        data,
-                        pos,
-                        pos + block_size,
-                    ),
+                    Matcher::Lazy(ctx) => {
+                        if self.window.has_ext_dict() {
+                            crate::lazy::compress_block_lazy_extdict(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                &self.window,
+                            )
+                        } else {
+                            crate::lazy::compress_block_lazy(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                &self.window,
+                            )
+                        }
+                    }
                     Matcher::Opt(ctx) => crate::opt::compress_block_opt(
                         ctx,
                         &mut store,

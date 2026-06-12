@@ -5,10 +5,10 @@
 //! auto-pledge on a first-call end, and the pledged-size quirks.
 //!
 //! Scope note: streams larger than `windowSize + blockSize` wrap the C input
-//! buffer and flip the window into extDict mode. The fast and dfast extDict
-//! match finders are ported (multi-wrap parity covered by
-//! `wrapped_streams_are_bit_exact_at_{fast,dfast}_levels`); the other
-//! strategies report a clean error at the wrap point
+//! buffer and flip the window into extDict mode. The fast, dfast and
+//! greedy/lazy/lazy2 extDict match finders are ported (multi-wrap parity
+//! covered by `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy}_levels`);
+//! the remaining strategies report a clean error at the wrap point
 //! (`oversized_stream_errors_cleanly_for_unported_strategies`).
 
 use libzstd_bitexact::StreamEncoder;
@@ -698,15 +698,144 @@ fn wrapped_streams_are_bit_exact_at_dfast_levels() {
     );
 }
 
+// --- Streams beyond the input buffer (wrap + extDict, greedy/lazy/lazy2) ----------
+
+/// Levels 5-12 resolve to greedy/lazy/lazy2 at unknown content size, all in
+/// row-matcher mode (windowLog 21-22: the buffer wraps every 2.125 / 4.125
+/// MiB). Wrapped streams must stay bit-exact through the extDict phase and
+/// the return to the noDict driver with a nonzero segment bias.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "heavy differential test, run in release")]
+fn wrapped_streams_are_bit_exact_at_lazy_levels() {
+    // ~7 MiB at a 2 MiB window: three full wraps, all three depths. The
+    // block-aligned chunk size lets `enforceMaxDist` age the extDict out
+    // completely (noDict driver with seg_bias != 2); the odd sizes keep
+    // every other alignment honest.
+    let text = word_salad(0x3C01, 7 << 20);
+    for level in [5, 6, 8] {
+        for &chunk in &[100_001usize, 131_072, 131_073] {
+            assert_stream_bit_exact(
+                level,
+                None,
+                false,
+                &chunked(&text, chunk),
+                b"",
+                &format!("lazy-wrap-text-7M-chunk-{chunk}"),
+            );
+        }
+    }
+    // Level 7 (lazy, depth 1) and 64 KiB chunks across one wrap.
+    let mixed = mixed_runs(0x3C02, 3 << 20);
+    for level in [5, 7] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&mixed, 65_536),
+            b"",
+            "lazy-wrap-mixed-3M",
+        );
+    }
+
+    // Levels 9 and 12 use windowLog 22: wrap at 4.125 MiB.
+    let big = word_salad(0x3C03, 9 << 20);
+    for level in [9, 12] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&big, 131_072),
+            b"",
+            "lazy2-wrap-text-9M",
+        );
+    }
+
+    // Tiny chunks (7 bytes) across a single wrap.
+    let small = word_salad(0x3C04, (2 << 20) + 300_000);
+    assert_stream_bit_exact(
+        5,
+        None,
+        false,
+        &chunked(&small, 7),
+        b"",
+        "lazy-wrap-chunk-7",
+    );
+
+    // Mixed runs with periodic flushes across wraps.
+    for level in [5, 8] {
+        let mut steps = Vec::new();
+        for (i, c) in mixed.chunks(90_000).enumerate() {
+            steps.push(Step::Push(c));
+            if i % 3 == 2 {
+                steps.push(Step::Flush);
+            }
+        }
+        assert_stream_bit_exact(level, None, false, &steps, b"", "lazy-wrap-flush-mixed");
+    }
+
+    // Incompressible data: raw blocks, lazy-skipping mode (2 KiB of misses)
+    // across the wrap, and the dict-overlap lowLimit shrink.
+    let random = Rng::new(0x3C05).bytes(3 << 20);
+    for level in [5, 8] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&random, 131_072),
+            b"",
+            "lazy-wrap-random-3M",
+        );
+    }
+
+    // Periodic data with the period just under the 2 MiB window: matches and
+    // repcodes constantly reach back into the extDict segment.
+    let mut periodic = Vec::with_capacity(5 << 20);
+    let unit: Vec<u8> = (0..2_000_000u32).map(|i| (i * 37 + 11) as u8).collect();
+    while periodic.len() < 5 << 20 {
+        periodic.extend_from_slice(&unit);
+    }
+    periodic.truncate(5 << 20);
+    for level in [6, 8] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&periodic, 131_072),
+            b"",
+            "lazy-wrap-periodic-5M",
+        );
+    }
+
+    // Pledged size and checksum still hold across wraps.
+    let data = &text[..3 << 20];
+    assert_stream_bit_exact(
+        7,
+        Some(data.len() as u64),
+        false,
+        &chunked(data, 131_072),
+        b"",
+        "lazy-wrap-pledged-3M",
+    );
+    assert_stream_bit_exact(
+        7,
+        None,
+        true,
+        &chunked(data, 200_003),
+        b"",
+        "lazy-wrap-checksum-3M",
+    );
+}
+
 // --- The current scope limit -------------------------------------------------------
 
 #[test]
 fn oversized_stream_errors_cleanly_for_unported_strategies() {
-    // Level 5 resolves to greedy (unknown size: windowLog 21), whose extDict
-    // variant is not ported yet. Past windowSize + blockSize = 2.125 MiB the
-    // input buffer wraps — we must fail loudly, never emit different bytes.
-    let data = word_salad(0x0CEA, 3 << 20);
-    let mut enc = StreamEncoder::new(5);
+    // Level 13 resolves to btlazy2 (unknown size: windowLog 22), whose
+    // extDict variant is not ported yet. Past windowSize + blockSize =
+    // 4.125 MiB the input buffer wraps — we must fail loudly, never emit
+    // different bytes.
+    let data = word_salad(0x0CEA, 5 << 20);
+    let mut enc = StreamEncoder::new(13);
     let mut out = Vec::new();
     let err = (|| -> Result<(), libzstd_bitexact::Error> {
         enc.compress(&data, &mut out)?;

@@ -1075,15 +1075,24 @@ pub(crate) fn is_rle(src: &[u8]) -> bool {
     src.iter().all(|&b| b == src[0])
 }
 
-/// `ZSTD_writeFrameHeader`, for the one-shot defaults: contentSize known and
-/// flagged, no checksum, no dictionary.
-fn write_frame_header(out: &mut Vec<u8>, cparams: &CParams, pledged_src_size: u64) {
+/// `ZSTD_writeFrameHeader`, no dictionary (dictID 0). `pledged` of `None` is
+/// `ZSTD_CONTENTSIZE_UNKNOWN`; per `ZSTD_resetCCtx_internal` an unknown
+/// pledged size clears the content-size flag, which both omits the FCS field
+/// and disables the single-segment format.
+fn write_frame_header(out: &mut Vec<u8>, cparams: &CParams, pledged: Option<u64>, checksum: bool) {
     let window_size = 1u64 << cparams.window_log;
-    let single_segment = window_size >= pledged_src_size;
-    let fcs_code = (pledged_src_size >= 256) as u32
-        + (pledged_src_size >= 65536 + 256) as u32
-        + (pledged_src_size >= 0xFFFF_FFFF) as u32;
-    let descriptor = (fcs_code << 6) as u8 | ((single_segment as u8) << 5);
+    let content_size_flag = pledged.is_some();
+    let pledged_src_size = pledged.unwrap_or(0);
+    let single_segment = content_size_flag && window_size >= pledged_src_size;
+    let fcs_code = if content_size_flag {
+        (pledged_src_size >= 256) as u32
+            + (pledged_src_size >= 65536 + 256) as u32
+            + (pledged_src_size >= 0xFFFF_FFFF) as u32
+    } else {
+        0
+    };
+    let descriptor =
+        (fcs_code << 6) as u8 | ((single_segment as u8) << 5) | ((checksum as u8) << 2);
 
     out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
     out.push(descriptor);
@@ -1108,185 +1117,319 @@ pub(crate) fn push_block_header(out: &mut Vec<u8>, last: bool, block_type: u32, 
     out.extend_from_slice(&v.to_le_bytes()[..3]);
 }
 
-/// `ZSTD_compress`: one-shot frame compression with the simple-API defaults.
+/// `ZSTDcs_*`: the frame-level stage of a [`FrameCompressor`].
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Stage {
+    /// Frame header not written yet (`ZSTDcs_init`).
+    Init,
+    /// Header written, no block flagged "last" yet (`ZSTDcs_ongoing`).
+    Ongoing,
+    /// A chunk was compressed with the last-block flag (`ZSTDcs_ending`).
+    Ending,
+}
+
+/// The frame-compression half of `ZSTD_CCtx`: every piece of state that
+/// persists across `ZSTD_compressContinue` calls. The one-shot [`compress`]
+/// feeds a single chunk; the streaming encoder feeds successive chunks of its
+/// input buffer.
+pub(crate) struct FrameCompressor {
+    cparams: CParams,
+    matcher: Matcher,
+    rep: [u32; 3],
+    entropy: FseEntropyState,
+    is_first_block: bool,
+    /// `cctx->consumedSrcSize` / `cctx->producedCSize`. Their difference seeds
+    /// the pre-splitter `savings` at each frame-chunk call; `produced`
+    /// includes the frame header, exactly as in C.
+    consumed: u64,
+    produced: u64,
+    /// `windowSize` per `ZSTD_resetCCtx_internal`:
+    /// `max(1, min(1 << windowLog, pledgedSrcSize))`.
+    window_size: usize,
+    /// `cctx->blockSizeMax = min(ZSTD_BLOCKSIZE_MAX, windowSize)`.
+    block_size_max: usize,
+    /// `None` is `ZSTD_CONTENTSIZE_UNKNOWN`.
+    pledged: Option<u64>,
+    checksum: bool,
+    xxh: crate::xxhash::Xxh64,
+    stage: Stage,
+    disable_literal_compression: bool,
+}
+
+impl FrameCompressor {
+    pub(crate) fn new(level: i32, pledged: Option<u64>, checksum: bool) -> Self {
+        // Unknown content size selects the "default" srcSize class and skips
+        // the window resize (`ZSTD_getCParamRowSize` returns
+        // ZSTD_CONTENTSIZE_UNKNOWN for unknown srcSize without a dictionary).
+        let cparams = get_cparams(level, pledged.unwrap_or(u64::MAX));
+        let window_size_u64 = match pledged {
+            Some(n) => (1u64 << cparams.window_log).min(n).max(1),
+            None => 1u64 << cparams.window_log,
+        };
+        let block_size_max = (BLOCK_SIZE_MAX as u64).min(window_size_u64) as usize;
+        let matcher = match cparams.strategy {
+            Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
+                Matcher::Lazy(crate::lazy::LazyCtx::new(&cparams))
+            }
+            Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                Matcher::Opt(Box::new(crate::opt::OptCtx::new(&cparams)))
+            }
+            _ => Matcher::Fast(FastCtx::new(&cparams)),
+        };
+        // `ZSTD_literalsCompressionIsDisabled` in the default `ZSTD_ps_auto`
+        // mode: the fast strategy with a nonzero target length (the negative
+        // / acceleration levels) skips literal compression entirely.
+        let disable_literal_compression =
+            cparams.strategy == Strategy::Fast && cparams.target_length > 0;
+        FrameCompressor {
+            cparams,
+            matcher,
+            rep: [1, 4, 8],
+            entropy: FseEntropyState::new(),
+            is_first_block: true,
+            consumed: 0,
+            produced: 0,
+            window_size: window_size_u64 as usize,
+            block_size_max,
+            pledged,
+            checksum,
+            xxh: crate::xxhash::Xxh64::new(0),
+            stage: Stage::Init,
+            disable_literal_compression,
+        }
+    }
+
+    pub(crate) fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    pub(crate) fn block_size_max(&self) -> usize {
+        self.block_size_max
+    }
+
+    /// `ZSTD_compressContinue_internal` (frame mode): write the frame header
+    /// on first use, then compress `data[chunk_start..chunk_end]` into one or
+    /// more terminated blocks (`ZSTD_compress_frameChunk`).
+    ///
+    /// `data` is the frame's contiguous history buffer: every chunk must
+    /// directly follow the previous one in the same buffer, so the match
+    /// finders can reach back across chunk boundaries.
+    pub(crate) fn compress_continue(
+        &mut self,
+        out: &mut Vec<u8>,
+        data: &[u8],
+        chunk_start: usize,
+        chunk_end: usize,
+        last_frame_chunk: bool,
+    ) -> Result<(), Error> {
+        let out_start = out.len();
+        if self.stage == Stage::Init {
+            write_frame_header(out, &self.cparams, self.pledged, self.checksum);
+            self.stage = Stage::Ongoing;
+        }
+        if chunk_start == chunk_end {
+            // Do not generate an empty block, but do count the header.
+            self.produced += (out.len() - out_start) as u64;
+            return Ok(());
+        }
+        if self.checksum {
+            self.xxh.update(&data[chunk_start..chunk_end]);
+        }
+
+        let cparams = self.cparams;
+        let mut savings: i64 = self.consumed as i64 - self.produced as i64;
+        let mut pos = chunk_start;
+        while pos < chunk_end {
+            let remaining = chunk_end - pos;
+            // ZSTD_optimalBlockSize: only full 128 KiB blocks are candidates
+            // for pre-splitting, and only once at least 3 bytes of savings
+            // are verified (so the first full block is never split). The
+            // auto split level is `splitLevels[strategy]`.
+            let block_size = if remaining < BLOCK_SIZE_MAX || self.block_size_max < BLOCK_SIZE_MAX {
+                remaining.min(self.block_size_max)
+            } else if savings < 3 {
+                BLOCK_SIZE_MAX
+            } else {
+                const SPLIT_LEVELS: [usize; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
+                let split_level = SPLIT_LEVELS[cparams.strategy as usize];
+                pre_split::split_block(&data[pos..pos + BLOCK_SIZE_MAX], split_level)
+            };
+            let last_block = last_frame_chunk && block_size == remaining;
+            let block = &data[pos..pos + block_size];
+
+            // --- ZSTD_compressBlock_internal ---
+            let mut c_size_kind: BlockKind;
+            let mut body: Vec<u8> = Vec::new();
+
+            // ZSTD_buildSeqStore: tiny blocks are not even attempted.
+            if block_size < MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1 {
+                c_size_kind = BlockKind::Raw;
+            } else {
+                let mut store = SeqStore::new();
+                let mut next_rep = self.rep;
+                let last_ll_size = match &mut self.matcher {
+                    Matcher::Fast(ctx) => compress_block_fast(
+                        ctx,
+                        &mut store,
+                        &mut next_rep,
+                        data,
+                        pos,
+                        pos + block_size,
+                    ),
+                    Matcher::Dfast(ctx) => compress_block_dfast(
+                        ctx,
+                        &mut store,
+                        &mut next_rep,
+                        data,
+                        pos,
+                        pos + block_size,
+                    ),
+                    Matcher::Lazy(ctx) => crate::lazy::compress_block_lazy(
+                        ctx,
+                        &mut store,
+                        &mut next_rep,
+                        data,
+                        pos,
+                        pos + block_size,
+                    ),
+                    Matcher::Opt(ctx) => crate::opt::compress_block_opt(
+                        ctx,
+                        &mut store,
+                        &mut next_rep,
+                        data,
+                        pos,
+                        pos + block_size,
+                    ),
+                };
+                let lits_from = block_size - last_ll_size;
+                store.store_last_literals(&block[lits_from..]);
+
+                // The post-block splitter (btopt+ with windowLog >= 17) takes
+                // over block emission entirely: it may emit several blocks
+                // from this one seqStore, with dRep/cRep reconciliation.
+                if crate::post_split::block_splitter_enabled(&cparams) {
+                    let c_size = crate::post_split::compress_block_split(
+                        out,
+                        &mut store,
+                        &mut self.entropy,
+                        &mut self.rep,
+                        next_rep,
+                        cparams.strategy as i32,
+                        block,
+                        last_block,
+                        self.is_first_block,
+                    )?;
+                    savings += block_size as i64 - c_size as i64;
+                    pos += block_size;
+                    self.is_first_block = false;
+                    continue;
+                }
+
+                match sequences_encode::entropy_compress_seq_store(
+                    &store,
+                    &self.entropy,
+                    cparams.strategy as i32,
+                    self.disable_literal_compression,
+                    block_size,
+                )? {
+                    None => c_size_kind = BlockKind::Raw,
+                    Some((b, next_entropy)) => {
+                        body = b;
+                        c_size_kind = BlockKind::Compressed;
+                        // RLE-block override (not for the first block;
+                        // decoder compat for zstd <= 1.4.3).
+                        if !self.is_first_block && body.len() < 25 && is_rle(block) {
+                            c_size_kind = BlockKind::Rle;
+                        }
+                        // Confirm repcodes + entropy only when actually
+                        // emitting a compressed block (cSize > 1).
+                        if c_size_kind == BlockKind::Compressed {
+                            self.rep = next_rep;
+                            self.entropy = next_entropy;
+                        }
+                    }
+                }
+            }
+
+            let c_size = match c_size_kind {
+                BlockKind::Raw => {
+                    push_block_header(out, last_block, 0, block_size);
+                    out.extend_from_slice(block);
+                    BLOCK_HEADER_SIZE + block_size
+                }
+                BlockKind::Rle => {
+                    push_block_header(out, last_block, 1, block_size);
+                    out.push(block[0]);
+                    BLOCK_HEADER_SIZE + 1
+                }
+                BlockKind::Compressed => {
+                    push_block_header(out, last_block, 2, body.len());
+                    out.extend_from_slice(&body);
+                    BLOCK_HEADER_SIZE + body.len()
+                }
+            };
+
+            savings += block_size as i64 - c_size as i64;
+            pos += block_size;
+            self.is_first_block = false;
+        }
+
+        // `if (lastFrameChunk && (op>ostart)) cctx->stage = ZSTDcs_ending;` —
+        // a nonempty chunk always emits at least one block.
+        if last_frame_chunk {
+            self.stage = Stage::Ending;
+        }
+        self.consumed += (chunk_end - chunk_start) as u64;
+        self.produced += (out.len() - out_start) as u64;
+        if self.pledged.is_some_and(|n| self.consumed > n) {
+            // `srcSize_wrong`: more input than pledged.
+            return Err(Error::Encode("pledged source size exceeded"));
+        }
+        Ok(())
+    }
+
+    /// `ZSTD_compressEnd_public`: compress the final chunk, then write the
+    /// epilogue (`ZSTD_writeEpilogue`: an empty last block if no block carried
+    /// the last-block flag, plus the optional content checksum).
+    pub(crate) fn compress_end(
+        &mut self,
+        out: &mut Vec<u8>,
+        data: &[u8],
+        chunk_start: usize,
+        chunk_end: usize,
+    ) -> Result<(), Error> {
+        self.compress_continue(out, data, chunk_start, chunk_end, true)?;
+        debug_assert!(self.stage != Stage::Init, "header is written above");
+        if self.stage != Stage::Ending {
+            // One last empty raw block to carry the end-of-frame mark.
+            push_block_header(out, true, 0, 0);
+        }
+        if self.checksum {
+            out.extend_from_slice(&(self.xxh.digest() as u32).to_le_bytes());
+        }
+        if self.pledged.is_some_and(|n| self.consumed != n) {
+            // `srcSize_wrong`: pledged size must match exactly at frame end.
+            return Err(Error::Encode("pledged source size not honored"));
+        }
+        Ok(())
+    }
+}
+
+/// `ZSTD_compress`: one-shot frame compression with the simple-API defaults
+/// (contentSize known and flagged, no checksum, no dictionary).
 ///
 /// Bit-exact with C libzstd 1.5.7 for the supported scope (see module docs);
 /// unsupported configurations return [`Error::Encode`] rather than diverging.
 pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
-    let cparams = get_cparams(level, src.len() as u64);
-    // Inputs too small to reach ZSTD_buildSeqStore never run a match finder:
-    // every strategy produces the same trivial raw-block frame, so any level
-    // is exact. The bound mirrors the per-block check in the loop below.
-    let min_block_for_matcher = MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1;
-    let matcher_can_run = src.len() >= min_block_for_matcher;
-    // All nine strategies are implemented; the gate remains only as a guard
-    // for future configurations that might resolve outside them.
-    let _ = matcher_can_run;
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
         // Match indices are 32-bit; larger inputs need the C window-cycling
         // (overflow correction) machinery.
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
     }
-
-    // `ZSTD_literalsCompressionIsDisabled` in the default `ZSTD_ps_auto`
-    // mode: the fast strategy with a nonzero target length (the negative /
-    // acceleration levels) skips literal compression entirely.
-    let disable_literal_compression =
-        cparams.strategy == Strategy::Fast && cparams.target_length > 0;
-
+    let mut fc = FrameCompressor::new(level, Some(src.len() as u64), false);
     let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
-    write_frame_header(&mut out, &cparams, src.len() as u64);
-
-    let block_size_max = BLOCK_SIZE_MAX.min(1usize << cparams.window_log);
-    let mut matcher = match cparams.strategy {
-        // For unsupported strategies this is only reachable when the matcher
-        // can never run (gate above); the Fast ctx is an unused placeholder.
-        Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
-            Matcher::Lazy(crate::lazy::LazyCtx::new(&cparams))
-        }
-        Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
-            Matcher::Opt(Box::new(crate::opt::OptCtx::new(&cparams)))
-        }
-        _ => Matcher::Fast(FastCtx::new(&cparams)),
-    };
-    let mut rep: [u32; 3] = [1, 4, 8];
-    let mut entropy = FseEntropyState::new();
-    let mut savings: i64 = 0;
-    let mut is_first_block = true;
-
-    let mut pos = 0usize;
-    if src.is_empty() {
-        // Epilogue only: a last, empty raw block.
-        push_block_header(&mut out, true, 0, 0);
-        return Ok(out);
-    }
-
-    while pos < src.len() {
-        let remaining = src.len() - pos;
-        // ZSTD_optimalBlockSize: only full 128 KiB blocks are candidates for
-        // pre-splitting, and only once at least 3 bytes of savings are
-        // verified (so the first block is never split). The auto split level
-        // is `splitLevels[strategy]` — 0 (fromBorders) for the fast strategy.
-        let block_size = if remaining < BLOCK_SIZE_MAX || block_size_max < BLOCK_SIZE_MAX {
-            remaining.min(block_size_max)
-        } else if savings < 3 {
-            BLOCK_SIZE_MAX
-        } else {
-            const SPLIT_LEVELS: [usize; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
-            let split_level = SPLIT_LEVELS[cparams.strategy as usize];
-            pre_split::split_block(&src[pos..pos + BLOCK_SIZE_MAX], split_level)
-        };
-        let last_block = block_size == remaining;
-        let block = &src[pos..pos + block_size];
-
-        // --- ZSTD_compressBlock_internal ---
-        let mut c_size_kind: BlockKind;
-        let mut body: Vec<u8> = Vec::new();
-
-        // ZSTD_buildSeqStore: tiny blocks are not even attempted.
-        if block_size < MIN_CBLOCK_SIZE + BLOCK_HEADER_SIZE + 1 + 1 {
-            c_size_kind = BlockKind::Raw;
-        } else {
-            let mut store = SeqStore::new();
-            let mut next_rep = rep;
-            let last_ll_size = match &mut matcher {
-                Matcher::Fast(ctx) => {
-                    compress_block_fast(ctx, &mut store, &mut next_rep, src, pos, pos + block_size)
-                }
-                Matcher::Dfast(ctx) => {
-                    compress_block_dfast(ctx, &mut store, &mut next_rep, src, pos, pos + block_size)
-                }
-                Matcher::Lazy(ctx) => crate::lazy::compress_block_lazy(
-                    ctx,
-                    &mut store,
-                    &mut next_rep,
-                    src,
-                    pos,
-                    pos + block_size,
-                ),
-                Matcher::Opt(ctx) => crate::opt::compress_block_opt(
-                    ctx,
-                    &mut store,
-                    &mut next_rep,
-                    src,
-                    pos,
-                    pos + block_size,
-                ),
-            };
-            let lits_from = block_size - last_ll_size;
-            store.store_last_literals(&block[lits_from..]);
-
-            // The post-block splitter (btopt+ with windowLog >= 17) takes over
-            // block emission entirely: it may emit several blocks from this
-            // one seqStore, with dRep/cRep repcode reconciliation.
-            if crate::post_split::block_splitter_enabled(&cparams) {
-                let c_size = crate::post_split::compress_block_split(
-                    &mut out,
-                    &mut store,
-                    &mut entropy,
-                    &mut rep,
-                    next_rep,
-                    cparams.strategy as i32,
-                    block,
-                    last_block,
-                    is_first_block,
-                )?;
-                savings += block_size as i64 - c_size as i64;
-                pos += block_size;
-                is_first_block = false;
-                continue;
-            }
-
-            match sequences_encode::entropy_compress_seq_store(
-                &store,
-                &entropy,
-                cparams.strategy as i32,
-                disable_literal_compression,
-                block_size,
-            )? {
-                None => c_size_kind = BlockKind::Raw,
-                Some((b, next_entropy)) => {
-                    body = b;
-                    c_size_kind = BlockKind::Compressed;
-                    // RLE-block override (not for the first block; decoder
-                    // compat for zstd <= 1.4.3).
-                    if !is_first_block && body.len() < 25 && is_rle(block) {
-                        c_size_kind = BlockKind::Rle;
-                    }
-                    // Confirm repcodes + entropy only when actually emitting a
-                    // compressed block (cSize > 1).
-                    if c_size_kind == BlockKind::Compressed {
-                        rep = next_rep;
-                        entropy = next_entropy;
-                    }
-                }
-            }
-        }
-
-        let c_size = match c_size_kind {
-            BlockKind::Raw => {
-                push_block_header(&mut out, last_block, 0, block_size);
-                out.extend_from_slice(block);
-                BLOCK_HEADER_SIZE + block_size
-            }
-            BlockKind::Rle => {
-                push_block_header(&mut out, last_block, 1, block_size);
-                out.push(block[0]);
-                BLOCK_HEADER_SIZE + 1
-            }
-            BlockKind::Compressed => {
-                push_block_header(&mut out, last_block, 2, body.len());
-                out.extend_from_slice(&body);
-                BLOCK_HEADER_SIZE + body.len()
-            }
-        };
-
-        savings += block_size as i64 - c_size as i64;
-        pos += block_size;
-        is_first_block = false;
-    }
-
+    fc.compress_end(&mut out, src, 0, src.len())?;
     Ok(out)
 }
 

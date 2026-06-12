@@ -42,6 +42,7 @@ mod post_split;
 mod pre_split;
 mod sequences_encode;
 mod stream;
+mod stream_encode;
 mod xxhash;
 
 pub use compress::compress;
@@ -49,3 +50,4 @@ pub use decompress::{DecodeOptions, WINDOW_LOG_MAX, decompress, decompress_with_
 pub use dictionary::Dictionary;
 pub use error::Error;
 pub use stream::StreamDecoder;
+pub use stream_encode::StreamEncoder;

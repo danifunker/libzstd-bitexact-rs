@@ -23,7 +23,14 @@ differential-testing every code path against the real libzstd, not by review.
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
 | Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
 | **Compression, bit-exact with C — every level (1–22 and negatives)** | ✅ byte-identical, differential-tested |
-| Streaming compression, dictionary compression | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
+| Streaming compression (`ZSTD_compressStream2` flush/end parity) | ✅ byte-identical; unlimited length at fast levels, up to window+block elsewhere¹ |
+| Dictionary compression, multithreaded mode | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
+
+¹ Streams longer than `windowSize + blockSize` turn the C window into an
+*extDict*; the extDict match finder is ported for the fast strategy (levels
+1–2 and negatives at unknown content size), so those stream without length
+limits. The other strategies return a clean error at that point instead of
+diverging — their extDict variants are the next milestone.
 
 ## Usage
 
@@ -53,6 +60,16 @@ StreamDecoder::new(compressed_reader).read_to_end(&mut out)?;
 // Compression: byte-identical to ZSTD_compress at every level (1-22,
 // and negative levels for faster-than-1 modes).
 let frame = libzstd_bitexact::compress(&data, 19)?;
+
+// Streaming compression: byte-identical to ZSTD_compressStream2 for the
+// same sequence of operations (continue/flush/end, pledged sizes,
+// checksums). Note that without a pledged size, parameters resolve as
+// "content size unknown", exactly as in C.
+let mut enc = libzstd_bitexact::StreamEncoder::new(3);
+let mut frame = Vec::new();
+enc.compress(&data, &mut frame)?;
+enc.flush(&mut frame)?;
+enc.finish(b"", &mut frame)?;
 ```
 
 ## Design principles

@@ -190,9 +190,36 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
 
 ## M5 — Full API parity
 
-- [ ] One-shot `compress` bit-exact for levels 1–22 (verified against
-      multiple upstream zstd releases, pinned per version).
-- [ ] Streaming compression; flush/end behavior parity.
+- [x] Streaming compression; flush/end behavior parity. `StreamEncoder`
+      (`src/stream_encode.rs`) ports the buffered `ZSTD_compressStream_generic`
+      path over a refactored `FrameCompressor` (= the frame half of
+      `ZSTD_CCtx`, with `ZSTD_compressContinue` / `ZSTD_compressEnd` /
+      `ZSTD_writeEpilogue` semantics and the consumed/produced counters that
+      seed the pre-splitter savings across chunks). Covers: deferred init
+      with auto-pledge on a first-call end (== the one-shot frame),
+      unknown-content-size parameter resolution (windowed header, no FCS),
+      pledged sizes (including the exact-blockSize `inBuffTarget` quirk and
+      pledge enforcement), `ZSTD_e_flush` scheduling, content checksums, and
+      the input-buffer wrap: `ZSTD_window_update` segment flips with the
+      overlap `lowLimit` shrink, `ZSTD_window_enforceMaxDist` (anchored at
+      the block *start*, as `ZSTD_compress_frameChunk` actually does), and
+      `ZSTD_compressBlock_fast_extDict` — so fast-strategy levels stream
+      without length limits (up to C's 3500 MiB overflow-correction
+      threshold). All gated by `tests/stream_compress_differential.rs`
+      against `ZSTD_compressStream2` with matched operation schedules.
+      Found and fixed along the way: the fast/dfast noDict ports derived
+      `maxRep` from the block end instead of `ZSTD_getLowestPrefixIndex` at
+      the block start, zeroing near-window repcodes C keeps (pinned by a
+      mutation-tested crafted regression).
+- [ ] extDict match finders for the remaining strategies (dfast, lazy
+      hash-chain/row, btlazy2, bt-opt), lifting the streaming length limit at
+      every level.
+- [ ] Index overflow correction (`ZSTD_window_correctOverflow`), lifting the
+      3500 MiB total-input cap (one-shot inputs are capped at 4 GiB − 2 by
+      32-bit match indices regardless).
+- [ ] One-shot `compress` bit-exact verified against multiple upstream zstd
+      releases, pinned per version (currently pinned to the single 1.5.7
+      oracle bundled by `zstd-sys`).
 - [ ] Dictionary compression.
 - [ ] Multithreaded mode (`ZSTDMT`) — job splitting parity.
 

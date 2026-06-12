@@ -541,8 +541,13 @@ fn update_dubt(ctx: &mut LazyCtx, data: &[u8], target: usize, seg_bias: usize) {
     ctx.next_to_update = target;
 }
 
-/// `ZSTD_insertDUBT1` (noDict): sort one previously unsorted position into the
-/// binary tree rooted at its own slot.
+/// `ZSTD_insertDUBT1` (noDict and extDict): sort one previously unsorted
+/// position into the binary tree rooted at its own slot. In extDict mode the
+/// position being sorted may itself live in the dict segment (a pre-wrap
+/// backlog entry), and each candidate compare resolves its segment by
+/// `matchIndex + matchLength >= dictLimit`, rebasing the post-run ordering
+/// byte into the prefix when the counted run crosses the seam.
+#[allow(clippy::too_many_arguments)]
 fn insert_dubt1(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -551,13 +556,29 @@ fn insert_dubt1(
     nb_compares0: u32,
     bt_low: u32,
     win: &Window,
+    ext_dict: bool,
 ) {
     let seg_bias = win.seg_bias as usize;
-    let to_pos = |idx: usize| idx - seg_bias;
+    let dict_bias = win.dict_bias as usize;
+    let dict_limit = win.dict_limit as usize;
     let bt_mask = (1u32 << (ctx.chain_log - 1)) - 1;
     let mut common_length_smaller = 0usize;
     let mut common_length_larger = 0usize;
     let ip = curr as usize;
+    // `ip` and its counting limit live in ip's own segment
+    // (`curr >= dictLimit ? base/inputEnd : dictBase/dictEnd`).
+    let ip_in_prefix = ip >= dict_limit;
+    let ip_pos = if ip_in_prefix {
+        ip - seg_bias
+    } else {
+        ip - dict_bias
+    };
+    let iend_pos = if ip_in_prefix {
+        iend - seg_bias
+    } else {
+        dict_limit - dict_bias
+    };
+    let prefix_start_pos = dict_limit - seg_bias;
     let max_distance = 1u32 << ctx.window_log;
     let window_valid = win.low_limit;
     let window_low = if curr - window_valid > max_distance {
@@ -577,18 +598,48 @@ fn insert_dubt1(
         let next = 2 * (match_index & bt_mask) as usize;
         let mut match_length = common_length_smaller.min(common_length_larger);
         let m = match_index as usize;
-        match_length += count_eq(
-            data,
-            to_pos(ip) + match_length,
-            to_pos(m) + match_length,
-            to_pos(iend),
-        );
 
-        if ip + match_length == iend {
+        // Position of `match[matchLength]` for the ordering byte, valid
+        // after the count inside each branch.
+        let m_read_pos = if !ext_dict || m + match_length >= dict_limit || !ip_in_prefix {
+            // Single-segment count: the match bytes come from the prefix
+            // unless both positions sit in the extDict.
+            let m_bias = if !ext_dict || m + match_length >= dict_limit {
+                seg_bias
+            } else {
+                dict_bias
+            };
+            match_length += count_eq(
+                data,
+                ip_pos + match_length,
+                m + match_length - m_bias,
+                iend_pos,
+            );
+            m + match_length - m_bias
+        } else {
+            // Match in the extDict, current position in the prefix.
+            let m_pos = m - dict_bias;
+            match_length += count_2segments(
+                data,
+                ip_pos + match_length,
+                m_pos + match_length,
+                iend_pos,
+                dict_limit - dict_bias,
+                prefix_start_pos,
+            );
+            // Preparation for the next read of match[matchLength].
+            if m + match_length >= dict_limit {
+                m + match_length - seg_bias
+            } else {
+                m_pos + match_length
+            }
+        };
+
+        if ip_pos + match_length == iend_pos {
             break; // equal: drop to guarantee tree consistency
         }
 
-        if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+        if data[m_read_pos] < data[ip_pos + match_length] {
             // match is smaller than current
             if let Some(s) = smaller_slot {
                 ctx.chain_table[s] = match_index;
@@ -624,9 +675,11 @@ fn insert_dubt1(
     }
 }
 
-/// `ZSTD_DUBT_findBestMatch` (noDict): resolve the unsorted backlog, then
-/// descend the tree keeping the best gain-adjusted match. Reads *and* writes
-/// `off_base` (the gain rule compares against the incoming sentinel).
+/// `ZSTD_DUBT_findBestMatch` (noDict and extDict): resolve the unsorted
+/// backlog, then descend the tree keeping the best gain-adjusted match. Reads
+/// *and* writes `off_base` (the gain rule compares against the incoming
+/// sentinel). The extDict candidate compares resolve their segment by
+/// `matchIndex + matchLength >= dictLimit` exactly as [`insert_dubt1`] does.
 fn dubt_find_best_match(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -634,8 +687,11 @@ fn dubt_find_best_match(
     iend: usize,
     off_base: &mut u64,
     win: &Window,
+    ext_dict: bool,
 ) -> usize {
     let seg_bias = win.seg_bias as usize;
+    let dict_bias = win.dict_bias as usize;
+    let dict_limit = win.dict_limit as usize;
     let to_pos = |idx: usize| idx - seg_bias;
     let h = hash_ptr(data, to_pos(ip), ctx.hash_log, ctx.mls);
     let mut match_index = ctx.hash_table[h];
@@ -687,6 +743,7 @@ fn dubt_find_best_match(
             nb_candidates,
             unsort_limit,
             win,
+            ext_dict,
         );
         match_index = next_candidate_idx;
         nb_candidates += 1;
@@ -709,12 +766,34 @@ fn dubt_find_best_match(
             let next = 2 * (match_index & bt_mask) as usize;
             let mut match_length = common_length_smaller.min(common_length_larger);
             let m = match_index as usize;
-            match_length += count_eq(
-                data,
-                to_pos(ip) + match_length,
-                to_pos(m) + match_length,
-                to_pos(iend),
-            );
+
+            // Position of `match[matchLength]` for the ordering byte, valid
+            // after the count inside each branch.
+            let m_read_pos = if !ext_dict || m + match_length >= dict_limit {
+                match_length += count_eq(
+                    data,
+                    to_pos(ip) + match_length,
+                    m + match_length - seg_bias,
+                    to_pos(iend),
+                );
+                m + match_length - seg_bias
+            } else {
+                let m_pos = m - dict_bias;
+                match_length += count_2segments(
+                    data,
+                    to_pos(ip) + match_length,
+                    m_pos + match_length,
+                    to_pos(iend),
+                    dict_limit - dict_bias,
+                    dict_limit - seg_bias,
+                );
+                // Preparation for the next read of match[matchLength].
+                if m + match_length >= dict_limit {
+                    m + match_length - seg_bias
+                } else {
+                    m_pos + match_length
+                }
+            };
 
             if match_length > best_length {
                 if match_length > (match_end_idx - match_index) as usize {
@@ -731,7 +810,7 @@ fn dubt_find_best_match(
                 }
             }
 
-            if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+            if data[m_read_pos] < data[to_pos(ip) + match_length] {
                 if let Some(s) = smaller_slot {
                     ctx.chain_table[s] = match_index;
                 }
@@ -778,12 +857,13 @@ fn bt_find_best_match(
     iend: usize,
     off_base: &mut u64,
     win: &Window,
+    ext_dict: bool,
 ) -> usize {
     if ip < ctx.next_to_update {
         return 0; // skipped area
     }
     update_dubt(ctx, data, ip, win.seg_bias as usize);
-    dubt_find_best_match(ctx, data, ip, iend, off_base, win)
+    dubt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
 }
 
 /// `ZSTD_searchMax`.
@@ -800,10 +880,7 @@ fn search_max(
         SearchMethod::HashChain => hc_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict),
         SearchMethod::RowHash => row_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict),
         SearchMethod::BinaryTree => {
-            // btlazy2's extDict DUBT is not ported yet; the frame-level gate
-            // keeps wrapped streams away from this strategy until it is.
-            debug_assert!(!ext_dict, "btlazy2 extDict is not ported yet");
-            bt_find_best_match(ctx, data, ip, iend, off_base, win)
+            bt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
         }
     }
 }

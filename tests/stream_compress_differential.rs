@@ -5,10 +5,10 @@
 //! auto-pledge on a first-call end, and the pledged-size quirks.
 //!
 //! Scope note: streams larger than `windowSize + blockSize` wrap the C input
-//! buffer and flip the window into extDict mode. The fast, dfast and
-//! greedy/lazy/lazy2 extDict match finders are ported (multi-wrap parity
-//! covered by `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy}_levels`);
-//! the remaining strategies report a clean error at the wrap point
+//! buffer and flip the window into extDict mode. The extDict match finders
+//! up to btlazy2 are ported (multi-wrap parity covered by
+//! `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy,btlazy2}_levels`); the
+//! bt-opt strategies report a clean error at the wrap point
 //! (`oversized_stream_errors_cleanly_for_unported_strategies`).
 
 use libzstd_bitexact::StreamEncoder;
@@ -826,16 +826,99 @@ fn wrapped_streams_are_bit_exact_at_lazy_levels() {
     );
 }
 
+// --- Streams beyond the input buffer (wrap + extDict, btlazy2) --------------------
+
+/// Levels 13-15 resolve to btlazy2 at unknown content size (windowLog 22:
+/// the buffer wraps every 4.125 MiB). The DUBT keeps an unsorted backlog
+/// across the wrap, so post-wrap searches batch-sort pre-wrap (dict-segment)
+/// positions — `insertDUBT1` with a dict-side `curr` — besides the
+/// two-segment candidate compares.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "heavy differential test, run in release")]
+fn wrapped_streams_are_bit_exact_at_btlazy2_levels() {
+    // ~9.5 MiB: two full wraps; block-aligned chunks let the extDict age out
+    // (noDict with seg_bias != 2), odd sizes keep alignments honest.
+    let text = word_salad(0x3D01, (9 << 20) + (1 << 19));
+    for level in [13, 15] {
+        for &chunk in &[131_072usize, 131_073] {
+            assert_stream_bit_exact(
+                level,
+                None,
+                false,
+                &chunked(&text, chunk),
+                b"",
+                &format!("btlazy2-wrap-text-9M-chunk-{chunk}"),
+            );
+        }
+    }
+
+    // Mixed runs with periodic flushes across one wrap (level 14).
+    let mixed = mixed_runs(0x3D02, 5 << 20);
+    let mut steps = Vec::new();
+    for (i, c) in mixed.chunks(90_000).enumerate() {
+        steps.push(Step::Push(c));
+        if i % 3 == 2 {
+            steps.push(Step::Flush);
+        }
+    }
+    assert_stream_bit_exact(14, None, false, &steps, b"", "btlazy2-wrap-flush-mixed-5M");
+
+    // Incompressible data across one wrap.
+    let random = Rng::new(0x3D03).bytes(5 << 20);
+    assert_stream_bit_exact(
+        13,
+        None,
+        false,
+        &chunked(&random, 131_072),
+        b"",
+        "btlazy2-wrap-random-5M",
+    );
+
+    // Periodic data with the period just under the 4 MiB window.
+    let mut periodic = Vec::with_capacity(9 << 20);
+    let unit: Vec<u8> = (0..4_000_000u32).map(|i| (i * 37 + 11) as u8).collect();
+    while periodic.len() < 9 << 20 {
+        periodic.extend_from_slice(&unit);
+    }
+    periodic.truncate(9 << 20);
+    assert_stream_bit_exact(
+        13,
+        None,
+        false,
+        &chunked(&periodic, 131_072),
+        b"",
+        "btlazy2-wrap-periodic-9M",
+    );
+
+    // Pledged size and checksum still hold across wraps.
+    let data = &text[..5 << 20];
+    assert_stream_bit_exact(
+        14,
+        Some(data.len() as u64),
+        false,
+        &chunked(data, 131_072),
+        b"",
+        "btlazy2-wrap-pledged-5M",
+    );
+    assert_stream_bit_exact(
+        14,
+        None,
+        true,
+        &chunked(data, 200_003),
+        b"",
+        "btlazy2-wrap-checksum-5M",
+    );
+}
+
 // --- The current scope limit -------------------------------------------------------
 
 #[test]
 fn oversized_stream_errors_cleanly_for_unported_strategies() {
-    // Level 13 resolves to btlazy2 (unknown size: windowLog 22), whose
-    // extDict variant is not ported yet. Past windowSize + blockSize =
-    // 4.125 MiB the input buffer wraps — we must fail loudly, never emit
-    // different bytes.
+    // Level 16 resolves to btopt (unknown size: windowLog 22), whose extDict
+    // variant is not ported yet. Past windowSize + blockSize = 4.125 MiB the
+    // input buffer wraps — we must fail loudly, never emit different bytes.
     let data = word_salad(0x0CEA, 5 << 20);
-    let mut enc = StreamEncoder::new(13);
+    let mut enc = StreamEncoder::new(16);
     let mut out = Vec::new();
     let err = (|| -> Result<(), libzstd_bitexact::Error> {
         enc.compress(&data, &mut out)?;

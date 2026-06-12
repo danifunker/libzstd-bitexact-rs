@@ -2125,12 +2125,12 @@ impl FrameCompressor {
                     | Strategy::Greedy
                     | Strategy::Lazy
                     | Strategy::Lazy2
+                    | Strategy::Btlazy2
             ) {
                 return Err(Error::Encode(
                     "streaming beyond windowSize+blockSize requires the extDict \
-                     match finders, which are only ported for the fast, dfast \
-                     and greedy/lazy strategies (levels 1-12 and negative \
-                     levels) so far",
+                     match finders, which are not ported for the bt-opt \
+                     strategies (levels 16-22) yet",
                 ));
             }
         }

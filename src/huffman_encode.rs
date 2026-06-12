@@ -606,17 +606,44 @@ pub(crate) enum HufOutput {
     Compressed(Vec<u8>),
 }
 
+/// `SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE` and its ratio gate.
+const SUSPECT_SAMPLE_SIZE: usize = 4096;
+const SUSPECT_SAMPLE_RATIO: usize = 10;
+
 /// Port of `HUF_compress_internal` without the repeat/old-table paths: build a
 /// fresh table and emit `table description || stream(s)`, applying the same
 /// incompressibility short-circuits. `single_stream` selects 1- vs 4-stream
-/// coding. Uses the cheap FSE-based table-log estimate (the `optimalDepth`
-/// search used at the highest strategies is a later refinement; it changes the
-/// chosen log, not validity).
-pub(crate) fn huf_compress(src: &[u8], single_stream: bool) -> HufOutput {
+/// coding; `suspect_uncompressible` enables the sampling pre-check
+/// (`HUF_flags_suspectUncompressible`). Uses the cheap FSE-based table-log
+/// estimate (the `optimalDepth` search used at the highest strategies is a
+/// later refinement; it changes the chosen log, not validity).
+pub(crate) fn huf_compress(
+    src: &[u8],
+    single_stream: bool,
+    suspect_uncompressible: bool,
+) -> HufOutput {
     let src_size = src.len();
     if src_size == 0 {
         return HufOutput::Raw;
     }
+
+    // If uncompressible data is suspected, histogram a head and tail sample
+    // first; bail to raw when even the dominant symbols are rare.
+    if suspect_uncompressible && src_size >= SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
+        let largest_of = |chunk: &[u8]| {
+            let mut count = [0u32; 256];
+            for &b in chunk {
+                count[b as usize] += 1;
+            }
+            *count.iter().max().unwrap() as usize
+        };
+        let largest_total = largest_of(&src[..SUSPECT_SAMPLE_SIZE])
+            + largest_of(&src[src_size - SUSPECT_SAMPLE_SIZE..]);
+        if largest_total <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4 {
+            return HufOutput::Raw;
+        }
+    }
+
     let mut count = [0u32; HUF_SYMBOLVALUE_MAX + 1];
     for &b in src {
         count[b as usize] += 1;

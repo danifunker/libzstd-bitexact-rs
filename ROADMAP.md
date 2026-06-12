@@ -89,7 +89,25 @@ not just emitting valid streams. Bottom-up:
 
 ## M4 — Block compression, level by level
 
-- [ ] Sequence emission and `ZSTD_entropyCompressSeqStore` parity.
+This is where byte-exact-vs-C parity is finally tested *end-to-end*: once a
+match finder and frame assembly exist, the differential tests compare our
+compressed bytes against the C oracle's directly.
+
+- [x] Sequence emission and `ZSTD_entropyCompressSeqStore`
+      (`src/sequences_encode.rs`): `ZSTD_seqToCodes` (LL/ML code tables +
+      long-length markers), `ZSTD_selectEncodingType` (both the
+      strategy-based heuristic branch and the cost-comparison branch with
+      `ZSTD_fseBitCost`/entropy/cross-entropy/NCount costing),
+      `ZSTD_buildCTable` (RLE byte, repeat copy, default tables, and the
+      last-sequence count adjustment), the 64-bit `ZSTD_encodeSequences`
+      interleaved bitstream, and the block-body shell with the
+      literals-section call, prev/next entropy double-buffering, the
+      1.3.4-decoder-bug fallback, and the min-gain raw-block gate. Verified
+      by decoding emitted blocks with the C-differential-tested decoder:
+      handcrafted repcode/real-offset cases, all three sequence-count header
+      forms, all four table modes (including Repeat across blocks), the
+      long-literal-length marker, and matcher-generated stores at strategies
+      1/3/6/9.
 - [ ] Match finders, in C-strategy order: `fast`, `dfast`, `greedy`, `lazy`,
       `lazy2`, `btlazy2`, `btopt`, `btultra`, `btultra2` — each gated by a
       differential test asserting byte-identical compressed output.

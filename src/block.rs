@@ -17,7 +17,7 @@ pub(crate) const BLOCK_SIZE_MAX: usize = 128 * 1024;
 // --- lib/decompress/zstd_decompress_internal.h of facebook/zstd).
 
 #[rustfmt::skip]
-const LL_BITS: [u32; 36] = [
+pub(crate) const LL_BITS: [u32; 36] = [
      0,  0,  0,  0,  0,  0,  0,  0,
      0,  0,  0,  0,  0,  0,  0,  0,
      1,  1,  1,  1,  2,  2,  3,  3,
@@ -35,7 +35,7 @@ const LL_BASE: [u32; 36] = [
 ];
 
 #[rustfmt::skip]
-const ML_BITS: [u32; 53] = [
+pub(crate) const ML_BITS: [u32; 53] = [
      0,  0,  0,  0,  0,  0,  0,  0,
      0,  0,  0,  0,  0,  0,  0,  0,
      0,  0,  0,  0,  0,  0,  0,  0,
@@ -57,17 +57,17 @@ const ML_BASE: [u32; 53] = [
 ];
 
 #[rustfmt::skip]
-const LL_DEFAULT_NORM: [i16; 36] = [
+pub(crate) const LL_DEFAULT_NORM: [i16; 36] = [
      4, 3, 2, 2, 2, 2, 2, 2,
      2, 2, 2, 2, 2, 1, 1, 1,
      2, 2, 2, 2, 2, 2, 2, 2,
      2, 3, 2, 1, 1, 1, 1, 1,
     -1,-1,-1,-1,
 ];
-const LL_DEFAULT_LOG: u32 = 6;
+pub(crate) const LL_DEFAULT_LOG: u32 = 6;
 
 #[rustfmt::skip]
-const ML_DEFAULT_NORM: [i16; 53] = [
+pub(crate) const ML_DEFAULT_NORM: [i16; 53] = [
      1, 4, 3, 2, 2, 2, 2, 2,
      2, 1, 1, 1, 1, 1, 1, 1,
      1, 1, 1, 1, 1, 1, 1, 1,
@@ -76,16 +76,16 @@ const ML_DEFAULT_NORM: [i16; 53] = [
      1, 1, 1, 1, 1, 1,-1,-1,
     -1,-1,-1,-1,-1,
 ];
-const ML_DEFAULT_LOG: u32 = 6;
+pub(crate) const ML_DEFAULT_LOG: u32 = 6;
 
 #[rustfmt::skip]
-const OF_DEFAULT_NORM: [i16; 29] = [
+pub(crate) const OF_DEFAULT_NORM: [i16; 29] = [
      1, 1, 1, 1, 1, 1, 2, 2,
      2, 1, 1, 1, 1, 1, 1, 1,
      1, 1, 1, 1, 1, 1, 1, 1,
     -1,-1,-1,-1,-1,
 ];
-const OF_DEFAULT_LOG: u32 = 5;
+pub(crate) const OF_DEFAULT_LOG: u32 = 5;
 
 pub(crate) struct SeqTableSpec {
     default_norm: &'static [i16],

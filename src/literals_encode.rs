@@ -61,8 +61,9 @@ fn min_literals_to_compress(strategy: i32) -> usize {
     8usize << shift
 }
 
-/// `ZSTD_minGain`: minimum byte savings required to keep a compressed section.
-fn min_gain(src_size: usize, strategy: i32) -> usize {
+/// `ZSTD_minGain`: minimum byte savings required to keep a compressed section
+/// (also applied at whole-block level by the sequences encoder).
+pub(crate) fn min_gain(src_size: usize, strategy: i32) -> usize {
     let minlog = if strategy >= 8 {
         strategy as u32 - 1
     } else {
@@ -73,7 +74,13 @@ fn min_gain(src_size: usize, strategy: i32) -> usize {
 
 /// `ZSTD_compressLiterals`: pick the best literals representation for `src` at
 /// the given compression `strategy` (1..=9), returning the section bytes.
-pub(crate) fn compress_literals(src: &[u8], strategy: i32) -> Vec<u8> {
+/// `suspect_uncompressible` enables the sampling short-circuit for inputs the
+/// caller already believes are high-entropy (`HUF_flags_suspectUncompressible`).
+pub(crate) fn compress_literals(
+    src: &[u8],
+    strategy: i32,
+    suspect_uncompressible: bool,
+) -> Vec<u8> {
     let n = src.len();
     if n < min_literals_to_compress(strategy) {
         return raw_literals(src);
@@ -82,7 +89,7 @@ pub(crate) fn compress_literals(src: &[u8], strategy: i32) -> Vec<u8> {
     // 4-stream coding for larger inputs (no table reuse here).
     let single_stream = n < 256;
 
-    match huffman_encode::huf_compress(src, single_stream) {
+    match huffman_encode::huf_compress(src, single_stream, suspect_uncompressible) {
         HufOutput::Raw => raw_literals(src),
         HufOutput::Rle => rle_literals(src),
         HufOutput::Compressed(payload) => {
@@ -133,7 +140,7 @@ mod tests {
     /// Decode an emitted section with a fresh context and require the literals
     /// back, with the whole section consumed.
     fn assert_round_trip(literals: &[u8]) {
-        let section = compress_literals(literals, 3);
+        let section = compress_literals(literals, 3, false);
         let mut ctx = FrameContext::new();
         let (decoded, used) = block::decode_literals(&mut ctx, &section, BLOCK_SIZE_MAX)
             .unwrap_or_else(|e| panic!("decode of {}-byte literals failed: {e}", literals.len()));

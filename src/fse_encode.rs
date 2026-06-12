@@ -376,10 +376,53 @@ struct SymbolTransform {
 
 /// An FSE compression table (`FSE_CTable`): the next-state lookup plus the
 /// per-symbol transforms.
+#[derive(Clone)]
 pub(crate) struct FseCTable {
     table_log: u32,
     next_state: Vec<u16>,
     symbol_tt: Vec<SymbolTransform>,
+}
+
+impl FseCTable {
+    /// `FSE_buildCTable_rle`: a zero-bit table that only encodes `symbol`.
+    /// All-zero transforms and a zero next-state make every encode emit no
+    /// bits, exactly like the C table (tableLog 0, stateTable {0, 0}).
+    pub(crate) fn rle(symbol: u8) -> Self {
+        FseCTable {
+            table_log: 0,
+            next_state: vec![0u16; 2],
+            symbol_tt: vec![
+                SymbolTransform {
+                    delta_nb_bits: 0,
+                    delta_find_state: 0,
+                };
+                symbol as usize + 1
+            ],
+        }
+    }
+
+    pub(crate) fn table_log(&self) -> u32 {
+        self.table_log
+    }
+
+    /// The largest symbol this table can encode (`ZSTD_getFSEMaxSymbolValue`).
+    pub(crate) fn max_symbol(&self) -> u32 {
+        self.symbol_tt.len() as u32 - 1
+    }
+
+    /// `FSE_bitCost`: approximate cost of `symbol` in fixed-point bits with
+    /// `accuracy_log` fractional bits.
+    pub(crate) fn bit_cost(&self, symbol: u32, accuracy_log: u32) -> u32 {
+        let tt = self.symbol_tt[symbol as usize];
+        let min_nb_bits = tt.delta_nb_bits >> 16;
+        let threshold = (min_nb_bits + 1) << 16;
+        let table_size = 1u32 << self.table_log;
+        let delta_from_threshold =
+            threshold.wrapping_sub(tt.delta_nb_bits.wrapping_add(table_size));
+        let normalized = (delta_from_threshold << accuracy_log) >> self.table_log;
+        let bit_multiplier = 1u32 << accuracy_log;
+        (min_nb_bits + 1) * bit_multiplier - normalized
+    }
 }
 
 /// `FSE_buildCTable`: lay out the encoding table for a normalized distribution.
@@ -466,14 +509,14 @@ pub(crate) fn build_ctable(norm: &[i16], max_symbol: u32, table_log: u32) -> Fse
 }
 
 /// `BIT_CStream_t`: forward LSB-first bit writer over a 64-bit container.
-struct BitCStream {
+pub(crate) struct BitCStream {
     container: u64,
     bit_pos: usize,
     out: Vec<u8>,
 }
 
 impl BitCStream {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BitCStream {
             container: 0,
             bit_pos: 0,
@@ -483,13 +526,13 @@ impl BitCStream {
 
     /// `BIT_addBits`: append the low `nb_bits` of `value` at the current
     /// position.
-    fn add_bits(&mut self, value: u64, nb_bits: u32) {
+    pub(crate) fn add_bits(&mut self, value: u64, nb_bits: u32) {
         self.container |= (value & crate::bits::mask64(nb_bits)) << self.bit_pos;
         self.bit_pos += nb_bits as usize;
     }
 
     /// `BIT_flushBits`: emit the whole bytes accumulated, keeping the remainder.
-    fn flush_bits(&mut self) {
+    pub(crate) fn flush_bits(&mut self) {
         let nb_bytes = self.bit_pos >> 3;
         let bytes = self.container.to_le_bytes();
         self.out.extend_from_slice(&bytes[..nb_bytes]);
@@ -499,7 +542,7 @@ impl BitCStream {
 
     /// `BIT_closeCStream`: write the end-mark bit (the decoder's padding bit),
     /// flush, and emit any final partial byte.
-    fn close(mut self) -> Vec<u8> {
+    pub(crate) fn close(mut self) -> Vec<u8> {
         self.add_bits(1, 1);
         self.flush_bits();
         if self.bit_pos > 0 {
@@ -510,7 +553,7 @@ impl BitCStream {
 }
 
 /// `FSE_initCState2`: seed a state from the first (last-consumed) symbol.
-fn init_cstate2(ct: &FseCTable, symbol: usize) -> i64 {
+pub(crate) fn init_cstate2(ct: &FseCTable, symbol: usize) -> i64 {
     let stt = ct.symbol_tt[symbol];
     let nb_bits_out = (stt.delta_nb_bits.wrapping_add(1 << 15)) >> 16;
     let value0 = (nb_bits_out << 16).wrapping_sub(stt.delta_nb_bits);
@@ -519,7 +562,7 @@ fn init_cstate2(ct: &FseCTable, symbol: usize) -> i64 {
 }
 
 /// `FSE_encodeSymbol`: emit the bits for `symbol` and advance `state`.
-fn encode_symbol(bitc: &mut BitCStream, ct: &FseCTable, state: &mut i64, symbol: usize) {
+pub(crate) fn encode_symbol(bitc: &mut BitCStream, ct: &FseCTable, state: &mut i64, symbol: usize) {
     let stt = ct.symbol_tt[symbol];
     let nb_bits_out = ((*state + stt.delta_nb_bits as i64) >> 16) as u32;
     bitc.add_bits(*state as u64, nb_bits_out);
@@ -528,7 +571,7 @@ fn encode_symbol(bitc: &mut BitCStream, ct: &FseCTable, state: &mut i64, symbol:
 }
 
 /// `FSE_flushCState`: write the final state value.
-fn flush_cstate(bitc: &mut BitCStream, ct: &FseCTable, state: i64) {
+pub(crate) fn flush_cstate(bitc: &mut BitCStream, ct: &FseCTable, state: i64) {
     bitc.add_bits(state as u64, ct.table_log);
     bitc.flush_bits();
 }

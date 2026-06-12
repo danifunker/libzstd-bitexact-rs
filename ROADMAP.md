@@ -140,9 +140,15 @@ compressed bytes against the C oracle's directly.
       Includes the row-mode hashLog cap in `ZSTD_adjustCParams`. Gated by
       byte-exact differential tests at every greedy/lazy/lazy2 level of all
       four srcSize classes, both backends, plus multi-block 1 MB inputs.
-- [ ] Remaining match finders: `btlazy2`, `btopt`, `btultra`, `btultra2`
-      (levels 13-22) — each gated the same way. Unsupported configurations
-      return `Error::Encode` rather than silently diverging.
+- [x] **`btlazy2` — BIT-EXACT** (levels up to 15). The dual-use binary tree
+      (`ZSTD_updateDUBT` unsorted-candidate insertion, `ZSTD_insertDUBT1`
+      batch sorting, `ZSTD_DUBT_findBestMatch` with the reversed unsorted
+      chain, gain-adjusted best-match rule, and the `matchEndIdx - 8`
+      repetition skip) as a third backend of the lazy driver at depth 2.
+      Gated at the btlazy2 levels of every srcSize class plus multi-block.
+- [ ] Remaining match finders: `btopt`, `btultra`, `btultra2` (levels 16-22,
+      the optimal parser of `zstd_opt.c`) — gated the same way. Unsupported
+      configurations return `Error::Encode` rather than silently diverging.
 - [x] Parameter tables (`ZSTD_defaultCParameters`, all four srcSize classes)
       and `ZSTD_adjustCParams_internal` (window resize, hash/chain clamping,
       cycle log), verified against the C `ZSTD_getCParams` via FFI probing and

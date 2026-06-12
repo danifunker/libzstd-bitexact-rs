@@ -72,7 +72,11 @@ pub(crate) fn use_row_match_finder(cparams: &CParams) -> bool {
 enum SearchMethod {
     HashChain,
     RowHash,
+    BinaryTree,
 }
+
+/// `ZSTD_DUBT_UNSORTED_MARK`: sort-mark sentinel in the BT's second slot.
+const DUBT_UNSORTED_MARK: u32 = 1;
 
 /// The lazy matcher's cross-block state (`ZSTD_MatchState_t` subset).
 pub(crate) struct LazyCtx {
@@ -100,14 +104,16 @@ pub(crate) struct LazyCtx {
 
 impl LazyCtx {
     pub(crate) fn new(cparams: &CParams) -> Self {
-        let method = if use_row_match_finder(cparams) {
+        let method = if cparams.strategy == Strategy::Btlazy2 {
+            SearchMethod::BinaryTree
+        } else if use_row_match_finder(cparams) {
             SearchMethod::RowHash
         } else {
             SearchMethod::HashChain
         };
         let depth = match cparams.strategy {
             Strategy::Lazy => 1,
-            Strategy::Lazy2 => 2,
+            Strategy::Lazy2 | Strategy::Btlazy2 => 2,
             _ => 0, // greedy
         };
         let row_log = cparams.search_log.clamp(4, 6);
@@ -115,7 +121,7 @@ impl LazyCtx {
             method,
             depth,
             hash_table: vec![0u32; 1usize << cparams.hash_log],
-            chain_table: if method == SearchMethod::HashChain {
+            chain_table: if method != SearchMethod::RowHash {
                 vec![0u32; 1usize << cparams.chain_log]
             } else {
                 Vec::new()
@@ -420,11 +426,263 @@ fn row_find_best_match(
     ml
 }
 
+// --- Binary-tree search (btlazy2) ---------------------------------------------
+
+/// `ZSTD_updateDUBT`: append positions [nextToUpdate, target) to their hash
+/// chains as *unsorted* BT candidates (second slot = the sort mark).
+fn update_dubt(ctx: &mut LazyCtx, data: &[u8], target: usize) {
+    let bt_log = ctx.chain_log - 1;
+    let bt_mask = (1u32 << bt_log) - 1;
+    let mut idx = ctx.next_to_update;
+    while idx < target {
+        let h = hash_ptr(data, idx - WINDOW_START_INDEX, ctx.hash_log, ctx.mls);
+        let slot = 2 * (idx as u32 & bt_mask) as usize;
+        ctx.chain_table[slot] = ctx.hash_table[h];
+        ctx.chain_table[slot + 1] = DUBT_UNSORTED_MARK;
+        ctx.hash_table[h] = idx as u32;
+        idx += 1;
+    }
+    ctx.next_to_update = target;
+}
+
+/// `ZSTD_insertDUBT1` (noDict): sort one previously unsorted position into the
+/// binary tree rooted at its own slot.
+fn insert_dubt1(
+    ctx: &mut LazyCtx,
+    data: &[u8],
+    curr: u32,
+    iend: usize,
+    nb_compares0: u32,
+    bt_low: u32,
+) {
+    let to_pos = |idx: usize| idx - WINDOW_START_INDEX;
+    let bt_mask = (1u32 << (ctx.chain_log - 1)) - 1;
+    let mut common_length_smaller = 0usize;
+    let mut common_length_larger = 0usize;
+    let ip = curr as usize;
+    let max_distance = 1u32 << ctx.window_log;
+    let window_valid = WINDOW_START_INDEX as u32;
+    let window_low = if curr - window_valid > max_distance {
+        curr - max_distance
+    } else {
+        window_valid
+    };
+
+    // smaller/larger "pointers" are slots in the chain table; None = dummy.
+    let root = 2 * (curr & bt_mask) as usize;
+    let mut smaller_slot: Option<usize> = Some(root);
+    let mut larger_slot: Option<usize> = Some(root + 1);
+    let mut match_index = ctx.chain_table[root];
+    let mut nb_compares = nb_compares0;
+
+    while nb_compares > 0 && match_index > window_low {
+        let next = 2 * (match_index & bt_mask) as usize;
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        let m = match_index as usize;
+        match_length += count_eq(
+            data,
+            to_pos(ip) + match_length,
+            to_pos(m) + match_length,
+            to_pos(iend),
+        );
+
+        if ip + match_length == iend {
+            break; // equal: drop to guarantee tree consistency
+        }
+
+        if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+            // match is smaller than current
+            if let Some(s) = smaller_slot {
+                ctx.chain_table[s] = match_index;
+            }
+            common_length_smaller = match_length;
+            if match_index <= bt_low {
+                smaller_slot = None;
+                break;
+            }
+            smaller_slot = Some(next + 1);
+            match_index = ctx.chain_table[next + 1];
+        } else {
+            // match is larger than current
+            if let Some(l) = larger_slot {
+                ctx.chain_table[l] = match_index;
+            }
+            common_length_larger = match_length;
+            if match_index <= bt_low {
+                larger_slot = None;
+                break;
+            }
+            larger_slot = Some(next);
+            match_index = ctx.chain_table[next];
+        }
+        nb_compares -= 1;
+    }
+
+    if let Some(s) = smaller_slot {
+        ctx.chain_table[s] = 0;
+    }
+    if let Some(l) = larger_slot {
+        ctx.chain_table[l] = 0;
+    }
+}
+
+/// `ZSTD_DUBT_findBestMatch` (noDict): resolve the unsorted backlog, then
+/// descend the tree keeping the best gain-adjusted match. Reads *and* writes
+/// `off_base` (the gain rule compares against the incoming sentinel).
+fn dubt_find_best_match(
+    ctx: &mut LazyCtx,
+    data: &[u8],
+    ip: usize,
+    iend: usize,
+    off_base: &mut u64,
+) -> usize {
+    let to_pos = |idx: usize| idx - WINDOW_START_INDEX;
+    let h = hash_ptr(data, to_pos(ip), ctx.hash_log, ctx.mls);
+    let mut match_index = ctx.hash_table[h];
+
+    let curr = ip as u32;
+    let max_distance = 1u32 << ctx.window_log;
+    let lowest_valid = WINDOW_START_INDEX as u32;
+    let window_low = if curr - lowest_valid > max_distance {
+        curr - max_distance
+    } else {
+        lowest_valid
+    };
+    let bt_mask = (1u32 << (ctx.chain_log - 1)) - 1;
+    let bt_low = curr.saturating_sub(bt_mask);
+    let unsort_limit = bt_low.max(window_low);
+
+    let mut nb_compares = 1u32 << ctx.search_log;
+    let mut nb_candidates = nb_compares;
+    let mut previous_candidate = 0u32;
+
+    // Reach the end of the unsorted-candidates list, reversing it as we go.
+    while match_index > unsort_limit
+        && ctx.chain_table[2 * (match_index & bt_mask) as usize + 1] == DUBT_UNSORTED_MARK
+        && nb_candidates > 1
+    {
+        ctx.chain_table[2 * (match_index & bt_mask) as usize + 1] = previous_candidate;
+        previous_candidate = match_index;
+        match_index = ctx.chain_table[2 * (match_index & bt_mask) as usize];
+        nb_candidates -= 1;
+    }
+
+    // Nullify the last candidate if it is still unsorted (speed simplification).
+    if match_index > unsort_limit
+        && ctx.chain_table[2 * (match_index & bt_mask) as usize + 1] == DUBT_UNSORTED_MARK
+    {
+        ctx.chain_table[2 * (match_index & bt_mask) as usize] = 0;
+        ctx.chain_table[2 * (match_index & bt_mask) as usize + 1] = 0;
+    }
+
+    // Batch-sort the stacked candidates.
+    match_index = previous_candidate;
+    while match_index != 0 {
+        let next_candidate_idx = ctx.chain_table[2 * (match_index & bt_mask) as usize + 1];
+        insert_dubt1(ctx, data, match_index, iend, nb_candidates, unsort_limit);
+        match_index = next_candidate_idx;
+        nb_candidates += 1;
+    }
+
+    // Find the longest match by tree descent (re-inserting curr).
+    {
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let root = 2 * (curr & bt_mask) as usize;
+        let mut smaller_slot: Option<usize> = Some(root);
+        let mut larger_slot: Option<usize> = Some(root + 1);
+        let mut match_end_idx = curr + 8 + 1;
+        let mut best_length = 0usize;
+
+        match_index = ctx.hash_table[h];
+        ctx.hash_table[h] = curr;
+
+        while nb_compares > 0 && match_index > window_low {
+            let next = 2 * (match_index & bt_mask) as usize;
+            let mut match_length = common_length_smaller.min(common_length_larger);
+            let m = match_index as usize;
+            match_length += count_eq(
+                data,
+                to_pos(ip) + match_length,
+                to_pos(m) + match_length,
+                to_pos(iend),
+            );
+
+            if match_length > best_length {
+                if match_length > (match_end_idx - match_index) as usize {
+                    match_end_idx = match_index + match_length as u32;
+                }
+                if 4 * (match_length as i32 - best_length as i32)
+                    > highbit32(curr - match_index + 1) as i32 - highbit32(*off_base as u32) as i32
+                {
+                    best_length = match_length;
+                    *off_base = (curr - match_index) as u64 + 3; // OFFSET_TO_OFFBASE
+                }
+                if ip + match_length == iend {
+                    break; // equal: drop to guarantee consistency
+                }
+            }
+
+            if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+                if let Some(s) = smaller_slot {
+                    ctx.chain_table[s] = match_index;
+                }
+                common_length_smaller = match_length;
+                if match_index <= bt_low {
+                    smaller_slot = None;
+                    break;
+                }
+                smaller_slot = Some(next + 1);
+                match_index = ctx.chain_table[next + 1];
+            } else {
+                if let Some(l) = larger_slot {
+                    ctx.chain_table[l] = match_index;
+                }
+                common_length_larger = match_length;
+                if match_index <= bt_low {
+                    larger_slot = None;
+                    break;
+                }
+                larger_slot = Some(next);
+                match_index = ctx.chain_table[next];
+            }
+            nb_compares -= 1;
+        }
+
+        if let Some(s) = smaller_slot {
+            ctx.chain_table[s] = 0;
+        }
+        if let Some(l) = larger_slot {
+            ctx.chain_table[l] = 0;
+        }
+
+        // Skip repetitive patterns on the next update.
+        ctx.next_to_update = (match_end_idx - 8) as usize;
+        best_length
+    }
+}
+
+/// `ZSTD_BtFindBestMatch`.
+fn bt_find_best_match(
+    ctx: &mut LazyCtx,
+    data: &[u8],
+    ip: usize,
+    iend: usize,
+    off_base: &mut u64,
+) -> usize {
+    if ip < ctx.next_to_update {
+        return 0; // skipped area
+    }
+    update_dubt(ctx, data, ip);
+    dubt_find_best_match(ctx, data, ip, iend, off_base)
+}
+
 /// `ZSTD_searchMax`.
 fn search_max(ctx: &mut LazyCtx, data: &[u8], ip: usize, iend: usize, off_base: &mut u64) -> usize {
     match ctx.method {
         SearchMethod::HashChain => hc_find_best_match(ctx, data, ip, iend, off_base),
         SearchMethod::RowHash => row_find_best_match(ctx, data, ip, iend, off_base),
+        SearchMethod::BinaryTree => bt_find_best_match(ctx, data, ip, iend, off_base),
     }
 }
 

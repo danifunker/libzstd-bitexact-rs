@@ -1123,11 +1123,16 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if matcher_can_run
         && !matches!(
             cparams.strategy,
-            Strategy::Fast | Strategy::Dfast | Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+            Strategy::Fast
+                | Strategy::Dfast
+                | Strategy::Greedy
+                | Strategy::Lazy
+                | Strategy::Lazy2
+                | Strategy::Btlazy2
         )
     {
         return Err(Error::Encode(
-            "only strategies up to lazy2 (levels <= 12) are implemented so far",
+            "only strategies up to btlazy2 (levels <= 15) are implemented so far",
         ));
     }
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
@@ -1150,7 +1155,7 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
         // For unsupported strategies this is only reachable when the matcher
         // can never run (gate above); the Fast ctx is an unused placeholder.
         Strategy::Dfast => Matcher::Dfast(DfastCtx::new(&cparams)),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
             Matcher::Lazy(crate::lazy::LazyCtx::new(&cparams))
         }
         _ => Matcher::Fast(FastCtx::new(&cparams)),

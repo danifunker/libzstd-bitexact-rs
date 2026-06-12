@@ -379,14 +379,73 @@ fn lazy_multiblock_is_bit_exact() {
     }
 }
 
+/// Levels resolving to btlazy2 (the dual-use binary-tree search) per class.
+#[test]
+fn btlazy2_levels_are_bit_exact() {
+    let sizes_and_levels: &[(usize, &[i32])] = &[
+        (1_000, &[9, 10]),        // ≤16K class
+        (10_000, &[9, 10]),       // ≤16K class
+        (60_000, &[11, 12]),      // ≤128K class
+        (200_000, &[11, 12]),     // ≤256K class
+        (500_000, &[13, 14, 15]), // default class
+    ];
+    for &(len, levels) in sizes_and_levels {
+        let text = word_salad(0xB71A ^ len as u64, len);
+        let mut rng = Rng::new(0xB71A_2000 ^ len as u64);
+        let random = rng.bytes(len);
+        let mut mixed = Vec::new();
+        while mixed.len() < len {
+            if rng.below(2) == 0 {
+                let b = (rng.next_u64() & 0xFF) as u8;
+                mixed.extend(std::iter::repeat_n(b, 1 + rng.below(400)));
+            } else {
+                let n = 1 + rng.below(60);
+                let r = rng.bytes(n);
+                mixed.extend_from_slice(&r);
+            }
+        }
+        mixed.truncate(len);
+
+        for &level in levels {
+            assert_bit_exact(&text, level, &format!("btlazy2-text-{len}"));
+            assert_bit_exact(&random, level, &format!("btlazy2-random-{len}"));
+            assert_bit_exact(&mixed, level, &format!("btlazy2-mixed-{len}"));
+        }
+    }
+    // Repetitive data drives the matchEndIdx-8 skip and the sorted/unsorted
+    // tree interplay.
+    for &period in &[1usize, 4, 16] {
+        let unit: Vec<u8> = (0..period).map(|i| (i * 37 + 11) as u8).collect();
+        let mut data = Vec::with_capacity(60_000);
+        while data.len() < 60_000 {
+            data.extend_from_slice(&unit);
+        }
+        data.truncate(60_000);
+        for &level in &[11, 12] {
+            assert_bit_exact(&data, level, &format!("btlazy2-period-{period}"));
+        }
+    }
+    // Multi-block with the byChunks pre-splitter at level 3.
+    let big = word_salad(0x0B71_AB16, 800_000);
+    for &level in &[13, 15] {
+        assert_bit_exact(&big, level, "btlazy2-multiblock-800k");
+    }
+}
+
 #[test]
 fn unsupported_scope_errors_cleanly_instead_of_diverging() {
     // Levels resolving to unported strategies are explicit errors, never
     // silently different bytes — once the input is big enough to actually
-    // run a match finder. Level 13 resolves to btlazy2 in the default class.
+    // run a match finder. Level 16 resolves to btopt in the default class
+    // (and ≥13 maps to btopt/btultra in the ≤16K class).
     let data = word_salad(0xE44, 1000);
     assert!(matches!(
         libzstd_bitexact::compress(&data, 13),
+        Err(libzstd_bitexact::Error::Encode(_))
+    ));
+    let big = word_salad(0xE45, 300_000);
+    assert!(matches!(
+        libzstd_bitexact::compress(&big, 16),
         Err(libzstd_bitexact::Error::Encode(_))
     ));
 }

@@ -22,8 +22,8 @@
 //! Current scope: when the staged stream outgrows the input buffer
 //! (`windowSize + blockSize` bytes — 640 KiB at level 1 up to 128 MiB+ at the
 //! top levels), the buffer wraps and the previous segment becomes an
-//! *extDict*. The fast strategy's extDict match finder is ported, so levels
-//! resolving to it (1, 2, and the negative levels) stream without length
+//! *extDict*. The fast and dfast extDict match finders are ported, so levels
+//! resolving to them (1-4 and the negative levels) stream without length
 //! limits (up to the C overflow-correction threshold of 3500 MiB); the other
 //! strategies report a clean [`Error::Encode`] at the wrap point instead of
 //! diverging.
@@ -214,8 +214,8 @@ impl StreamEncoder {
 
             // Prepare the next block; past the buffer end, wrap to the start.
             // The wrapped chunk is non-contiguous, turning the live window
-            // into the extDict — supported by the fast strategy's match
-            // finder; other strategies report a clean error from
+            // into the extDict — supported by the fast and dfast match
+            // finders; other strategies report a clean error from
             // `compress_continue` until their extDict variants are ported.
             st.in_buff_target = st.in_buff_pos + block_size;
             if st.in_buff_target > st.in_buff.len() {

@@ -5,10 +5,10 @@
 //! auto-pledge on a first-call end, and the pledged-size quirks.
 //!
 //! Scope note: streams larger than `windowSize + blockSize` wrap the C input
-//! buffer and flip the window into extDict mode. The fast strategy's extDict
-//! match finder is ported (multi-wrap parity covered by
-//! `wrapped_streams_are_bit_exact_at_fast_levels`); the other strategies
-//! report a clean error at the wrap point
+//! buffer and flip the window into extDict mode. The fast and dfast extDict
+//! match finders are ported (multi-wrap parity covered by
+//! `wrapped_streams_are_bit_exact_at_{fast,dfast}_levels`); the other
+//! strategies report a clean error at the wrap point
 //! (`oversized_stream_errors_cleanly_for_unported_strategies`).
 
 use libzstd_bitexact::StreamEncoder;
@@ -585,15 +585,128 @@ fn wrapped_streams_are_bit_exact_at_fast_levels() {
     );
 }
 
+// --- Streams beyond the input buffer (wrap + extDict, dfast strategy) -------------
+
+/// Levels 3-4 resolve to dfast at unknown content size (windowLog 21: the
+/// buffer wraps every 2.125 MiB). Wrapped streams must stay bit-exact through
+/// the extDict phase, the extDict-aged-out fallback inside the matcher, and
+/// the return to the noDict matcher with a nonzero segment bias.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "heavy differential test, run in release")]
+fn wrapped_streams_are_bit_exact_at_dfast_levels() {
+    // ~7 MiB: three full wraps. Block-aligned chunks make a lap line up
+    // exactly with the buffer, which is what lets `enforceMaxDist` age the
+    // extDict out completely (noDict with seg_bias != 2); the odd-sized
+    // chunks keep every other alignment honest.
+    let text = word_salad(0x3B01, 7 << 20);
+    for level in [3, 4] {
+        for &chunk in &[100_001usize, 131_072, 131_073] {
+            assert_stream_bit_exact(
+                level,
+                None,
+                false,
+                &chunked(&text, chunk),
+                b"",
+                &format!("dfast-wrap-text-7M-chunk-{chunk}"),
+            );
+        }
+    }
+
+    // 64 KiB chunks (two chunks per block) across one wrap.
+    let mixed = mixed_runs(0x3B02, 3 << 20);
+    for level in [3, 4] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&mixed, 65_536),
+            b"",
+            "dfast-wrap-mixed-3M",
+        );
+    }
+
+    // Tiny chunks (7 bytes) across a single wrap.
+    let small = word_salad(0x3B03, (2 << 20) + 300_000);
+    assert_stream_bit_exact(
+        3,
+        None,
+        false,
+        &chunked(&small, 7),
+        b"",
+        "dfast-wrap-chunk-7",
+    );
+
+    // Mixed runs with periodic flushes across wraps.
+    for level in [3, 4] {
+        let mut steps = Vec::new();
+        for (i, c) in mixed.chunks(90_000).enumerate() {
+            steps.push(Step::Push(c));
+            if i % 3 == 2 {
+                steps.push(Step::Flush);
+            }
+        }
+        assert_stream_bit_exact(level, None, false, &steps, b"", "dfast-wrap-flush-mixed");
+    }
+
+    // Incompressible data: raw blocks and the dict-overlap lowLimit shrink.
+    let random = Rng::new(0x3B04).bytes(3 << 20);
+    assert_stream_bit_exact(
+        3,
+        None,
+        false,
+        &chunked(&random, 131_072),
+        b"",
+        "dfast-wrap-random-3M",
+    );
+
+    // Periodic data with the period just under the 2 MiB window: matches and
+    // repcodes constantly reach back into the extDict segment.
+    let mut periodic = Vec::with_capacity(7 << 20);
+    let unit: Vec<u8> = (0..2_000_000u32).map(|i| (i * 37 + 11) as u8).collect();
+    while periodic.len() < 7 << 20 {
+        periodic.extend_from_slice(&unit);
+    }
+    periodic.truncate(7 << 20);
+    for level in [3, 4] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&periodic, 131_072),
+            b"",
+            "dfast-wrap-periodic-7M",
+        );
+    }
+
+    // Pledged size and checksum still hold across wraps.
+    let data = &text[..3 << 20];
+    assert_stream_bit_exact(
+        3,
+        Some(data.len() as u64),
+        false,
+        &chunked(data, 131_072),
+        b"",
+        "dfast-wrap-pledged-3M",
+    );
+    assert_stream_bit_exact(
+        3,
+        None,
+        true,
+        &chunked(data, 200_003),
+        b"",
+        "dfast-wrap-checksum-3M",
+    );
+}
+
 // --- The current scope limit -------------------------------------------------------
 
 #[test]
 fn oversized_stream_errors_cleanly_for_unported_strategies() {
-    // Level 3 resolves to dfast (unknown size: windowLog 21), whose extDict
+    // Level 5 resolves to greedy (unknown size: windowLog 21), whose extDict
     // variant is not ported yet. Past windowSize + blockSize = 2.125 MiB the
     // input buffer wraps — we must fail loudly, never emit different bytes.
     let data = word_salad(0x0CEA, 3 << 20);
-    let mut enc = StreamEncoder::new(3);
+    let mut enc = StreamEncoder::new(5);
     let mut out = Vec::new();
     let err = (|| -> Result<(), libzstd_bitexact::Error> {
         enc.compress(&data, &mut out)?;

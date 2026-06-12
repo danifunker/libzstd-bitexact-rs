@@ -516,29 +516,37 @@ const SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO: usize = 20;
 
 /// `ZSTD_entropyCompressSeqStore`: build the complete `Compressed_Block` body
 /// for `store` — literals section, sequence count, modes byte, table
-/// descriptions, and the sequence bitstream. Returns `None` when the block
-/// should be emitted raw instead (incompressible, or one of the C fallback
-/// quirks). `entropy` is updated to the post-block state only on `Some`,
-/// mirroring C's prev/next double buffering with the confirm-on-success swap
-/// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
+/// descriptions, and the sequence bitstream. Returns the body and the
+/// *candidate* next-block entropy state, or `None` when the block should be
+/// emitted raw instead (incompressible, or one of the C fallback quirks).
+///
+/// The caller owns the commit decision, mirroring C's prev/next double
+/// buffering: `ZSTD_blockState_confirmRepcodesAndEntropyTables` runs only when
+/// the block is actually emitted compressed (`cSize > 1` — not for the
+/// RLE-block override, not for raw fallbacks).
 pub(crate) fn entropy_compress_seq_store(
     store: &SeqStore,
-    entropy: &mut FseEntropyState,
+    entropy: &FseEntropyState,
     strategy: i32,
+    disable_literal_compression: bool,
     block_size: usize,
-) -> Result<Option<Vec<u8>>, Error> {
+) -> Result<Option<(Vec<u8>, FseEntropyState)>, Error> {
     let mut next = entropy.clone();
-    let result = entropy_compress_seq_store_internal(store, &mut next, strategy, block_size)?;
-    if result.is_some() {
-        *entropy = next;
-    }
-    Ok(result)
+    let result = entropy_compress_seq_store_internal(
+        store,
+        &mut next,
+        strategy,
+        disable_literal_compression,
+        block_size,
+    )?;
+    Ok(result.map(|body| (body, next)))
 }
 
 fn entropy_compress_seq_store_internal(
     store: &SeqStore,
     entropy: &mut FseEntropyState,
     strategy: i32,
+    disable_literal_compression: bool,
     block_size: usize,
 ) -> Result<Option<Vec<u8>>, Error> {
     let nb_seq = store.sequences.len();
@@ -548,8 +556,12 @@ fn entropy_compress_seq_store_internal(
     // literals-to-sequences ratio.
     let suspect_uncompressible =
         nb_seq == 0 || lit_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
-    let mut out =
-        literals_encode::compress_literals(&store.literals, strategy, suspect_uncompressible);
+    let mut out = literals_encode::compress_literals(
+        &store.literals,
+        strategy,
+        suspect_uncompressible,
+        disable_literal_compression,
+    );
 
     // Sequences header.
     if nb_seq < 128 {
@@ -726,17 +738,18 @@ mod tests {
 
     /// Compress a store and require a compressed (non-fallback) block.
     fn compress(store: &SeqStore, strategy: i32, block_size: usize) -> Vec<u8> {
-        let mut entropy = FseEntropyState::new();
-        entropy_compress_seq_store(store, &mut entropy, strategy, block_size)
+        let entropy = FseEntropyState::new();
+        entropy_compress_seq_store(store, &entropy, strategy, false, block_size)
             .unwrap()
             .expect("expected a compressible block")
+            .0
     }
 
     /// Like [`compress`], but without the block-level compressibility gate —
     /// for tiny handcrafted blocks that a real compressor would emit raw.
     fn compress_ungated(store: &SeqStore, strategy: i32, block_size: usize) -> Vec<u8> {
         let mut entropy = FseEntropyState::new();
-        entropy_compress_seq_store_internal(store, &mut entropy, strategy, usize::MAX)
+        entropy_compress_seq_store_internal(store, &mut entropy, strategy, false, usize::MAX)
             .unwrap()
             .unwrap_or_else(|| panic!("ungated compression returned None ({block_size} bytes)"))
     }
@@ -843,10 +856,11 @@ mod tests {
             let store = greedy_store(&data);
             assert!(!store.sequences.is_empty(), "matcher found no matches");
             for strategy in [1, 3, 6, 9] {
-                let mut entropy = FseEntropyState::new();
-                let body = entropy_compress_seq_store(&store, &mut entropy, strategy, data.len())
-                    .unwrap()
-                    .expect("word salad must compress");
+                let entropy = FseEntropyState::new();
+                let (body, _next) =
+                    entropy_compress_seq_store(&store, &entropy, strategy, false, data.len())
+                        .unwrap()
+                        .expect("word salad must compress");
                 let mut out = Vec::new();
                 decode_block(&body, &mut FrameContext::new(), &mut out);
                 assert_eq!(out, data, "len={len} strategy={strategy}");
@@ -868,16 +882,17 @@ mod tests {
         let store2 = greedy_store(&data);
         assert!(store2.sequences.len() < 1000, "below the repeat-gate limit");
 
-        let mut entropy = FseEntropyState::new();
-        let body1 = entropy_compress_seq_store(&store1, &mut entropy, 6, data.len())
-            .unwrap()
-            .unwrap();
+        let entropy = FseEntropyState::new();
+        let (body1, mut entropy) =
+            entropy_compress_seq_store(&store1, &entropy, 6, false, data.len())
+                .unwrap()
+                .unwrap();
         // Promote the freshly built tables to Valid, as ZSTD_loadCEntropy
         // would for a dictionary, so the strategy-1 heuristic reuses them.
         entropy.ll_repeat = FseRepeat::Valid;
         entropy.of_repeat = FseRepeat::Valid;
         entropy.ml_repeat = FseRepeat::Valid;
-        let body2 = entropy_compress_seq_store(&store2, &mut entropy, 1, data.len())
+        let (body2, _next) = entropy_compress_seq_store(&store2, &entropy, 1, false, data.len())
             .unwrap()
             .unwrap();
 
@@ -947,8 +962,8 @@ mod tests {
             .collect();
         let mut store = SeqStore::new();
         store.store_last_literals(&data);
-        let mut entropy = FseEntropyState::new();
-        let r = entropy_compress_seq_store(&store, &mut entropy, 3, data.len()).unwrap();
+        let entropy = FseEntropyState::new();
+        let r = entropy_compress_seq_store(&store, &entropy, 3, false, data.len()).unwrap();
         assert!(
             r.is_none(),
             "random bytes must not produce a compressed block"

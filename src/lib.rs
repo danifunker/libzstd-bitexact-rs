@@ -26,6 +26,7 @@
 
 mod bits;
 mod block;
+mod compress;
 mod decompress;
 mod dictionary;
 mod error;
@@ -39,6 +40,7 @@ mod sequences_encode;
 mod stream;
 mod xxhash;
 
+pub use compress::compress;
 pub use decompress::{DecodeOptions, WINDOW_LOG_MAX, decompress, decompress_with_limit};
 pub use dictionary::Dictionary;
 pub use error::Error;

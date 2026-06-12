@@ -22,7 +22,8 @@ libzstd, not by review.
 | `windowLogMax` enforcement | ✅ implemented |
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
 | Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
-| Compression (bit-exact with C, all levels) | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
+| **Compression, bit-exact with C** — fast strategy (levels 1, 2, negatives) | ✅ byte-identical, differential-tested |
+| Compression — remaining strategies (`dfast` … `btultra2`) | ⬜ in progress — see [ROADMAP.md](ROADMAP.md) |
 
 ## Usage
 

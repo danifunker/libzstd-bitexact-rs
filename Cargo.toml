@@ -15,6 +15,13 @@ categories = ["compression"]
 [dev-dependencies]
 # The real C libzstd, used exclusively as the differential-testing oracle.
 zstd = "0.13"
+# Raw FFI to the same bundled libzstd, for oracle introspection in tests
+# (e.g. asking C which compression parameters it derives). `experimental`
+# exposes the ZSTD_STATIC_LINKING_ONLY API surface with pregenerated bindings.
+zstd-sys = { version = "2.0.16", default-features = false, features = [
+    "experimental",
+    "std",
+] }
 
 [profile.dev]
 # The decoder is exercised on megabytes of data in tests; opt-level 1 keeps

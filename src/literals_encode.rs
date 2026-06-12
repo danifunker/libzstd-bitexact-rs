@@ -75,13 +75,20 @@ pub(crate) fn min_gain(src_size: usize, strategy: i32) -> usize {
 /// `ZSTD_compressLiterals`: pick the best literals representation for `src` at
 /// the given compression `strategy` (1..=9), returning the section bytes.
 /// `suspect_uncompressible` enables the sampling short-circuit for inputs the
-/// caller already believes are high-entropy (`HUF_flags_suspectUncompressible`).
+/// caller already believes are high-entropy (`HUF_flags_suspectUncompressible`);
+/// `disable_literal_compression` forces raw literals
+/// (`ZSTD_literalsCompressionIsDisabled` — true in `ZSTD_ps_auto` mode for the
+/// fast strategy with a nonzero target length, i.e. the negative levels).
 pub(crate) fn compress_literals(
     src: &[u8],
     strategy: i32,
     suspect_uncompressible: bool,
+    disable_literal_compression: bool,
 ) -> Vec<u8> {
     let n = src.len();
+    if disable_literal_compression {
+        return raw_literals(src);
+    }
     if n < min_literals_to_compress(strategy) {
         return raw_literals(src);
     }
@@ -140,7 +147,7 @@ mod tests {
     /// Decode an emitted section with a fresh context and require the literals
     /// back, with the whole section consumed.
     fn assert_round_trip(literals: &[u8]) {
-        let section = compress_literals(literals, 3, false);
+        let section = compress_literals(literals, 3, false, false);
         let mut ctx = FrameContext::new();
         let (decoded, used) = block::decode_literals(&mut ctx, &section, BLOCK_SIZE_MAX)
             .unwrap_or_else(|e| panic!("decode of {}-byte literals failed: {e}", literals.len()));

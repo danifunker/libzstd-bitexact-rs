@@ -108,14 +108,28 @@ compressed bytes against the C oracle's directly.
       forms, all four table modes (including Repeat across blocks), the
       long-literal-length marker, and matcher-generated stores at strategies
       1/3/6/9.
-- [ ] Match finders, in C-strategy order: `fast`, `dfast`, `greedy`, `lazy`,
-      `lazy2`, `btlazy2`, `btopt`, `btultra`, `btultra2` — each gated by a
-      differential test asserting byte-identical compressed output.
-- [ ] Parameter tables (`ZSTD_defaultCParameters`) and
-      `ZSTD_adjustCParams` logic, so every (level, srcSize) pair picks the
-      same parameters as C.
-- [ ] Block splitter and `ZSTD_compressBlock` decision points (RLE/raw
-      block fallbacks, `ZSTD_maybeRLE`, …).
+- [x] **`fast` — BIT-EXACT.** `src/compress.rs` ports the `ZSTD_fast` match
+      finder (hash functions, pipelined search loop, step acceleration,
+      repcode fast path, backward extension), and the public `compress(src,
+      level)` produces **byte-identical frames to C** for fast-strategy levels
+      (1, 2, and the negative/acceleration levels, which also required the
+      `ZSTD_ps_auto` rule disabling literal compression when
+      `fast && targetLength > 0`). Gated by `tests/compress_differential.rs`:
+      byte-for-byte equality with `ZSTD_compress` across text, runs, periods,
+      structured records, random multi-block data, and size edges.
+- [ ] Remaining match finders, in C-strategy order: `dfast`, `greedy`,
+      `lazy`, `lazy2`, `btlazy2`, `btopt`, `btultra`, `btultra2` — each gated
+      the same way. Unsupported configurations return `Error::Encode` rather
+      than silently diverging.
+- [x] Parameter tables (`ZSTD_defaultCParameters`, all four srcSize classes)
+      and `ZSTD_adjustCParams_internal` (window resize, hash/chain clamping,
+      cycle log), verified against the C `ZSTD_getCParams` via FFI probing and
+      end-to-end by the byte-exact frame headers.
+- [ ] Block splitter: `ZSTD_compressBlock` decision points (RLE/raw
+      fallbacks, the `cSize > 1` confirm rule, savings tracking) are done and
+      byte-exact; `ZSTD_splitBlock` (the 1.5.7 pre-block splitter for
+      compressible inputs beyond 128 KiB) is the missing piece — such inputs
+      error explicitly until it lands.
 
 ## M5 — Full API parity
 

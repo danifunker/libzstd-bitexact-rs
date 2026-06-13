@@ -623,8 +623,20 @@ fn update_tree(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, ext_dict: 
     ctx.next_to_update = target;
 }
 
-/// `ZSTD_insertBtAndGetAllMatches` (noDict and extDict). Returns the number
-/// of matches stored in `ctx.matches`, in strictly increasing length order.
+/// An attached CDict's optimal-parser match state (`ms->dictMatchState`) for the
+/// dictMatchState arm. In the concatenated `content ++ src` buffer the dict
+/// occupies indices `[WINDOW_START_INDEX, WINDOW_START_INDEX + content_len)`, so
+/// `dmsIndexDelta == 0` and a dict index maps to a position like the working
+/// context's (`pos = index - WINDOW_START_INDEX`).
+pub(crate) struct OptDms<'a> {
+    pub(crate) ms: &'a OptCtx,
+    pub(crate) content_len: usize,
+}
+
+/// `ZSTD_insertBtAndGetAllMatches` (noDict, extDict, and dictMatchState).
+/// Returns the number of matches stored in `ctx.matches`, in strictly
+/// increasing length order. `dms` (the attached CDict) is mutually exclusive
+/// with `ext_dict`.
 #[allow(clippy::too_many_arguments)]
 fn insert_bt_and_get_all_matches(
     ctx: &mut OptCtx,
@@ -636,6 +648,7 @@ fn insert_bt_and_get_all_matches(
     ll0: bool,
     length_to_beat: u32,
     ext_dict: bool,
+    dms: Option<&OptDms>,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
@@ -703,6 +716,25 @@ fn insert_bt_and_get_all_matches(
                     to_pos(iend),
                     dict_limit as usize - dict_bias,
                     dict_limit as usize - bias,
+                ) + min_match as usize;
+            }
+        } else if let Some(att) = dms {
+            // repIndex reaches into the attached dict. dmsLowLimit +
+            // dmsIndexDelta == WINDOW_START_INDEX (concat delta 0); the repMatch
+            // lives at `repIndex - WINDOW_START_INDEX`.
+            let rep_index = curr.wrapping_sub(rep_offset);
+            if rep_offset.wrapping_sub(1) < curr - WINDOW_START_INDEX as u32
+                && (dict_limit - 1).wrapping_sub(rep_index) >= 3
+                && read_minmatch(data, to_pos(ip), min_match)
+                    == read_minmatch(data, rep_index as usize - WINDOW_START_INDEX, min_match)
+            {
+                rep_len = count_2segments(
+                    data,
+                    to_pos(ip) + min_match as usize,
+                    (rep_index as usize - WINDOW_START_INDEX) + min_match as usize,
+                    to_pos(iend),
+                    att.content_len, // dmsEnd position
+                    att.content_len, // prefixStart position (= src start)
                 ) + min_match as usize;
             }
         }
@@ -802,6 +834,10 @@ fn insert_bt_and_get_all_matches(
             };
             mnum += 1;
             if match_length > ZSTD_OPT_NUM || ip + match_length == iend {
+                // dictMatchState: a break should also skip searching the dms.
+                if dms.is_some() {
+                    nb_compares = 0;
+                }
                 break; // drop, to preserve bt consistency
             }
         }
@@ -839,6 +875,67 @@ fn insert_bt_and_get_all_matches(
         ctx.bt[l] = 0;
     }
 
+    // `ZSTD_insertBtAndGetAllMatches` dictMatchState arm: descend the attached
+    // CDict's own (fully sorted) binary tree with the compares left over. Concat
+    // buffer ⇒ dmsIndexDelta == 0, so a dict index is a working index directly
+    // and the post-seam match-pointer rebase is a no-op. Read-only on the dms.
+    if nb_compares > 0 {
+        if let Some(att) = dms {
+            let d = att.ms;
+            let dms_high_limit = (WINDOW_START_INDEX + att.content_len) as u32; // dmsSize
+            let dms_low_limit = WINDOW_START_INDEX as u32; // dms.window.lowLimit
+            let dms_bt_mask = (1u32 << (d.chain_log - 1)) - 1;
+            let dms_bt_low = if dms_bt_mask < dms_high_limit - dms_low_limit {
+                dms_high_limit - dms_bt_mask
+            } else {
+                dms_low_limit
+            };
+            let dms_h = hash_ptr(data, to_pos(ip), d.hash_log, ctx.mls);
+            let mut dict_match_index = d.hash_table[dms_h];
+            let mut common_smaller = 0usize;
+            let mut common_larger = 0usize;
+            while nb_compares > 0 && dict_match_index > dms_low_limit {
+                let next = 2 * (dict_match_index & dms_bt_mask) as usize;
+                let mut match_length = common_smaller.min(common_larger);
+                let m_pos = dict_match_index as usize - WINDOW_START_INDEX;
+                match_length += count_2segments(
+                    data,
+                    to_pos(ip) + match_length,
+                    m_pos + match_length,
+                    to_pos(iend),
+                    att.content_len, // dmsEnd position
+                    att.content_len, // prefixStart position
+                );
+                if match_length > best_length {
+                    let match_index = dict_match_index; // + dmsIndexDelta (0)
+                    if match_length > (match_end_idx - match_index) as usize {
+                        match_end_idx = match_index + match_length as u32;
+                    }
+                    best_length = match_length;
+                    ctx.matches[mnum] = Match {
+                        off: (curr - match_index) + 3, // OFFSET_TO_OFFBASE
+                        len: match_length as u32,
+                    };
+                    mnum += 1;
+                    if match_length > ZSTD_OPT_NUM || ip + match_length == iend {
+                        break;
+                    }
+                }
+                if dict_match_index <= dms_bt_low {
+                    break;
+                }
+                if data[m_pos + match_length] < data[to_pos(ip) + match_length] {
+                    common_smaller = match_length;
+                    dict_match_index = d.bt[next + 1];
+                } else {
+                    common_larger = match_length;
+                    dict_match_index = d.bt[next];
+                }
+                nb_compares -= 1;
+            }
+        }
+    }
+
     ctx.next_to_update = (match_end_idx - 8) as usize; // skip repetitive patterns
     mnum
 }
@@ -855,6 +952,7 @@ fn get_all_matches(
     ll0: bool,
     length_to_beat: u32,
     ext_dict: bool,
+    dms: Option<&OptDms>,
 ) -> usize {
     if ip < ctx.next_to_update {
         return 0; // skipped area
@@ -870,6 +968,7 @@ fn get_all_matches(
         ll0,
         length_to_beat,
         ext_dict,
+        dms,
     )
 }
 
@@ -1023,6 +1122,7 @@ pub(crate) fn compress_block_opt(
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
     symbol_costs: Option<&FseEntropyState>,
+    dms: Option<&OptDms>,
 ) -> usize {
     // Snapshot the window geometry (the C code reads `ms->window` directly).
     ctx.base_bias = win.seg_bias as usize;
@@ -1032,10 +1132,12 @@ pub(crate) fn compress_block_opt(
 
     let src_size = block_end - block_start;
     let curr = block_start + ctx.base_bias;
-    // `ZSTD_compressBlock_btultra2` (a noDict-only entry point: extDict
-    // blocks of the btultra2 strategy run `ZSTD_compressBlock_btultra_extDict`
-    // per the `ZSTD_selectBlockCompressor` table, with no stats pass).
+    // `ZSTD_compressBlock_btultra2` (a noDict-only entry point: extDict and
+    // dictMatchState blocks of the btultra2 strategy run
+    // `ZSTD_compressBlock_btultra_{extDict,dictMatchState}` per the
+    // `ZSTD_selectBlockCompressor` table, with no stats pass).
     if !ext_dict
+        && dms.is_none()
         && ctx.is_ultra2
         && ctx.ll_sum == 0
         && store.sequences.is_empty()
@@ -1058,6 +1160,7 @@ pub(crate) fn compress_block_opt(
             false,
             ldm_seqs,
             symbol_costs,
+            dms,
         );
         win.slide_for_init_stats(src_size);
         ctx.base_bias = win.seg_bias as usize;
@@ -1075,6 +1178,7 @@ pub(crate) fn compress_block_opt(
         ext_dict,
         ldm_seqs,
         symbol_costs,
+        dms,
     )
 }
 
@@ -1092,6 +1196,7 @@ fn compress_block_opt_generic(
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
     symbol_costs: Option<&FseEntropyState>,
+    dms: Option<&OptDms>,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
@@ -1144,6 +1249,7 @@ fn compress_block_opt_generic(
                 ll0,
                 min_match,
                 ext_dict,
+                dms,
             );
             opt_ldm_process_match_candidate(
                 ctx,
@@ -1294,6 +1400,7 @@ fn compress_block_opt_generic(
                         ll0,
                         min_match,
                         ext_dict,
+                        dms,
                     );
                     opt_ldm_process_match_candidate(
                         ctx,

@@ -3044,6 +3044,7 @@ enum DictMatchState {
     Fast(FastDictMatchState),
     Dfast(DfastDictMatchState),
     Lazy(LazyDictMatchState),
+    Opt(OptDictMatchState),
 }
 
 struct FastDictMatchState {
@@ -3069,6 +3070,14 @@ struct DfastDictMatchState {
 /// parameters and salt 0. Read-only during the attach search.
 struct LazyDictMatchState {
     ms: Box<crate::lazy::LazyCtx>,
+    content_len: usize,
+}
+
+/// The btopt/btultra/btultra2 variant: the CDict's own (untagged) optimal-parser
+/// match state — the fully-sorted binary tree built over the dict content with
+/// the CDict's parameters. Read-only during the attach search.
+struct OptDictMatchState {
+    ms: Box<crate::opt::OptCtx>,
     content_len: usize,
 }
 
@@ -3388,6 +3397,15 @@ impl FrameCompressor {
                     }
                     Matcher::Opt(ctx) => {
                         let ext_dict = self.window.has_ext_dict();
+                        // `ZSTD_selectBlockCompressor`: an attached CDict
+                        // (dictMatchState) outranks extDict/noDict.
+                        let opt_dms = match &self.dict_match_state {
+                            Some(DictMatchState::Opt(d)) => Some(crate::opt::OptDms {
+                                ms: d.ms.as_ref(),
+                                content_len: d.content_len,
+                            }),
+                            _ => None,
+                        };
                         // `ZSTD_buildSeqStore`: with LDM enabled, generate
                         // the block's raw sequences first; the opt parser
                         // takes them as extra candidates
@@ -3420,6 +3438,7 @@ impl FrameCompressor {
                                 None
                             },
                             Some(&self.entropy),
+                            opt_dms.as_ref(),
                         )
                     }
                 };
@@ -3663,10 +3682,11 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
 /// context either **attaches** the CDict (small inputs ≤ the strategy cutoff) or
 /// **copies** its de-tagged tables (larger inputs).
 ///
-/// Current scope: the fast, dfast, greedy, lazy, lazy2 and btlazy2 strategies,
-/// both raw and trained dictionaries, on both the attach and copy sides of the
-/// cutoff; the btopt family (and tiny dictionaries) return a clean
-/// [`Error::Encode`] until their sub-commits land.
+/// Current scope: all nine strategies, both raw and trained dictionaries, on
+/// both the attach and copy sides of the cutoff. The only rejected
+/// configurations are a dictionary with <= 8 bytes of content and the rare
+/// large-window case where C would enable long-distance matching with the dict
+/// (`windowLog >= 27` at btopt+) — both return a clean [`Error::Encode`].
 pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
@@ -3674,19 +3694,9 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
 
     // The CDict's own cParams (`cpm_createCDict`, the *whole* dict buffer size).
     let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
-    if !matches!(
-        cdict_cparams.strategy,
-        Strategy::Fast
-            | Strategy::Dfast
-            | Strategy::Greedy
-            | Strategy::Lazy
-            | Strategy::Lazy2
-            | Strategy::Btlazy2
-    ) {
-        return Err(Error::Encode(
-            "CDict (Path B) currently supports only the fast..btlazy2 strategies",
-        ));
-    }
+    // All nine strategies are supported; the only unsupported configurations are
+    // tiny dictionaries (gated below) and the rare large-window LDM-with-dict
+    // case (gated after the context is built).
 
     // Parse the dictionary (`ZSTD_compress_insertDictionary` for the CDict):
     // a trained dict seeds the first block's tables/reps/ID; a raw dict uses the
@@ -3716,12 +3726,17 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         ));
     }
 
-    // `ZSTD_shouldAttachDict`: attach iff srcSize <= the strategy cutoff (fast =
-    // 8 KB, dfast = 16 KB, greedy/lazy/lazy2/btlazy2 = 32 KB), otherwise copy the
-    // dict's tables into the context (`attachDictSizeCutoffs`).
+    // `ZSTD_shouldAttachDict` / `attachDictSizeCutoffs`: attach iff srcSize <= the
+    // strategy cutoff — fast 8 KB, dfast 16 KB, greedy/lazy/lazy2/btlazy2/btopt
+    // 32 KB, btultra/btultra2 8 KB — otherwise copy the dict into the context.
     let cutoff = match cdict_cparams.strategy {
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => 32 * 1024,
+        Strategy::Greedy
+        | Strategy::Lazy
+        | Strategy::Lazy2
+        | Strategy::Btlazy2
+        | Strategy::Btopt => 32 * 1024,
         Strategy::Dfast => 16 * 1024,
+        // fast, btultra, btultra2
         _ => 8 * 1024,
     };
     let attach = src_len <= cutoff;
@@ -3760,6 +3775,18 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
                     cdict_uses_row,
                 ));
                 DictMatchState::Lazy(LazyDictMatchState {
+                    ms: Box::new(dms),
+                    content_len,
+                })
+            }
+            Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                // The CDict's own optimal-parser binary tree (its params), filled
+                // over the content; consulted read-only by the dictMatchState arm.
+                // The working OptCtx (from `from_cparams`) keeps its own empty
+                // tree — the opt parser has no row/chain backend to override.
+                let mut dms = crate::opt::OptCtx::new(&cdict_cparams);
+                dms.load_dictionary(&data, content_len);
+                DictMatchState::Opt(OptDictMatchState {
                     ms: Box::new(dms),
                     content_len,
                 })
@@ -3822,6 +3849,13 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
                 ctx.load_dictionary(&data, content_len);
                 fc.matcher = Matcher::Lazy(ctx);
             }
+            Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                // btopt+ tables aren't tagged either: the copied CDict tree equals
+                // a plain Path A `load_dictionary` fill over the working OptCtx.
+                if let Matcher::Opt(ctx) = &mut fc.matcher {
+                    ctx.load_dictionary(&data, content_len);
+                }
+            }
             // The de-tagged CDict fast/dfast table equals an untagged `dtlm_full`
             // fill, reproduced directly in the working tables.
             _ => match &mut fc.matcher {
@@ -3837,18 +3871,30 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         fc
     };
 
+    // C's `ZSTD_loadDictionaryContent` seeds the dict into the LDM tables too;
+    // that path isn't ported, so reject the (large-window) configurations where
+    // `ZSTD_resolveEnableLdm` turns long-distance matching on (btopt+ with
+    // windowLog >= 27) rather than diverge. Unreachable at typical sizes.
+    if fc.ldm.is_some() {
+        return Err(Error::Encode(
+            "long-distance matching with a CDict is not supported yet",
+        ));
+    }
+
     // `prevCBlock = cdict.cBlockState` on both paths.
     fc.entropy = entropy;
     fc.rep = rep;
     fc.dict_id = dict_id;
 
-    // Lazy resumes table insertion at the src start; the window-preloaded path
+    // Lazy/opt resume table insertion at the src start; the window-preloaded path
     // skips compress_continue's non-contiguous `nextToUpdate = dictLimit` reset.
     // (Fast/dfast don't track nextToUpdate; the attach window's dictLimit is the
     // src start, the copy window's is the dict/src seam — both the right resume
     // point.)
-    if let Matcher::Lazy(ctx) = &mut fc.matcher {
-        ctx.next_to_update = fc.window.dict_limit as usize;
+    match &mut fc.matcher {
+        Matcher::Lazy(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        _ => {}
     }
 
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);

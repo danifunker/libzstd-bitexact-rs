@@ -84,10 +84,21 @@ fn payloads() -> Vec<Vec<u8>> {
 /// `ZSTD_strategy` discriminants — element [6] of `cparams_for_testing`.
 const FAST: u32 = 1;
 const DFAST: u32 = 2;
+const GREEDY: u32 = 3;
+const LAZY: u32 = 4;
+const LAZY2: u32 = 5;
 
-/// The strategy our (and C's) dict-aware cParams select for a known srcSize.
-fn strategy_of(level: i32, src_len: usize, dict_len: usize) -> u32 {
-    cparams_for_testing(level, src_len as u64, dict_len as u64)[6]
+/// The strategies `compress_with_dict` currently supports (everything up to and
+/// including lazy2). Any binary-tree strategy (btlazy2/btopt/btultra/btultra2)
+/// is still gated.
+const SUPPORTED: [u32; 5] = [FAST, DFAST, GREEDY, LAZY, LAZY2];
+
+/// The (strategy, windowLog) our — and C's — dict-aware cParams select for a
+/// known srcSize. windowLog decides the greedy/lazy/lazy2 backend: the row
+/// finder when `windowLog > 14`, otherwise the hash chain.
+fn strat_and_wlog(level: i32, src_len: usize, dict_len: usize) -> (u32, u32) {
+    let cp = cparams_for_testing(level, src_len as u64, dict_len as u64);
+    (cp[6], cp[0])
 }
 
 /// C oracle: `ZSTD_compress_usingDict` (the extDict path) at `level`.
@@ -101,13 +112,13 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
 }
 
 #[test]
-fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
+fn raw_dict_supported_strategies_are_bit_exact_and_round_trip_else_rejected() {
     let big = raw_dict_content();
     // Dictionary sizes spanning the C boundaries:
     //   < 8  -> dict ignored entirely (still influences cParams);
     //   == 8 -> extDict live but no table fill;
-    //   9    -> fill loop runs zero times (boundary);
-    //   >= 10 -> table actually populated.
+    //   9    -> fast fill runs zero times, the lazy/chain fill inserts one;
+    //   >= 10 -> tables actually populated.
     let dicts: Vec<Vec<u8>> = vec![
         Vec::new(),
         big[..7].to_vec(),
@@ -118,23 +129,30 @@ fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
         big[..1024].to_vec(),
         big.clone(),
     ];
-    // Negative + 1/2 resolve to fast and 3 to dfast at these sizes (both
-    // supported); 9/19 resolve to lazy/opt, exercising the gate.
-    let levels = [-3, -1, 1, 2, 3, 9, 19];
+    // Across these payload/dict sizes (only tables 2 and 3 are reached) the
+    // levels cover: negatives/1/2 -> fast, 3 -> dfast, 4/5 -> greedy, 5/6/7 ->
+    // lazy, 6..10 -> lazy2 — each of greedy/lazy/lazy2 in BOTH the row finder
+    // (the 60000-byte payload, windowLog 17) and the hash chain (small payloads,
+    // windowLog 14); 9/10/19 select a binary-tree strategy at some sizes,
+    // exercising the gate. The coverage assertions below fail loudly if any
+    // class stops being exercised.
+    let levels = [-3, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 19];
 
-    let mut fast_checks = 0u64;
-    let mut dfast_checks = 0u64;
+    // Per-strategy and per-backend coverage, so nothing silently goes untested.
+    let mut by_strategy = [0u64; 10]; // indexed by ZSTD_strategy discriminant
+    let mut lazy_row = 0u64;
+    let mut lazy_hc = 0u64;
     let mut gate_checks = 0u64;
     for dict in &dicts {
         for data in payloads() {
             for &level in &levels {
-                let strat = strategy_of(level, data.len(), dict.len());
+                let (strat, wlog) = strat_and_wlog(level, data.len(), dict.len());
                 let ours = compress_with_dict(&data, dict, level);
 
-                if strat == FAST || strat == DFAST {
+                if SUPPORTED.contains(&strat) {
                     let ours = ours.unwrap_or_else(|e| {
                         panic!(
-                            "compress_with_dict errored on supported config (dict={}, src={}, level={level}): {e}",
+                            "compress_with_dict errored on supported config (strat={strat}, dict={}, src={}, level={level}): {e}",
                             dict.len(),
                             data.len()
                         )
@@ -143,7 +161,7 @@ fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
                     assert_eq!(
                         ours,
                         theirs,
-                        "byte mismatch vs C: dict={}, src={}, level={level}",
+                        "byte mismatch vs C: strat={strat}, wlog={wlog}, dict={}, src={}, level={level}",
                         dict.len(),
                         data.len()
                     );
@@ -166,10 +184,14 @@ fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
                         dict.len(),
                         data.len()
                     );
-                    if strat == FAST {
-                        fast_checks += 1;
-                    } else {
-                        dfast_checks += 1;
+                    by_strategy[strat as usize] += 1;
+                    // Which backend did the greedy/lazy/lazy2 family exercise?
+                    if matches!(strat, GREEDY | LAZY | LAZY2) {
+                        if wlog > 14 {
+                            lazy_row += 1;
+                        } else {
+                            lazy_hc += 1;
+                        }
                     }
                 } else {
                     assert!(
@@ -183,9 +205,16 @@ fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
             }
         }
     }
+    // Every supported strategy, both lazy backends, and the gate must be hit.
+    for &s in &SUPPORTED {
+        assert!(
+            by_strategy[s as usize] > 0,
+            "strategy {s} was never exercised (counts={by_strategy:?})"
+        );
+    }
     assert!(
-        fast_checks > 0 && dfast_checks > 0 && gate_checks > 0,
-        "matrix must exercise fast ({fast_checks}), dfast ({dfast_checks}), and the gate ({gate_checks})"
+        lazy_row > 0 && lazy_hc > 0 && gate_checks > 0,
+        "must exercise the row finder ({lazy_row}), the hash chain ({lazy_hc}), and the gate ({gate_checks})"
     );
 }
 

@@ -9,12 +9,13 @@
 //!   whose SIMD paths are pure accelerators — the scalar form here produces
 //!   identical match choices, byte-for-byte.
 //!
-//! Both backends carry the extDict candidate branch. Note that the hash-chain
-//! extDict path is unreachable through the public API: hash chains are only
-//! selected when `windowLog <= 14`, which can only result from a small pledged
-//! content size, and a pledged stream that small never wraps its input buffer.
-//! It is ported for completeness and symmetry with C, not because any
-//! differential test can reach it.
+//! Both backends carry the extDict candidate branch. The hash-chain extDict
+//! path is unreachable through plain streaming (hash chains are only selected
+//! when `windowLog <= 14`, which needs a small pledged content size, and a
+//! stream that small never wraps its input buffer), but dictionary compression
+//! reaches it: `compress_with_dict` on a greedy/lazy/lazy2 level whose dict-aware
+//! `windowLog` lands at <= 14 (small `dict + src`) runs the hash-chain extDict
+//! finder, differential-tested in `tests/dict_compress_differential.rs`.
 //!
 //! Row hashing is salted. For a fresh one-shot context the salt is the fixed
 //! constant `bitmix(0,8) ^ bitmix(0,4)` (a zeroed `ZSTD_CCtx` advanced once by
@@ -180,6 +181,39 @@ impl LazyCtx {
             crate::compress::reduce_table(&mut self.chain_table, correction, preserve_mark);
         }
         self.next_to_update = self.next_to_update.saturating_sub(correction as usize);
+    }
+
+    /// `ZSTD_loadDictionaryContent`'s greedy/lazy/lazy2 branch: seed the match
+    /// finder from the raw dictionary `data[0..dict_len]` before `src` is
+    /// compressed. The row finder zeroes its tag table (already zero on a fresh
+    /// `LazyCtx`) then runs `ZSTD_row_update` (uncached); the hash-chain finder
+    /// runs `ZSTD_insertAndFindFirstIndex`. Both insert positions up to
+    /// `dictEnd - HASH_READ_SIZE`, after which `nextToUpdate` jumps to `dictEnd`,
+    /// so the final `HASH_READ_SIZE` dict positions are never inserted (exactly
+    /// as in C). Reusing the very functions the matcher uses keeps the fill and
+    /// the search hash-consistent. Caller guarantees `dict_len > HASH_READ_SIZE`
+    /// and a fresh context (`next_to_update == WINDOW_START_INDEX`); not for
+    /// btlazy2 (the binary tree fills via `ZSTD_updateTree`, a later increment).
+    pub(crate) fn load_dictionary(&mut self, data: &[u8], dict_len: usize) {
+        const HASH_READ_SIZE: usize = 8;
+        let seg_bias = WINDOW_START_INDEX;
+        // Biased index of `dictEnd - HASH_READ_SIZE`, the fill's exclusive upper
+        // bound (C passes this pointer to ZSTD_row_update / insertAndFind).
+        let fill_target = WINDOW_START_INDEX + dict_len - HASH_READ_SIZE;
+        match self.method {
+            SearchMethod::RowHash => {
+                row_update_internal(self, data, fill_target, false, seg_bias);
+            }
+            SearchMethod::HashChain => {
+                let _ = insert_and_find_first_index(self, data, fill_target, seg_bias);
+            }
+            SearchMethod::BinaryTree => {
+                debug_assert!(false, "btlazy2 dict load not implemented");
+            }
+        }
+        // `ms->nextToUpdate = iend - base`: resume insertion at the start of
+        // `src`, never re-touching the dict's last few positions.
+        self.next_to_update = WINDOW_START_INDEX + dict_len;
     }
 }
 

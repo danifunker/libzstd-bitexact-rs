@@ -8,8 +8,8 @@
 //! acceleration levels), any input size, no dictionary, no checksum — the
 //! `ZSTD_compress` defaults. [`compress_with_dict`] additionally primes the
 //! match finder from a raw dictionary (`ZSTD_compress_usingDict`, extDict
-//! path), currently limited to the fast and dfast strategies. This includes the
-//! configurations where C
+//! path), currently limited to the fast, dfast, and greedy/lazy/lazy2
+//! strategies. This includes the configurations where C
 //! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
 //! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
 //! bit-exact. All nine strategies are implemented: fast and
@@ -2701,13 +2701,14 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 /// libzstd 1.5.7 for the supported scope; unsupported configurations return
 /// [`Error::Encode`] rather than diverging.
 ///
-/// Current scope (raw / content-only dictionaries, **fast** and **dfast**
-/// strategies): the dict-aware cParams must resolve to `ZSTD_fast` or
-/// `ZSTD_dfast` — true for the lower levels and the negative (acceleration)
+/// Current scope (raw / content-only dictionaries, **fast**, **dfast**, and the
+/// **greedy/lazy/lazy2** strategies): the dict-aware cParams must resolve to one
+/// of those — true for the low and mid levels and the negative (acceleration)
 /// levels at typical sizes. A trained (`ZDICT`) dictionary, or any level/size
-/// whose cParams select another strategy, returns a clean `Error::Encode`. An
-/// empty `dict` is equivalent to [`compress`]; a dict shorter than 8 bytes is
-/// ignored (as in C), though it still influences the derived parameters.
+/// whose cParams select a binary-tree strategy (btlazy2 / btopt / btultra /
+/// btultra2), returns a clean `Error::Encode`. An empty `dict` is equivalent to
+/// [`compress`]; a dict shorter than 8 bytes is ignored (as in C), though it
+/// still influences the derived parameters.
 pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         // Match indices are 32-bit; larger histories need overflow correction.
@@ -2725,9 +2726,12 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     // cParams use the dictionary size, exactly as `ZSTD_compress_usingDict` ->
     // `ZSTD_getParams_internal(level, srcSize, dictSize, cpm_noAttachDict)`.
     let cparams = get_cparams(level, src.len() as u64, dict.len() as u64);
-    if !matches!(cparams.strategy, Strategy::Fast | Strategy::Dfast) {
+    if !matches!(
+        cparams.strategy,
+        Strategy::Fast | Strategy::Dfast | Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    ) {
         return Err(Error::Encode(
-            "dictionary compression currently supports only the fast and dfast strategies",
+            "dictionary compression currently supports only the fast, dfast, greedy, and lazy strategies",
         ));
     }
 
@@ -2759,12 +2763,27 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
         match &mut fc.matcher {
             Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, dict_len),
             Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, dict_len),
-            // Unreachable: the strategy gate above admits only fast and dfast.
+            Matcher::Lazy(ctx) => ctx.load_dictionary(&data, dict_len),
+            // Unreachable: the gate admits only fast, dfast, and the
+            // greedy/lazy/lazy2 family (Matcher::Lazy; never btlazy2/opt).
             _ => {}
         }
     }
     fc.window = Window::preloaded_ext_dict(dict_len, src_len);
     fc.window_preloaded = true;
+    // The window-preloaded path skips compress_continue's non-contiguous reset
+    // (`ms->nextToUpdate = window.dictLimit`); apply it here so the lazy/opt
+    // matchers resume insertion at the start of `src` and never re-insert dict
+    // positions. (For a filled dict, load_dictionary already left nextToUpdate
+    // at dictLimit; this is what covers the no-fill `dict_len == HASH_READ_SIZE`
+    // case, where leaving it at the dict start would fabricate dict matches that
+    // C — whose post-flip base makes those indices hash unrelated bytes — never
+    // finds. Fast/dfast don't track nextToUpdate.)
+    match &mut fc.matcher {
+        Matcher::Lazy(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        _ => {}
+    }
 
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
     fc.compress_end(&mut out, &data, dict_len, dict_len + src_len)?;

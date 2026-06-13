@@ -81,18 +81,12 @@ fn payloads() -> Vec<Vec<u8>> {
     out
 }
 
-/// `ZSTD_strategy` discriminants — element [6] of `cparams_for_testing`.
-const FAST: u32 = 1;
-const DFAST: u32 = 2;
+/// `ZSTD_strategy` discriminants — element [6] of `cparams_for_testing`. Used to
+/// pick the greedy/lazy/lazy2 backend (row vs hash chain) and to assert
+/// per-strategy coverage. All nine strategies are supported for raw dicts.
 const GREEDY: u32 = 3;
 const LAZY: u32 = 4;
 const LAZY2: u32 = 5;
-const BTLAZY2: u32 = 6;
-
-/// The strategies `compress_with_dict` currently supports (everything up to and
-/// including btlazy2). The optimal-parser strategies (btopt/btultra/btultra2)
-/// are still gated.
-const SUPPORTED: [u32; 6] = [FAST, DFAST, GREEDY, LAZY, LAZY2, BTLAZY2];
 
 /// The (strategy, windowLog) our — and C's — dict-aware cParams select for a
 /// known srcSize. windowLog decides the greedy/lazy/lazy2 backend: the row
@@ -113,12 +107,12 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
 }
 
 #[test]
-fn raw_dict_supported_strategies_are_bit_exact_and_round_trip_else_rejected() {
+fn raw_dict_all_strategies_are_bit_exact_and_round_trip() {
     let big = raw_dict_content();
     // Dictionary sizes spanning the C boundaries:
     //   < 8  -> dict ignored entirely (still influences cParams);
     //   == 8 -> extDict live but no table fill;
-    //   9    -> fast fill runs zero times, the lazy/chain fill inserts one;
+    //   9    -> fast fill runs zero times, the lazy/tree fill inserts one;
     //   >= 10 -> tables actually populated.
     let dicts: Vec<Vec<u8>> = vec![
         Vec::new(),
@@ -130,92 +124,77 @@ fn raw_dict_supported_strategies_are_bit_exact_and_round_trip_else_rejected() {
         big[..1024].to_vec(),
         big.clone(),
     ];
-    // Across these payload/dict sizes (only tables 2 and 3 are reached) the
-    // levels cover: negatives/1/2 -> fast, 3 -> dfast, 4/5 -> greedy, 5/6/7 ->
-    // lazy, 6..10 -> lazy2 — each of greedy/lazy/lazy2 in BOTH the row finder
-    // (the 60000-byte payload, windowLog 17) and the hash chain (small payloads,
-    // windowLog 14); 9/10 -> btlazy2 at the small (table-3) sizes; 19 ->
-    // btultra2, exercising the gate. The coverage assertions below fail loudly
-    // if any class stops being exercised.
-    let levels = [-3, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 19];
+    // Levels -3,-1 and 1..=22 cover all nine strategies across tables 2 and 3:
+    // fast/dfast/greedy/lazy/lazy2 (greedy/lazy/lazy2 in BOTH the row finder at
+    // the 60000-byte payload, windowLog 17, and the hash chain at the small
+    // payloads, windowLog 14), btlazy2, and btopt/btultra/btultra2. The coverage
+    // assertions below fail loudly if any strategy class stops being exercised.
+    let levels: Vec<i32> = [-3, -1].into_iter().chain(1..=22).collect();
 
     // Per-strategy and per-backend coverage, so nothing silently goes untested.
-    let mut by_strategy = [0u64; 10]; // indexed by ZSTD_strategy discriminant
+    let mut by_strategy = [0u64; 10]; // indexed by ZSTD_strategy discriminant (1..=9)
     let mut lazy_row = 0u64;
     let mut lazy_hc = 0u64;
-    let mut gate_checks = 0u64;
     for dict in &dicts {
         for data in payloads() {
             for &level in &levels {
                 let (strat, wlog) = strat_and_wlog(level, data.len(), dict.len());
-                let ours = compress_with_dict(&data, dict, level);
-
-                if SUPPORTED.contains(&strat) {
-                    let ours = ours.unwrap_or_else(|e| {
+                let ours = compress_with_dict(&data, dict, level).unwrap_or_else(|e| {
+                    panic!(
+                        "compress_with_dict errored (strat={strat}, dict={}, src={}, level={level}): {e}",
+                        dict.len(),
+                        data.len()
+                    )
+                });
+                let theirs = oracle(&data, dict, level);
+                assert_eq!(
+                    ours,
+                    theirs,
+                    "byte mismatch vs C: strat={strat}, wlog={wlog}, dict={}, src={}, level={level}",
+                    dict.len(),
+                    data.len()
+                );
+                // Independently round-trip through our decoder with the dict.
+                let dict_obj = Dictionary::new(dict).expect("raw dict parse");
+                let decoded = DecodeOptions::new()
+                    .dictionary(&dict_obj)
+                    .decompress(&ours)
+                    .unwrap_or_else(|e| {
                         panic!(
-                            "compress_with_dict errored on supported config (strat={strat}, dict={}, src={}, level={level}): {e}",
+                            "decode failed: dict={}, src={}, level={level}: {e}",
                             dict.len(),
                             data.len()
                         )
                     });
-                    let theirs = oracle(&data, dict, level);
-                    assert_eq!(
-                        ours,
-                        theirs,
-                        "byte mismatch vs C: strat={strat}, wlog={wlog}, dict={}, src={}, level={level}",
-                        dict.len(),
-                        data.len()
-                    );
-                    // Independently round-trip through our decoder with the dict.
-                    let dict_obj = Dictionary::new(dict).expect("raw dict parse");
-                    let decoded = DecodeOptions::new()
-                        .dictionary(&dict_obj)
-                        .decompress(&ours)
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "decode failed: dict={}, src={}, level={level}: {e}",
-                                dict.len(),
-                                data.len()
-                            )
-                        });
-                    assert_eq!(
-                        decoded,
-                        data,
-                        "round-trip mismatch: dict={}, src={}, level={level}",
-                        dict.len(),
-                        data.len()
-                    );
-                    by_strategy[strat as usize] += 1;
-                    // Which backend did the greedy/lazy/lazy2 family exercise?
-                    if matches!(strat, GREEDY | LAZY | LAZY2) {
-                        if wlog > 14 {
-                            lazy_row += 1;
-                        } else {
-                            lazy_hc += 1;
-                        }
+                assert_eq!(
+                    decoded,
+                    data,
+                    "round-trip mismatch: dict={}, src={}, level={level}",
+                    dict.len(),
+                    data.len()
+                );
+                by_strategy[strat as usize] += 1;
+                // Which backend did the greedy/lazy/lazy2 family exercise?
+                if matches!(strat, GREEDY | LAZY | LAZY2) {
+                    if wlog > 14 {
+                        lazy_row += 1;
+                    } else {
+                        lazy_hc += 1;
                     }
-                } else {
-                    assert!(
-                        ours.is_err(),
-                        "unsupported strategy {strat} must be gated (dict={}, src={}, level={level})",
-                        dict.len(),
-                        data.len()
-                    );
-                    gate_checks += 1;
                 }
             }
         }
     }
-    // Every supported strategy, both lazy backends, and the gate must be hit.
-    for &s in &SUPPORTED {
+    // All nine strategies and both greedy/lazy/lazy2 backends must be exercised.
+    for s in 1..=9u32 {
         assert!(
             by_strategy[s as usize] > 0,
             "strategy {s} was never exercised (counts={by_strategy:?})"
         );
     }
     assert!(
-        lazy_row > 0 && lazy_hc > 0 && gate_checks > 0,
-        "must exercise the row finder ({lazy_row}), the hash chain ({lazy_hc}), and the gate ({gate_checks})"
+        lazy_row > 0 && lazy_hc > 0,
+        "must exercise both the row finder ({lazy_row}) and the hash chain ({lazy_hc})"
     );
 }
 

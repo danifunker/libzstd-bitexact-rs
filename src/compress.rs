@@ -8,8 +8,8 @@
 //! acceleration levels), any input size, no dictionary, no checksum — the
 //! `ZSTD_compress` defaults. [`compress_with_dict`] additionally primes the
 //! match finder from a raw dictionary (`ZSTD_compress_usingDict`, extDict
-//! path), currently limited to the fast, dfast, greedy/lazy/lazy2, and btlazy2
-//! strategies. This includes the configurations where C
+//! path), for raw dictionaries at every strategy (fast through btultra2). This
+//! includes the configurations where C
 //! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
 //! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
 //! bit-exact. All nine strategies are implemented: fast and
@@ -2701,12 +2701,11 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 /// libzstd 1.5.7 for the supported scope; unsupported configurations return
 /// [`Error::Encode`] rather than diverging.
 ///
-/// Current scope (raw / content-only dictionaries, every strategy up to and
-/// including **btlazy2**): the dict-aware cParams must resolve to fast, dfast,
-/// greedy, lazy, lazy2, or btlazy2 — true for all but the highest levels at
-/// typical sizes. A trained (`ZDICT`) dictionary, or any level/size whose
-/// cParams select an optimal-parser strategy (btopt / btultra / btultra2),
-/// returns a clean `Error::Encode`. An empty `dict` is equivalent to
+/// Current scope: raw / content-only dictionaries at **every strategy** (fast
+/// through btultra2). A trained (`ZDICT`) dictionary returns a clean
+/// `Error::Encode` (its entropy/rep seeding is not ported), as does the rare
+/// large-input configuration where C would enable long-distance matching with a
+/// dictionary (`windowLog >= 27` at btopt+). An empty `dict` is equivalent to
 /// [`compress`]; a dict shorter than 8 bytes is ignored (as in C), though it
 /// still influences the derived parameters.
 pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
@@ -2726,19 +2725,9 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     // cParams use the dictionary size, exactly as `ZSTD_compress_usingDict` ->
     // `ZSTD_getParams_internal(level, srcSize, dictSize, cpm_noAttachDict)`.
     let cparams = get_cparams(level, src.len() as u64, dict.len() as u64);
-    if !matches!(
-        cparams.strategy,
-        Strategy::Fast
-            | Strategy::Dfast
-            | Strategy::Greedy
-            | Strategy::Lazy
-            | Strategy::Lazy2
-            | Strategy::Btlazy2
-    ) {
-        return Err(Error::Encode(
-            "dictionary compression currently supports the fast, dfast, greedy, lazy, and btlazy2 strategies",
-        ));
-    }
+    // All nine strategies are supported for raw dictionaries; the only rejected
+    // configurations are trained (ZDICT) dicts (above) and long-distance
+    // matching with a dict (below, once the extDict path is set up).
 
     let pledged = Some(src.len() as u64);
     let mut fc = FrameCompressor::from_cparams(cparams, pledged, false);
@@ -2750,6 +2739,17 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
         let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
         fc.compress_end(&mut out, src, 0, src.len())?;
         return Ok(out);
+    }
+
+    // C's `ZSTD_loadDictionaryContent` also seeds the dictionary into the LDM
+    // tables (`ZSTD_ldm_fillHashTable`); that path isn't ported, so reject the
+    // (large-input, btopt+) configurations where `ZSTD_resolveEnableLdm` turns
+    // long-distance matching on rather than diverge. Unreachable at typical
+    // sizes — LDM needs `windowLog >= 27`.
+    if fc.ldm.is_some() {
+        return Err(Error::Encode(
+            "long-distance matching with a dictionary is not supported yet",
+        ));
     }
 
     // `ZSTD_loadDictionaryContent` followed by the non-contiguous `src` append:
@@ -2769,9 +2769,7 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
             Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, dict_len),
             Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, dict_len),
             Matcher::Lazy(ctx) => ctx.load_dictionary(&data, dict_len),
-            // Unreachable: the gate admits only fast, dfast, and the
-            // greedy/lazy/lazy2/btlazy2 family (all Matcher::Lazy); never opt.
-            _ => {}
+            Matcher::Opt(ctx) => ctx.load_dictionary(&data, dict_len),
         }
     }
     fc.window = Window::preloaded_ext_dict(dict_len, src_len);

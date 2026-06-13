@@ -189,6 +189,24 @@ impl OptCtx {
         self.next_to_update = self.next_to_update.saturating_sub(correction as usize);
     }
 
+    /// `ZSTD_loadDictionaryContent`'s bt* branch for the optimal parser: seed
+    /// the binary tree from the raw dictionary `data[0..dict_len]`. The dict is
+    /// loaded as the current segment (noDict), so the window fields a fresh
+    /// `OptCtx` left at `WINDOW_START_INDEX` are already the right state, and
+    /// `update_tree`'s `window_low` resolves to `lowLimit` (the C `isDictionary`
+    /// case). C fills a FULLY SORTED tree via `ZSTD_updateTree(ms, dictEnd -
+    /// HASH_READ_SIZE, dictEnd)` (`ZSTD_insertBt1`, `ZSTD_noDict`) — the same
+    /// fill btlazy2 uses; the 3-byte hash table is NOT seeded (`insertBt1` never
+    /// touches it). `nextToUpdate` then jumps to `dictEnd`. The caller guarantees
+    /// `dict_len > HASH_READ_SIZE` and a fresh context.
+    pub(crate) fn load_dictionary(&mut self, data: &[u8], dict_len: usize) {
+        const HASH_READ_SIZE: usize = 8;
+        let fill_target = WINDOW_START_INDEX + dict_len - HASH_READ_SIZE;
+        let iend = WINDOW_START_INDEX + dict_len;
+        update_tree(self, data, fill_target, iend, false);
+        self.next_to_update = WINDOW_START_INDEX + dict_len;
+    }
+
     pub(crate) fn new(cparams: &CParams) -> Self {
         let mls = cparams.min_match.clamp(3, 6);
         let hash_log3 = if mls == 3 {

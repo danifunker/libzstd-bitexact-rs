@@ -3663,10 +3663,10 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
 /// context either **attaches** the CDict (small inputs ≤ the strategy cutoff) or
 /// **copies** its de-tagged tables (larger inputs).
 ///
-/// Current scope: the fast, dfast, greedy, lazy and lazy2 strategies, both raw
-/// and trained dictionaries, on both the attach and copy sides of the cutoff;
-/// other strategies (and tiny dictionaries) return a clean [`Error::Encode`]
-/// until their sub-commits land.
+/// Current scope: the fast, dfast, greedy, lazy, lazy2 and btlazy2 strategies,
+/// both raw and trained dictionaries, on both the attach and copy sides of the
+/// cutoff; the btopt family (and tiny dictionaries) return a clean
+/// [`Error::Encode`] until their sub-commits land.
 pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
@@ -3676,10 +3676,15 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
     if !matches!(
         cdict_cparams.strategy,
-        Strategy::Fast | Strategy::Dfast | Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+        Strategy::Fast
+            | Strategy::Dfast
+            | Strategy::Greedy
+            | Strategy::Lazy
+            | Strategy::Lazy2
+            | Strategy::Btlazy2
     ) {
         return Err(Error::Encode(
-            "CDict (Path B) currently supports only the fast, dfast, greedy, lazy and lazy2 strategies",
+            "CDict (Path B) currently supports only the fast..btlazy2 strategies",
         ));
     }
 
@@ -3712,10 +3717,10 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     }
 
     // `ZSTD_shouldAttachDict`: attach iff srcSize <= the strategy cutoff (fast =
-    // 8 KB, dfast = 16 KB, greedy/lazy/lazy2 = 32 KB), otherwise copy the dict's
-    // tables into the context (`attachDictSizeCutoffs`).
+    // 8 KB, dfast = 16 KB, greedy/lazy/lazy2/btlazy2 = 32 KB), otherwise copy the
+    // dict's tables into the context (`attachDictSizeCutoffs`).
     let cutoff = match cdict_cparams.strategy {
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => 32 * 1024,
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => 32 * 1024,
         Strategy::Dfast => 16 * 1024,
         _ => 8 * 1024,
     };
@@ -3738,12 +3743,13 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         // Build the CDict's own table(s) over the content.
         let mls = cdict_cparams.min_match.clamp(4, 7);
         fc.dict_match_state = Some(match cdict_cparams.strategy {
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
                 // The CDict's own lazy match state (its params, salt 0), filled
                 // over the content; consulted read-only by the dictMatchState
                 // search. The working context (built above) keeps its own empty
-                // tables, but its row/chain backend must match the CDict's
-                // (`ZSTD_resetCCtx_byAttachingCDict` overrides useRowMatchFinder).
+                // tables, but its backend (hash chain / row / binary tree) must
+                // match the CDict's — `ZSTD_resetCCtx_byAttachingCDict` overrides
+                // useRowMatchFinder; btlazy2 is always the binary tree.
                 let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
                 let mut dms =
                     crate::lazy::LazyCtx::with_row_match_finder(&cdict_cparams, cdict_uses_row);
@@ -3805,10 +3811,10 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         working.window_log = get_cparams(level, src_size, dict.len() as u64).window_log;
         let mut fc = FrameCompressor::from_cparams(working, pledged, false);
         match cdict_cparams.strategy {
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
-                // Lazy tables aren't tagged (`ZSTD_CDictIndicesAreTagged` is
-                // fast/dfast only), so the copied CDict tables equal a plain Path A
-                // (`load_dictionary`) fill — same params, the CDict's row/chain
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
+                // Lazy/btlazy2 tables aren't tagged (`ZSTD_CDictIndicesAreTagged`
+                // is fast/dfast only), so the copied CDict tables equal a plain
+                // Path A (`load_dictionary`) fill — same params, the CDict's
                 // backend, and the CDict's salt (0, copied for the row finder).
                 let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
                 let mut ctx = crate::lazy::LazyCtx::with_row_match_finder(&working, cdict_uses_row);

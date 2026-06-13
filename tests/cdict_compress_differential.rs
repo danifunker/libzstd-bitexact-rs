@@ -5,13 +5,14 @@
 //! which produces **different bytes** than `ZSTD_compress_usingDict` (Path A,
 //! [`compress_with_dict`]).
 //!
-//! Sub-commits 1-3 implement the **fast**, **dfast**, **greedy**, **lazy** and
-//! **lazy2** strategies. This test targets the levels whose CDict uses an
-//! implemented strategy and spans payload sizes on both sides of the attach/copy
-//! cutoff, so both the **attach** (small `src`, dictMatchState matcher) and
-//! **copy** (large `src`, de-tagged/reproduced tables) paths are exercised —
-//! including the lazy family's two backends (hash chain when the CDict windowLog
-//! ≤ 14, the row finder above it) — plus a round-trip through our own decoder.
+//! Sub-commits 1-4 implement the **fast**, **dfast**, **greedy**, **lazy**,
+//! **lazy2** and **btlazy2** strategies. This test targets the levels whose CDict
+//! uses an implemented strategy and spans payload sizes on both sides of the
+//! attach/copy cutoff, so both the **attach** (small `src`, dictMatchState
+//! matcher) and **copy** (large `src`, de-tagged/reproduced tables) paths are
+//! exercised — including the lazy family's two backends (hash chain when the
+//! CDict windowLog ≤ 14, the row finder above it) and btlazy2's binary tree —
+//! plus a round-trip through our own decoder.
 
 use libzstd_bitexact::{
     DecodeOptions, Dictionary, compress_with_cdict, cparams_create_cdict_for_testing,
@@ -123,6 +124,7 @@ const DFAST: u32 = 2;
 const GREEDY: u32 = 3;
 const LAZY: u32 = 4;
 const LAZY2: u32 = 5;
+const BTLAZY2: u32 = 6;
 
 /// The levels whose CDict (for this dict size) uses an implemented strategy.
 fn supported_levels(dict_len: usize) -> Vec<i32> {
@@ -130,7 +132,7 @@ fn supported_levels(dict_len: usize) -> Vec<i32> {
         .filter(|&l| {
             matches!(
                 cparams_create_cdict_for_testing(l, dict_len as u64)[6],
-                FAST | DFAST | GREEDY | LAZY | LAZY2
+                FAST | DFAST | GREEDY | LAZY | LAZY2 | BTLAZY2
             )
         })
         .collect()
@@ -143,10 +145,12 @@ fn cdict_uses_row(level: i32, dict_len: usize) -> bool {
     matches!(cp[6], GREEDY | LAZY | LAZY2) && cp[0] > 14
 }
 
-/// Backend coverage observed for the lazy family: (row, chain) match-finder hits.
+/// Backend coverage observed for the lazy family: row / hash-chain match-finder
+/// hits (greedy/lazy/lazy2) and binary-tree hits (btlazy2).
 struct LazyCoverage {
     row: u64,
     chain: u64,
+    bt: u64,
 }
 
 fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
@@ -163,6 +167,7 @@ fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
     let mut copy = 0u64;
     let mut lazy_row = 0u64;
     let mut lazy_chain = 0u64;
+    let mut bt = 0u64;
     for data in payloads() {
         for &level in &levels {
             let ours = compress_with_cdict(&data, dict_bytes, level).unwrap_or_else(|e| {
@@ -194,9 +199,9 @@ fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
             let strat = cparams_create_cdict_for_testing(level, dict_bytes.len() as u64)[6];
             by_strategy[strat as usize] += 1;
             // The strategy-specific attach/copy cutoff (fast 8K, dfast 16K,
-            // greedy/lazy/lazy2 32K) decides which reset path ran.
+            // greedy/lazy/lazy2/btlazy2 32K) decides which reset path ran.
             let cutoff = match strat {
-                GREEDY | LAZY | LAZY2 => 32 * 1024,
+                GREEDY | LAZY | LAZY2 | BTLAZY2 => 32 * 1024,
                 DFAST => 16 * 1024,
                 _ => 8 * 1024,
             };
@@ -212,6 +217,9 @@ fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
                     lazy_chain += 1;
                 }
             }
+            if strat == BTLAZY2 {
+                bt += 1;
+            }
         }
     }
     assert!(
@@ -225,21 +233,27 @@ fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
         "must exercise the lazy family (greedy/lazy/lazy2)"
     );
     println!(
-        "dict {} bytes: strategies {:?}, attach {attach}, copy {copy}, lazy_row {lazy_row}, lazy_chain {lazy_chain}",
+        "dict {} bytes: strategies {:?}, attach {attach}, copy {copy}, lazy_row {lazy_row}, lazy_chain {lazy_chain}, bt {bt}",
         dict_bytes.len(),
-        &by_strategy[1..=5],
+        &by_strategy[1..=6],
     );
     LazyCoverage {
         row: lazy_row,
         chain: lazy_chain,
+        bt,
     }
 }
 
 #[test]
 fn fast_cdict_raw_is_bit_exact_and_round_trips() {
-    // The 8 KB dict keeps the lazy family on the hash-chain backend.
+    // The 8 KB dict keeps the lazy family on the hash-chain backend, and also
+    // exercises btlazy2's binary-tree dictMatchState arm (attach + copy).
     let cov = check_dict(&raw_dict_content());
     assert!(cov.chain > 0, "8 KB dict should hit the hash-chain backend");
+    assert!(
+        cov.bt > 0,
+        "8 KB dict should exercise btlazy2 (binary tree)"
+    );
 }
 
 #[test]

@@ -996,6 +996,7 @@ fn insert_dubt1(
 /// *and* writes `off_base` (the gain rule compares against the incoming
 /// sentinel). The extDict candidate compares resolve their segment by
 /// `matchIndex + matchLength >= dictLimit` exactly as [`insert_dubt1`] does.
+#[allow(clippy::too_many_arguments)]
 fn dubt_find_best_match(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -1004,6 +1005,7 @@ fn dubt_find_best_match(
     off_base: &mut u64,
     win: &Window,
     ext_dict: bool,
+    dms: Option<&AttachedDict>,
 ) -> usize {
     let seg_bias = win.seg_bias as usize;
     let dict_bias = win.dict_bias as usize;
@@ -1122,7 +1124,12 @@ fn dubt_find_best_match(
                     *off_base = (curr - match_index) as u64 + 3; // OFFSET_TO_OFFBASE
                 }
                 if ip + match_length == iend {
-                    break; // equal: drop to guarantee consistency
+                    // equal: drop to guarantee consistency. In dictMatchState
+                    // mode also skip the dict search (C sets nbCompares = 0).
+                    if dms.is_some() {
+                        nb_compares = 0;
+                    }
+                    break;
                 }
             }
 
@@ -1159,13 +1166,83 @@ fn dubt_find_best_match(
             ctx.chain_table[l] = 0;
         }
 
+        // `ZSTD_DUBT_findBetterDictMatch`: descend the attached CDict's own
+        // (fully sorted) binary tree with the compares left after the working
+        // tree. Concat buffer ⇒ dictIndexDelta == 0, so a dict index is a
+        // working index directly. Read-only on the dms tree.
+        if nb_compares > 0 {
+            if let Some(att) = dms {
+                let d = att.ms;
+                let dict_high_limit = (WINDOW_START_INDEX + att.content_len) as u32; // dmsSize
+                let dict_low_limit = WINDOW_START_INDEX as u32; // dms.window.lowLimit
+                let dms_bt_mask = (1u32 << (d.chain_log - 1)) - 1;
+                let dms_bt_low = if dms_bt_mask >= dict_high_limit - dict_low_limit {
+                    dict_low_limit
+                } else {
+                    dict_high_limit - dms_bt_mask
+                };
+                let dict_end_pos = att.content_len; // dictEnd position
+                let prefix_start_pos = att.content_len; // prefixStart (= src start)
+                let dms_h = hash_ptr(data, to_pos(ip), d.hash_log, ctx.mls);
+                let mut dict_match_index = d.hash_table[dms_h];
+                let mut common_smaller = 0usize;
+                let mut common_larger = 0usize;
+                while nb_compares > 0 && dict_match_index > dict_low_limit {
+                    let next = 2 * (dict_match_index & dms_bt_mask) as usize;
+                    let mut match_length = common_smaller.min(common_larger);
+                    // dictBase + dictMatchIndex; the post-seam rebase to
+                    // base + idx + dictIndexDelta is a no-op here (delta 0).
+                    let m_pos = dict_match_index as usize - WINDOW_START_INDEX;
+                    match_length += count_2segments(
+                        data,
+                        to_pos(ip) + match_length,
+                        m_pos + match_length,
+                        to_pos(iend),
+                        dict_end_pos,
+                        prefix_start_pos,
+                    );
+                    if match_length > best_length {
+                        // matchIndex == dictMatchIndex (dictIndexDelta 0). Note the
+                        // gain rule uses highbit32(offBase + 1) here, unlike the
+                        // working descent's highbit32(offBase).
+                        if 4 * (match_length as i32 - best_length as i32)
+                            > highbit32(curr - dict_match_index + 1) as i32
+                                - highbit32(*off_base as u32 + 1) as i32
+                        {
+                            best_length = match_length;
+                            *off_base = (curr - dict_match_index) as u64 + 3;
+                        }
+                        if ip + match_length == iend {
+                            break;
+                        }
+                    }
+                    if data[m_pos + match_length] < data[to_pos(ip) + match_length] {
+                        if dict_match_index <= dms_bt_low {
+                            break;
+                        }
+                        common_smaller = match_length;
+                        dict_match_index = d.chain_table[next + 1];
+                    } else {
+                        if dict_match_index <= dms_bt_low {
+                            break;
+                        }
+                        common_larger = match_length;
+                        dict_match_index = d.chain_table[next];
+                    }
+                    nb_compares -= 1;
+                }
+            }
+        }
+
         // Skip repetitive patterns on the next update.
         ctx.next_to_update = (match_end_idx - 8) as usize;
         best_length
     }
 }
 
-/// `ZSTD_BtFindBestMatch`.
+/// `ZSTD_BtFindBestMatch`. The skipped-area early return precedes the dict
+/// search too (C returns before `ZSTD_DUBT_findBestMatch`).
+#[allow(clippy::too_many_arguments)]
 fn bt_find_best_match(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -1174,18 +1251,18 @@ fn bt_find_best_match(
     off_base: &mut u64,
     win: &Window,
     ext_dict: bool,
+    dms: Option<&AttachedDict>,
 ) -> usize {
     if ip < ctx.next_to_update {
         return 0; // skipped area
     }
     update_dubt(ctx, data, ip, win.seg_bias as usize);
-    dubt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
+    dubt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict, dms)
 }
 
-/// `ZSTD_searchMax`. `dms` (`ms->dictMatchState`) is consulted only by the
-/// hash-chain and row finders (the dictMatchState dispatch is greedy/lazy/lazy2);
-/// the binary tree's dictMatchState arm is a separate increment, so it is never
-/// reached with `dms.is_some()`.
+/// `ZSTD_searchMax`. `dms` (`ms->dictMatchState`) is consulted by all three
+/// backends — the hash-chain and row finders (greedy/lazy/lazy2) and the binary
+/// tree (btlazy2) — each in its own `ZSTD_*FindBestMatch` dictMatchState arm.
 #[allow(clippy::too_many_arguments)]
 fn search_max(
     ctx: &mut LazyCtx,
@@ -1205,7 +1282,7 @@ fn search_max(
             row_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict, dms)
         }
         SearchMethod::BinaryTree => {
-            bt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
+            bt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict, dms)
         }
     }
 }

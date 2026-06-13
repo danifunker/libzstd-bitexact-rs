@@ -31,6 +31,16 @@ pub(crate) struct HuffmanTable {
 ///
 /// Returns the table and the number of bytes consumed from `src`.
 pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
+    let (weights, table_log, consumed) = read_weights(src)?;
+    Ok((build(&weights, table_log)?, consumed))
+}
+
+/// Read the Huffman weight array of a table description (`HUF_readStats`),
+/// shared by the decode-table builder [`read_table`] and the encoder-side
+/// CTable reader (`crate::huffman_encode::read_ctable`). Returns the per-symbol
+/// weights *including* the implicit final weight (so the length is `nbSymbols`),
+/// the table log, and the number of input bytes consumed.
+pub(crate) fn read_weights(src: &[u8]) -> Result<(Vec<u8>, u32, usize), Error> {
     let header = *src
         .first()
         .ok_or(Error::Corrupted("missing huffman header"))?;
@@ -92,7 +102,7 @@ pub(crate) fn read_table(src: &[u8]) -> Result<(HuffmanTable, usize), Error> {
         return Err(Error::Corrupted("too many huffman symbols"));
     }
 
-    Ok((build(&weights, table_log)?, consumed))
+    Ok((weights, table_log, consumed))
 }
 
 /// Build the single-symbol decode table (`HUF_readDTableX1`): symbols are

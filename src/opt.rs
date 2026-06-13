@@ -18,7 +18,8 @@
 
 use crate::block::{LL_BITS, ML_BITS};
 use crate::compress::{CParams, Strategy, Window, count_2segments, count_eq, hash_ptr, read32};
-use crate::sequences_encode::{SeqStore, ll_code, ml_code};
+use crate::huffman_encode::HufRepeat;
+use crate::sequences_encode::{FseEntropyState, SeqStore, ll_code, ml_code};
 
 const WINDOW_START_INDEX: usize = 2;
 const ZSTD_OPT_NUM: usize = 1 << 12;
@@ -302,46 +303,91 @@ fn scale_stats(table: &mut [u32], log_target: u32) -> u32 {
     downscale_stats(table, highbit32(factor), true)
 }
 
-/// `ZSTD_rescaleFreqs` (no-dictionary paths).
-fn rescale_freqs(ctx: &mut OptCtx, block: &[u8]) {
+/// `ZSTD_rescaleFreqs`. `symbol_costs` is the first block's `prevCBlock`
+/// entropy (`optPtr->symbolCosts`); when its Huffman table came from a
+/// dictionary (`HUF_repeat_valid`) the first-block statistics are derived from
+/// those tables instead of the raw histogram + base frequencies.
+fn rescale_freqs(ctx: &mut OptCtx, block: &[u8], symbol_costs: Option<&FseEntropyState>) {
     ctx.price_predef = false;
     if ctx.ll_sum == 0 {
         // First block: init.
         if block.len() <= ZSTD_PREDEF_THRESHOLD {
             ctx.price_predef = true;
         }
-        // (No dictionary: the huf-repeat seeding branch is unreachable here —
-        // a fresh frame starts with repeatMode none.)
-        let mut lit_hist = [0u32; MAX_LIT + 1];
-        for &b in block {
-            lit_hist[b as usize] += 1;
+
+        // A dictionary whose literals Huffman table spans the full value set is
+        // presumed to carry representative statistics: derive the cost model
+        // from the seeded tables (and force dynamic pricing).
+        let dict_costs =
+            symbol_costs.filter(|sc| sc.huf.repeat == HufRepeat::Valid && sc.huf.table.is_some());
+        if let Some(sc) = dict_costs {
+            ctx.price_predef = false;
+            // Literals: `1 << (11 - nbBits)`, scaled to 2K (`HUF_getNbBitsFromCTable`).
+            let huf = sc.huf.table.as_ref().unwrap();
+            ctx.lit_sum = 0;
+            for lit in 0..=MAX_LIT {
+                let bit_cost = huf.nb_bits_of(lit as u32);
+                ctx.lit_freq[lit] = if bit_cost != 0 {
+                    1u32 << (11 - bit_cost)
+                } else {
+                    1
+                };
+                ctx.lit_sum += ctx.lit_freq[lit];
+            }
+            // The three sequence components: `1 << (10 - maxNbBits)`, scaled to
+            // 1K (`FSE_getMaxNbBits`); a zero cost (symbol absent / past the
+            // table) keeps the minimum frequency of 1.
+            let seed_fse =
+                |freq: &mut [u32], ct: &crate::fse_encode::FseCTable, max: usize| -> u32 {
+                    let mut sum = 0u32;
+                    for (s, slot) in freq.iter_mut().enumerate().take(max + 1) {
+                        let bit_cost = ct.max_nb_bits(s as u32);
+                        *slot = if bit_cost != 0 {
+                            1u32 << (10 - bit_cost)
+                        } else {
+                            1
+                        };
+                        sum += *slot;
+                    }
+                    sum
+                };
+            ctx.ll_sum = seed_fse(&mut ctx.ll_freq, sc.ll.as_ref().unwrap(), MAX_LL);
+            ctx.ml_sum = seed_fse(&mut ctx.ml_freq, sc.ml.as_ref().unwrap(), MAX_ML);
+            ctx.of_sum = seed_fse(&mut ctx.of_freq, sc.of.as_ref().unwrap(), MAX_OFF);
+        } else {
+            // First block, no dictionary: literals from the raw histogram, the
+            // sequence components from C's base frequency tables.
+            let mut lit_hist = [0u32; MAX_LIT + 1];
+            for &b in block {
+                lit_hist[b as usize] += 1;
+            }
+            ctx.lit_freq.copy_from_slice(&lit_hist);
+            ctx.lit_sum = downscale_stats(&mut ctx.lit_freq, 8, false);
+
+            #[rustfmt::skip]
+            const BASE_LL_FREQS: [u32; MAX_LL + 1] = [
+                4, 2, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1,
+            ];
+            ctx.ll_freq.copy_from_slice(&BASE_LL_FREQS);
+            ctx.ll_sum = BASE_LL_FREQS.iter().sum();
+
+            ctx.ml_freq.fill(1);
+            ctx.ml_sum = (MAX_ML + 1) as u32;
+
+            #[rustfmt::skip]
+            const BASE_OF_FREQS: [u32; MAX_OFF + 1] = [
+                6, 2, 1, 1, 2, 3, 4, 4,
+                4, 3, 2, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1,
+            ];
+            ctx.of_freq.copy_from_slice(&BASE_OF_FREQS);
+            ctx.of_sum = BASE_OF_FREQS.iter().sum();
         }
-        ctx.lit_freq.copy_from_slice(&lit_hist);
-        ctx.lit_sum = downscale_stats(&mut ctx.lit_freq, 8, false);
-
-        #[rustfmt::skip]
-        const BASE_LL_FREQS: [u32; MAX_LL + 1] = [
-            4, 2, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1,
-        ];
-        ctx.ll_freq.copy_from_slice(&BASE_LL_FREQS);
-        ctx.ll_sum = BASE_LL_FREQS.iter().sum();
-
-        ctx.ml_freq.fill(1);
-        ctx.ml_sum = (MAX_ML + 1) as u32;
-
-        #[rustfmt::skip]
-        const BASE_OF_FREQS: [u32; MAX_OFF + 1] = [
-            6, 2, 1, 1, 2, 3, 4, 4,
-            4, 3, 2, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1, 1, 1, 1,
-        ];
-        ctx.of_freq.copy_from_slice(&BASE_OF_FREQS);
-        ctx.of_sum = BASE_OF_FREQS.iter().sum();
     } else {
         // New block: scale down accumulated statistics.
         ctx.lit_sum = scale_stats(&mut ctx.lit_freq, 12);
@@ -976,6 +1022,7 @@ pub(crate) fn compress_block_opt(
     win: &mut Window,
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
+    symbol_costs: Option<&FseEntropyState>,
 ) -> usize {
     // Snapshot the window geometry (the C code reads `ms->window` directly).
     ctx.base_bias = win.seg_bias as usize;
@@ -1010,6 +1057,7 @@ pub(crate) fn compress_block_opt(
             block_end,
             false,
             ldm_seqs,
+            symbol_costs,
         );
         win.slide_for_init_stats(src_size);
         ctx.base_bias = win.seg_bias as usize;
@@ -1026,6 +1074,7 @@ pub(crate) fn compress_block_opt(
         block_end,
         ext_dict,
         ldm_seqs,
+        symbol_costs,
     )
 }
 
@@ -1042,6 +1091,7 @@ fn compress_block_opt_generic(
     block_end: usize,
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
+    symbol_costs: Option<&FseEntropyState>,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
@@ -1071,7 +1121,7 @@ fn compress_block_opt_generic(
     };
     opt_ldm.get_next_match(0, src_size as u32);
 
-    rescale_freqs(ctx, &data[to_pos(istart)..to_pos(iend)]);
+    rescale_freqs(ctx, &data[to_pos(istart)..to_pos(iend)], symbol_costs);
     let _ = src_size;
     ip += (ip == prefix_start) as usize;
 

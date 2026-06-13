@@ -96,7 +96,9 @@ fn strat_and_wlog(level: i32, src_len: usize, dict_len: usize) -> (u32, u32) {
     (cp[6], cp[0])
 }
 
-/// C oracle: `ZSTD_compress_usingDict` (the extDict path) at `level`.
+/// C oracle: `ZSTD_compress_usingDict` (the extDict path) at `level`. Works for
+/// both raw and trained dictionaries — C auto-detects the `ZDICT` magic and
+/// seeds the entropy tables accordingly.
 fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
     use zstd::zstd_safe;
     let mut dst = Vec::with_capacity(zstd_safe::compress_bound(src.len()));
@@ -104,6 +106,52 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
     cctx.compress_using_dict(&mut dst, src, dict, level)
         .expect("C oracle ZSTD_compress_usingDict failed");
     dst
+}
+
+/// Build a real trained (`ZDICT`) dictionary from word-salad samples via the
+/// bundled C dictionary trainer. Unlike a raw-content dictionary, the result
+/// carries `ZSTD_MAGIC_DICTIONARY`, a nonzero dictionary ID, and precomputed
+/// entropy tables — so it exercises the `ZSTD_loadCEntropy` seeding path
+/// (Huffman + 3 FSE CTables + repeat offsets + dict ID), not just the matcher
+/// fill. Training is `unsafe` raw FFI, which is fine in a test.
+fn trained_dict() -> Vec<u8> {
+    let mut rng = Rng::new(0x7A1A_ED01);
+    // A few thousand small samples from the same vocabulary as the payloads, so
+    // the trainer finds repeated content worth storing.
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for _ in 0..4000 {
+        let start = samples.len();
+        let target = 24 + rng.below(128);
+        while samples.len() - start < target {
+            samples.extend_from_slice(WORDS[rng.below(WORDS.len())]);
+            samples.push(b' ');
+        }
+        sizes.push(samples.len() - start);
+    }
+
+    let mut dict = vec![0u8; 16 * 1024];
+    let dict_size = unsafe {
+        zstd_sys::ZDICT_trainFromBuffer(
+            dict.as_mut_ptr() as *mut core::ffi::c_void,
+            dict.len(),
+            samples.as_ptr() as *const core::ffi::c_void,
+            sizes.as_ptr(),
+            sizes.len() as core::ffi::c_uint,
+        )
+    };
+    assert!(
+        unsafe { zstd_sys::ZDICT_isError(dict_size) } == 0,
+        "ZDICT_trainFromBuffer failed (code {dict_size})"
+    );
+    dict.truncate(dict_size);
+    // It really is a formatted dictionary: 0xEC30A437 little-endian.
+    assert_eq!(
+        &dict[..4],
+        &[0x37, 0xA4, 0x30, 0xEC],
+        "trained dict must start with the ZDICT magic"
+    );
+    dict
 }
 
 #[test]
@@ -215,19 +263,74 @@ fn empty_dict_matches_plain_compress() {
     }
 }
 
-/// A trained (ZDICT) dictionary is not supported yet and must be rejected
-/// cleanly (never a divergent or panicking path).
+/// A trained (`ZDICT`) dictionary must match C's `ZSTD_compress_usingDict`
+/// byte-for-byte across every strategy, and round-trip through our own decoder.
+/// This exercises the `ZSTD_loadCEntropy` seeding (Huffman + 3 FSE CTables +
+/// repeat offsets) and the `Dictionary_ID` in the frame header on top of the
+/// shared match-finder fill.
 #[test]
-fn trained_dictionary_is_rejected() {
-    // Minimal well-formed-enough header: the 4-byte ZSTD_MAGIC_DICTIONARY
-    // followed by padding to clear the >= 8 byte length check.
+fn trained_dict_all_strategies_are_bit_exact_and_round_trip() {
+    let dict = trained_dict();
+    // Levels -3,-1 and 1..=22 cover all nine strategies (a fixed dictionary size
+    // means each rSize bucket walks fast..btultra2 as the level rises).
+    let levels: Vec<i32> = [-3, -1].into_iter().chain(1..=22).collect();
+    let dict_obj = Dictionary::new(&dict).expect("trained dict parse");
+
+    let mut by_strategy = [0u64; 10];
+    for data in payloads() {
+        for &level in &levels {
+            let (strat, wlog) = strat_and_wlog(level, data.len(), dict.len());
+            let ours = compress_with_dict(&data, &dict, level).unwrap_or_else(|e| {
+                panic!(
+                    "compress_with_dict errored (strat={strat}, src={}, level={level}): {e}",
+                    data.len()
+                )
+            });
+            let theirs = oracle(&data, &dict, level);
+            assert_eq!(
+                ours,
+                theirs,
+                "byte mismatch vs C: strat={strat}, wlog={wlog}, src={}, level={level}",
+                data.len()
+            );
+            // Independently round-trip through our decoder with the same dict.
+            let decoded = DecodeOptions::new()
+                .dictionary(&dict_obj)
+                .decompress(&ours)
+                .unwrap_or_else(|e| {
+                    panic!("decode failed: src={}, level={level}: {e}", data.len())
+                });
+            assert_eq!(
+                decoded,
+                data,
+                "round-trip mismatch: src={}, level={level}",
+                data.len()
+            );
+            by_strategy[strat as usize] += 1;
+        }
+    }
+    for s in 1..=9u32 {
+        assert!(
+            by_strategy[s as usize] > 0,
+            "strategy {s} was never exercised (counts={by_strategy:?})"
+        );
+    }
+}
+
+/// A buffer that begins with the `ZDICT` magic but is otherwise malformed must
+/// be rejected cleanly (never a divergent or panicking path).
+#[test]
+fn malformed_trained_dict_is_rejected() {
+    // The 4-byte ZSTD_MAGIC_DICTIONARY followed by a dict ID and zero-filled
+    // padding: long enough to be treated as a trained dict, but the entropy
+    // tables cannot be parsed out of the zeros.
     let mut trained = vec![0x37, 0xA4, 0x30, 0xEC]; // 0xEC30A437 little-endian
     trained.extend_from_slice(&[0u8; 60]);
     for data in payloads() {
         let r = compress_with_dict(&data, &trained, 1);
         assert!(
             r.is_err(),
-            "trained dict must be rejected (src={})",
+            "malformed trained dict must be rejected (src={})",
             data.len()
         );
     }

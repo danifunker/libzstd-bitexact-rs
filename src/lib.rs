@@ -31,6 +31,7 @@ mod bits;
 mod block;
 mod compress;
 mod decompress;
+mod dict_encode;
 mod dictionary;
 mod error;
 mod frame;

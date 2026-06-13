@@ -2175,7 +2175,13 @@ pub(crate) fn is_rle(src: &[u8]) -> bool {
 /// `ZSTD_CONTENTSIZE_UNKNOWN`; per `ZSTD_resetCCtx_internal` an unknown
 /// pledged size clears the content-size flag, which both omits the FCS field
 /// and disables the single-segment format.
-fn write_frame_header(out: &mut Vec<u8>, cparams: &CParams, pledged: Option<u64>, checksum: bool) {
+fn write_frame_header(
+    out: &mut Vec<u8>,
+    cparams: &CParams,
+    pledged: Option<u64>,
+    checksum: bool,
+    dict_id: u32,
+) {
     let window_size = 1u64 << cparams.window_log;
     let content_size_flag = pledged.is_some();
     let pledged_src_size = pledged.unwrap_or(0);
@@ -2187,13 +2193,26 @@ fn write_frame_header(out: &mut Vec<u8>, cparams: &CParams, pledged: Option<u64>
     } else {
         0
     };
-    let descriptor =
-        (fcs_code << 6) as u8 | ((single_segment as u8) << 5) | ((checksum as u8) << 2);
+    // `ZSTD_writeFrameHeader`: the `Dictionary_ID` field is 0/1/2/4 bytes, and
+    // its size code occupies the low two bits of the descriptor. The default
+    // frame params keep `noDictIDFlag == 0`, so a nonzero dict ID is always
+    // written (a zero dict ID — no dict, or a raw-content dict — emits no field).
+    let did_size_code = (dict_id > 0) as u32 + (dict_id >= 256) as u32 + (dict_id >= 65536) as u32;
+    let descriptor = (fcs_code << 6) as u8
+        | ((single_segment as u8) << 5)
+        | ((checksum as u8) << 2)
+        | did_size_code as u8;
 
     out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
     out.push(descriptor);
     if !single_segment {
         out.push(((cparams.window_log - WINDOWLOG_ABSOLUTEMIN) << 3) as u8);
+    }
+    match did_size_code {
+        0 => {}
+        1 => out.push(dict_id as u8),
+        2 => out.extend_from_slice(&(dict_id as u16).to_le_bytes()),
+        _ => out.extend_from_slice(&dict_id.to_le_bytes()),
     }
     match fcs_code {
         0 => {
@@ -2260,6 +2279,11 @@ pub(crate) struct FrameCompressor {
     /// run `ZSTD_window_update` (which would recompute the wrong segment
     /// boundary for the concatenated `dict ++ src` buffer). One-shot only.
     window_preloaded: bool,
+    /// `cctx->dictID`: the `Dictionary_ID` written into the frame header. Zero
+    /// for no dictionary or a raw-content dictionary (no `Dictionary_ID` field);
+    /// nonzero only for a trained (`ZDICT`) dictionary loaded by
+    /// [`compress_with_dict`].
+    dict_id: u32,
 }
 
 impl FrameCompressor {
@@ -2314,6 +2338,7 @@ impl FrameCompressor {
             window: Window::new(),
             ldm: crate::ldm::LdmParams::auto(&cparams).map(crate::ldm::LdmState::new),
             window_preloaded: false,
+            dict_id: 0,
         }
     }
 
@@ -2342,7 +2367,13 @@ impl FrameCompressor {
     ) -> Result<(), Error> {
         let out_start = out.len();
         if self.stage == Stage::Init {
-            write_frame_header(out, &self.cparams, self.pledged, self.checksum);
+            write_frame_header(
+                out,
+                &self.cparams,
+                self.pledged,
+                self.checksum,
+                self.dict_id,
+            );
             self.stage = Stage::Ongoing;
         }
         if chunk_start == chunk_end {
@@ -2562,6 +2593,7 @@ impl FrameCompressor {
                             } else {
                                 None
                             },
+                            Some(&self.entropy),
                         )
                     }
                 };
@@ -2701,45 +2733,49 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 /// libzstd 1.5.7 for the supported scope; unsupported configurations return
 /// [`Error::Encode`] rather than diverging.
 ///
-/// Current scope: raw / content-only dictionaries at **every strategy** (fast
-/// through btultra2). A trained (`ZDICT`) dictionary returns a clean
-/// `Error::Encode` (its entropy/rep seeding is not ported), as does the rare
-/// large-input configuration where C would enable long-distance matching with a
-/// dictionary (`windowLog >= 27` at btopt+). An empty `dict` is equivalent to
-/// [`compress`]; a dict shorter than 8 bytes is ignored (as in C), though it
-/// still influences the derived parameters.
+/// Current scope: raw / content-only **and** trained (`ZDICT`) dictionaries at
+/// **every strategy** (fast through btultra2). A trained dictionary seeds the
+/// first block's entropy tables, repeat offsets, and the frame's
+/// `Dictionary_ID`, exactly as `ZSTD_loadCEntropy` does. The only rejected
+/// configuration is the rare large input where C would enable long-distance
+/// matching with a dictionary (`windowLog >= 27` at btopt+). An empty `dict` is
+/// equivalent to [`compress`]; a raw dict shorter than 8 bytes is ignored (as in
+/// C), though it still influences the derived parameters. A malformed trained
+/// dictionary yields [`Error::DictionaryCorrupted`].
 pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         // Match indices are 32-bit; larger histories need overflow correction.
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
     }
-    // `ZSTD_compress_insertDictionary`: a dictionary of >= 8 bytes that starts
-    // with the dictionary magic is a trained (ZDICT) dict, whose entropy/rep
-    // seeding is not ported yet. (A dict < 8 bytes is ignored entirely, below.)
-    if dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY {
-        return Err(Error::Encode(
-            "trained (ZDICT) dictionaries are not supported yet",
-        ));
-    }
 
-    // cParams use the dictionary size, exactly as `ZSTD_compress_usingDict` ->
+    // cParams use the *whole* dictionary size, exactly as
+    // `ZSTD_compress_usingDict` ->
     // `ZSTD_getParams_internal(level, srcSize, dictSize, cpm_noAttachDict)`.
     let cparams = get_cparams(level, src.len() as u64, dict.len() as u64);
-    // All nine strategies are supported for raw dictionaries; the only rejected
-    // configurations are trained (ZDICT) dicts (above) and long-distance
-    // matching with a dict (below, once the extDict path is set up).
-
     let pledged = Some(src.len() as u64);
     let mut fc = FrameCompressor::from_cparams(cparams, pledged, false);
 
-    // `ZSTD_compress_insertDictionary` ignores a dict shorter than 8 bytes
-    // entirely (the cParams above still reflect its size); compress `src` as a
-    // plain frame.
-    if dict.len() < 8 {
+    // Resolve the dictionary *content* — the bytes the match finder loads. For a
+    // trained (`ZDICT`) dictionary (`ZSTD_loadZstdDictionary`), parse the entropy
+    // section first and seed the first block's `prevCBlock` tables, repeat
+    // offsets, and the frame's dict ID; the content is everything after that
+    // header. For a raw-content dictionary the whole buffer is content.
+    let content: &[u8] = if dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY {
+        let seed = crate::dict_encode::load_c_entropy(dict)?;
+        fc.entropy = seed.entropy;
+        fc.rep = seed.rep;
+        fc.dict_id = seed.dict_id;
+        &dict[seed.entropy_size..]
+    } else if dict.len() < 8 {
+        // `ZSTD_compress_insertDictionary` ignores a (raw) dict shorter than 8
+        // bytes entirely — the cParams above still reflect its size; compress
+        // `src` as a plain frame.
         let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
         fc.compress_end(&mut out, src, 0, src.len())?;
         return Ok(out);
-    }
+    } else {
+        dict
+    };
 
     // C's `ZSTD_loadDictionaryContent` also seeds the dictionary into the LDM
     // tables (`ZSTD_ldm_fillHashTable`); that path isn't ported, so reject the
@@ -2753,35 +2789,36 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     }
 
     // `ZSTD_loadDictionaryContent` followed by the non-contiguous `src` append:
-    // lay the history out as one buffer `dict ++ src` and put the window
-    // directly in the post-flip extDict state.
-    let dict_len = dict.len();
+    // lay the history out as one buffer `content ++ src` and put the window
+    // directly in the post-flip extDict state. For a trained dict `content` is
+    // the post-entropy tail; for a raw dict it is the whole buffer.
+    let content_len = content.len();
     let src_len = src.len();
-    let mut data = Vec::with_capacity(dict_len + src_len);
-    data.extend_from_slice(dict);
+    let mut data = Vec::with_capacity(content_len + src_len);
+    data.extend_from_slice(content);
     data.extend_from_slice(src);
 
-    // Seed the strategy's dict table(s). Skipped when `dictSize <=
+    // Seed the strategy's dict table(s). Skipped when `dictContentSize <=
     // HASH_READ_SIZE`, where C's `ZSTD_loadDictionaryContent` returns before
     // filling — the extDict is still live, just with empty tables.
-    if dict_len > HASH_READ_SIZE {
+    if content_len > HASH_READ_SIZE {
         match &mut fc.matcher {
-            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, dict_len),
-            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, dict_len),
-            Matcher::Lazy(ctx) => ctx.load_dictionary(&data, dict_len),
-            Matcher::Opt(ctx) => ctx.load_dictionary(&data, dict_len),
+            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, content_len),
+            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, content_len),
+            Matcher::Lazy(ctx) => ctx.load_dictionary(&data, content_len),
+            Matcher::Opt(ctx) => ctx.load_dictionary(&data, content_len),
         }
     }
-    fc.window = Window::preloaded_ext_dict(dict_len, src_len);
+    fc.window = Window::preloaded_ext_dict(content_len, src_len);
     fc.window_preloaded = true;
     // The window-preloaded path skips compress_continue's non-contiguous reset
     // (`ms->nextToUpdate = window.dictLimit`); apply it here so the lazy/opt
     // matchers resume insertion at the start of `src` and never re-insert dict
     // positions. (For a filled dict, load_dictionary already left nextToUpdate
-    // at dictLimit; this is what covers the no-fill `dict_len == HASH_READ_SIZE`
-    // case, where leaving it at the dict start would fabricate dict matches that
-    // C — whose post-flip base makes those indices hash unrelated bytes — never
-    // finds. Fast/dfast don't track nextToUpdate.)
+    // at dictLimit; this is what covers the no-fill `content_len ==
+    // HASH_READ_SIZE` case, where leaving it at the dict start would fabricate
+    // dict matches that C — whose post-flip base makes those indices hash
+    // unrelated bytes — never finds. Fast/dfast don't track nextToUpdate.)
     match &mut fc.matcher {
         Matcher::Lazy(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
         Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
@@ -2789,7 +2826,7 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     }
 
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
-    fc.compress_end(&mut out, &data, dict_len, dict_len + src_len)?;
+    fc.compress_end(&mut out, &data, content_len, content_len + src_len)?;
     Ok(out)
 }
 

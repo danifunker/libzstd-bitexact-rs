@@ -410,6 +410,17 @@ impl FseCTable {
         self.symbol_tt.len() as u32 - 1
     }
 
+    /// `FSE_getMaxNbBits`: the (rounded-up) maximum bit cost of `symbol`, used to
+    /// seed the optimal parser's cost model from a dictionary's tables. A symbol
+    /// beyond the built range reads zeroed workspace in C (`deltaNbBits == 0`),
+    /// which yields 0; return the same so the seeding stays bit-exact.
+    pub(crate) fn max_nb_bits(&self, symbol: u32) -> u32 {
+        match self.symbol_tt.get(symbol as usize) {
+            Some(tt) => tt.delta_nb_bits.wrapping_add(0xFFFF) >> 16,
+            None => 0,
+        }
+    }
+
     /// `FSE_bitCost`: approximate cost of `symbol` in fixed-point bits with
     /// `accuracy_log` fractional bits.
     pub(crate) fn bit_cost(&self, symbol: u32, accuracy_log: u32) -> u32 {

@@ -68,6 +68,18 @@ pub(crate) struct HufCTable {
     code: [u16; HUF_SYMBOLVALUE_MAX + 1],
 }
 
+impl HufCTable {
+    /// `HUF_getNbBitsFromCTable`: the code length of `symbol`, or 0 when the
+    /// table does not cover it. Used to seed the optimal parser's literal cost
+    /// model from a dictionary's Huffman table.
+    pub(crate) fn nb_bits_of(&self, symbol: u32) -> u32 {
+        if symbol > self.max_symbol {
+            return 0;
+        }
+        u32::from(self.nb_bits[symbol as usize])
+    }
+}
+
 /// `HUF_repeat`: whether a previous block's table may be reused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum HufRepeat {
@@ -445,6 +457,61 @@ pub(crate) fn build_ctable(
         non_null_rank,
         max_symbol,
         max_nb_bits,
+    ))
+}
+
+/// `HUF_readCTable`: reconstruct a compression table from a serialized table
+/// description — the same weight encoding [`crate::huffman::read_table`] decodes
+/// into a decode table, rebuilt here into encoder form (per-symbol code length
+/// and canonical code). Used to seed a frame's literals table from a trained
+/// (`ZDICT`) dictionary (`ZSTD_loadCEntropy`). Returns the table, whether any
+/// symbol carries a zero weight (`hasZeroWeights`, which keeps a dictionary's
+/// table at `HUF_repeat_check` rather than promoting it to `valid`), and the
+/// number of input bytes consumed.
+pub(crate) fn read_ctable(src: &[u8]) -> Result<(HufCTable, bool, usize), Error> {
+    let (weights, table_log, consumed) = crate::huffman::read_weights(src)?;
+    let nb_symbols = weights.len();
+    let max_symbol = (nb_symbols - 1) as u32;
+    // `*hasZeroWeights = (rankVal[0] > 0)`: the implicit last weight is always
+    // >= 1, so this is exactly "some symbol has weight 0".
+    let has_zero_weights = weights.contains(&0);
+
+    // `nbBits[n] = (tableLog + 1 - w) & -(w != 0)`.
+    let mut nb_bits = [0u8; HUF_SYMBOLVALUE_MAX + 1];
+    for n in 0..nb_symbols {
+        let w = u32::from(weights[n]);
+        nb_bits[n] = if w == 0 { 0 } else { (table_log + 1 - w) as u8 };
+    }
+
+    // Canonical code value, assigned in symbol order within each code-length
+    // rank — the inverse of the decoder's weight-ordered table fill.
+    let mut nb_per_rank = [0u16; (HUF_TABLELOG_MAX + 2) as usize];
+    for n in 0..nb_symbols {
+        nb_per_rank[nb_bits[n] as usize] += 1;
+    }
+    let mut val_per_rank = [0u16; (HUF_TABLELOG_MAX + 2) as usize];
+    let mut min: u16 = 0;
+    for r in (1..=table_log as usize).rev() {
+        val_per_rank[r] = min;
+        min += nb_per_rank[r];
+        min >>= 1;
+    }
+    let mut code = [0u16; HUF_SYMBOLVALUE_MAX + 1];
+    for n in 0..nb_symbols {
+        let b = nb_bits[n] as usize;
+        code[n] = val_per_rank[b];
+        val_per_rank[b] += 1;
+    }
+
+    Ok((
+        HufCTable {
+            table_log,
+            max_symbol,
+            nb_bits,
+            code,
+        },
+        has_zero_weights,
+        consumed,
     ))
 }
 

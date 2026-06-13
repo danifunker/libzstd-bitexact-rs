@@ -228,10 +228,18 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
       megabytes later when a wrapped stream looked the entries up).
       All gated by per-strategy multi-wrap differential tests in
       `tests/stream_compress_differential.rs`.
-- [ ] Long-distance matching (LDM, `zstd_ldm.c`): C auto-enables it for
+- [~] Long-distance matching (LDM, `zstd_ldm.c`): C auto-enables it for
       `strategy >= btopt && windowLog >= 27` (`ZSTD_resolveEnableLdm`),
-      i.e. level 22 at unknown or > 64 MiB content sizes. Those
-      configurations currently return a clean error instead of diverging.
+      i.e. level 22 at unknown or > 64 MiB content sizes. **Ported and wired**
+      (`src/ldm.rs`: the gear-hash splitter, the XXH64-fingerprint bucket
+      table, `ZSTD_ldm_generateSequences`, and the optimal-parser candidate
+      plumbing `ZSTD_optLdm_*` in `src/opt.rs`) but **not yet bit-exact**: on
+      large inputs the matcher occasionally emits one extra raw-match
+      candidate that C does not (a fingerprint-table / gear-split divergence
+      still under investigation), perturbing the optimal parse. Until that is
+      fixed, those configurations return a clean error rather than diverge
+      (`FrameCompressor::compress_continue`'s `self.ldm.is_some()` gate);
+      removing the gate re-activates the wired LDM.
 - [ ] Index overflow correction (`ZSTD_window_correctOverflow`), lifting the
       3500 MiB total-input cap (one-shot inputs are capped at 4 GiB − 2 by
       32-bit match indices regardless).

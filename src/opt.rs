@@ -797,6 +797,141 @@ fn get_all_matches(
     )
 }
 
+// --- LDM candidate plumbing -------------------------------------------------------
+
+/// `ZSTD_optLdm_t`: a cursor over the block's LDM raw sequences. The C code
+/// copies the rawSeqStore *by value* into this struct, so every opt pass
+/// (including the btultra2 stats pass) walks its own cursor from the start.
+struct OptLdm<'a> {
+    seqs: &'a [crate::ldm::RawSeq],
+    pos: usize,
+    pos_in_sequence: usize,
+    start_pos_in_block: u32,
+    end_pos_in_block: u32,
+    offset: u32,
+}
+
+impl OptLdm<'_> {
+    /// `ZSTD_optLdm_skipRawSeqStoreBytes`.
+    fn skip_bytes(&mut self, nb_bytes: usize) {
+        let mut curr_pos = (self.pos_in_sequence + nb_bytes) as u32;
+        while curr_pos > 0 && self.pos < self.seqs.len() {
+            let curr_seq = self.seqs[self.pos];
+            if curr_pos >= curr_seq.lit_length + curr_seq.match_length {
+                curr_pos -= curr_seq.lit_length + curr_seq.match_length;
+                self.pos += 1;
+            } else {
+                self.pos_in_sequence = curr_pos as usize;
+                break;
+            }
+        }
+        if curr_pos == 0 || self.pos == self.seqs.len() {
+            self.pos_in_sequence = 0;
+        }
+    }
+
+    /// `ZSTD_opt_getNextMatchAndUpdateSeqStore`: compute the block-relative
+    /// span of the next LDM match and advance the cursor past it.
+    fn get_next_match(&mut self, curr_pos_in_block: u32, block_bytes_remaining: u32) {
+        // No more matches in this block: never offer an LDM candidate again.
+        if self.seqs.is_empty() || self.pos >= self.seqs.len() {
+            self.start_pos_in_block = u32::MAX;
+            self.end_pos_in_block = u32::MAX;
+            return;
+        }
+        let curr_seq = self.seqs[self.pos];
+        let curr_block_end_pos = curr_pos_in_block + block_bytes_remaining;
+        // `(posInSequence < litLength) ? litLength - posInSequence : 0`.
+        let literals_bytes_remaining = curr_seq
+            .lit_length
+            .saturating_sub(self.pos_in_sequence as u32);
+        let match_bytes_remaining = if literals_bytes_remaining == 0 {
+            curr_seq.match_length - (self.pos_in_sequence as u32 - curr_seq.lit_length)
+        } else {
+            curr_seq.match_length
+        };
+
+        // More literal bytes than bytes remaining in the block: no LDM here.
+        if literals_bytes_remaining >= block_bytes_remaining {
+            self.start_pos_in_block = u32::MAX;
+            self.end_pos_in_block = u32::MAX;
+            self.skip_bytes(block_bytes_remaining as usize);
+            return;
+        }
+
+        self.start_pos_in_block = curr_pos_in_block + literals_bytes_remaining;
+        self.end_pos_in_block = self.start_pos_in_block + match_bytes_remaining;
+        self.offset = curr_seq.offset;
+
+        if self.end_pos_in_block > curr_block_end_pos {
+            // Match ends after the block does: use only the part within it.
+            self.end_pos_in_block = curr_block_end_pos;
+            self.skip_bytes((curr_block_end_pos - curr_pos_in_block) as usize);
+        } else {
+            self.skip_bytes((literals_bytes_remaining + match_bytes_remaining) as usize);
+        }
+    }
+}
+
+/// `ZSTD_optLdm_maybeAddMatch`: append the LDM candidate to `ctx.matches` if
+/// it is longer than the current longest (preserving the length ordering).
+fn opt_ldm_maybe_add_match(
+    ctx: &mut OptCtx,
+    nb_matches: &mut usize,
+    opt_ldm: &OptLdm,
+    curr_pos_in_block: u32,
+    min_match: u32,
+) {
+    let pos_diff = curr_pos_in_block.wrapping_sub(opt_ldm.start_pos_in_block);
+    let candidate_match_length = opt_ldm
+        .end_pos_in_block
+        .wrapping_sub(opt_ldm.start_pos_in_block)
+        .wrapping_sub(pos_diff);
+
+    // The current block position must lie inside the match.
+    if curr_pos_in_block < opt_ldm.start_pos_in_block
+        || curr_pos_in_block >= opt_ldm.end_pos_in_block
+        || candidate_match_length < min_match
+    {
+        return;
+    }
+
+    if *nb_matches == 0
+        || (candidate_match_length > ctx.matches[*nb_matches - 1].len && *nb_matches < ZSTD_OPT_NUM)
+    {
+        ctx.matches[*nb_matches] = Match {
+            off: opt_ldm.offset + 3, // OFFSET_TO_OFFBASE
+            len: candidate_match_length,
+        };
+        *nb_matches += 1;
+    }
+}
+
+/// `ZSTD_optLdm_processMatchCandidate`.
+fn opt_ldm_process_match_candidate(
+    ctx: &mut OptCtx,
+    opt_ldm: &mut OptLdm,
+    nb_matches: &mut usize,
+    curr_pos_in_block: u32,
+    remaining_bytes: u32,
+    min_match: u32,
+) {
+    if opt_ldm.seqs.is_empty() || opt_ldm.pos >= opt_ldm.seqs.len() {
+        return;
+    }
+
+    if curr_pos_in_block >= opt_ldm.end_pos_in_block {
+        if curr_pos_in_block > opt_ldm.end_pos_in_block {
+            // Correct for "overshoots": this is not necessarily called at
+            // the exact end of the previous LDM match.
+            let pos_overshoot = curr_pos_in_block - opt_ldm.end_pos_in_block;
+            opt_ldm.skip_bytes(pos_overshoot as usize);
+        }
+        opt_ldm.get_next_match(curr_pos_in_block, remaining_bytes);
+    }
+    opt_ldm_maybe_add_match(ctx, nb_matches, opt_ldm, curr_pos_in_block, min_match);
+}
+
 // --- The optimal parser ---------------------------------------------------------
 
 /// `ZSTD_compressBlock_btultra2`'s first-block stats-seeding double pass.
@@ -810,6 +945,7 @@ pub(crate) fn compress_block_opt(
     block_end: usize,
     win: &mut Window,
     ext_dict: bool,
+    ldm_seqs: Option<&[crate::ldm::RawSeq]>,
 ) -> usize {
     // Snapshot the window geometry (the C code reads `ms->window` directly).
     ctx.base_bias = win.seg_bias as usize;
@@ -843,6 +979,7 @@ pub(crate) fn compress_block_opt(
             block_start,
             block_end,
             false,
+            ldm_seqs,
         );
         win.slide_for_init_stats(src_size);
         ctx.base_bias = win.seg_bias as usize;
@@ -850,12 +987,22 @@ pub(crate) fn compress_block_opt(
         ctx.low_limit = win.low_limit as usize;
         ctx.next_to_update = ctx.dict_limit;
     }
-    compress_block_opt_generic(ctx, store, rep, data, block_start, block_end, ext_dict)
+    compress_block_opt_generic(
+        ctx,
+        store,
+        rep,
+        data,
+        block_start,
+        block_end,
+        ext_dict,
+        ldm_seqs,
+    )
 }
 
 /// `ZSTD_compressBlock_opt_generic`. The driver itself is dictMode-agnostic
 /// (it only prices and emits within the current block); the dict mode lives
 /// in the match finder.
+#[allow(clippy::too_many_arguments)]
 fn compress_block_opt_generic(
     ctx: &mut OptCtx,
     store: &mut SeqStore,
@@ -864,6 +1011,7 @@ fn compress_block_opt_generic(
     block_start: usize,
     block_end: usize,
     ext_dict: bool,
+    ldm_seqs: Option<&[crate::ldm::RawSeq]>,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
@@ -880,6 +1028,19 @@ fn compress_block_opt_generic(
     let mut ip = istart;
     let mut anchor = istart;
 
+    // The LDM candidate cursor (a by-value copy of the raw store in C, so
+    // this pass owns its walk); primed before the prefix-start skip, i.e.
+    // at block position 0 with the whole block remaining.
+    let mut opt_ldm = OptLdm {
+        seqs: ldm_seqs.unwrap_or(&[]),
+        pos: 0,
+        pos_in_sequence: 0,
+        start_pos_in_block: 0,
+        end_pos_in_block: 0,
+        offset: 0,
+    };
+    opt_ldm.get_next_match(0, src_size as u32);
+
     rescale_freqs(ctx, &data[to_pos(istart)..to_pos(iend)]);
     let _ = src_size;
     ip += (ip == prefix_start) as usize;
@@ -893,7 +1054,7 @@ fn compress_block_opt_generic(
         let found = 'forward: {
             let litlen = (ip - anchor) as u32;
             let ll0 = litlen == 0;
-            let nb_matches = get_all_matches(
+            let mut nb_matches = get_all_matches(
                 ctx,
                 data,
                 &mut next_to_update3,
@@ -903,6 +1064,14 @@ fn compress_block_opt_generic(
                 ll0,
                 min_match,
                 ext_dict,
+            );
+            opt_ldm_process_match_candidate(
+                ctx,
+                &mut opt_ldm,
+                &mut nb_matches,
+                (ip - istart) as u32,
+                (iend - ip) as u32,
+                min_match,
             );
             if nb_matches == 0 {
                 ip += 1;
@@ -1035,7 +1204,7 @@ fn compress_block_opt_generic(
                     let ll0 = ctx.opt[cur as usize].litlen == 0;
                     let base_price = ctx.opt[cur as usize].price + ll_price(ctx, 0);
                     let opt_rep = ctx.opt[cur as usize].rep;
-                    let nb_matches = get_all_matches(
+                    let mut nb_matches = get_all_matches(
                         ctx,
                         data,
                         &mut next_to_update3,
@@ -1045,6 +1214,14 @@ fn compress_block_opt_generic(
                         ll0,
                         min_match,
                         ext_dict,
+                    );
+                    opt_ldm_process_match_candidate(
+                        ctx,
+                        &mut opt_ldm,
+                        &mut nb_matches,
+                        (inr - istart) as u32,
+                        (iend - inr) as u32,
+                        min_match,
                     );
                     if nb_matches == 0 {
                         cur += 1;

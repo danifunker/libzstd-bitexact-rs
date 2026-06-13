@@ -39,6 +39,7 @@ mod fse_encode;
 mod huffman;
 mod huffman_encode;
 mod lazy;
+mod ldm;
 mod literals_encode;
 mod opt;
 mod post_split;

@@ -26,8 +26,9 @@
 //! every level streams without length limits (up to the C
 //! overflow-correction threshold of 3500 MiB) — except configurations where
 //! C auto-enables long-distance matching (`strategy >= btopt && windowLog >=
-//! 27`, i.e. level 22 at unknown content size), which report a clean
-//! [`Error::Encode`] instead of diverging until LDM is ported.
+//! 27`, i.e. level 22 at unknown content size). LDM is ported
+//! ([`crate::ldm`]) but not yet bit-exact on large inputs, so those
+//! configurations report a clean [`Error::Encode`] instead of diverging.
 
 use crate::compress::FrameCompressor;
 use crate::error::Error;

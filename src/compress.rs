@@ -331,7 +331,7 @@ impl Window {
     /// `ZSTD_window_init` (plus the first-update segment flip baked in: the
     /// first chunk always starts a fresh segment at index 2 with an empty
     /// dict, so the flip is a no-op).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Window {
             seg_bias: WINDOW_START_INDEX as u32,
             dict_bias: WINDOW_START_INDEX as u32,
@@ -346,7 +346,7 @@ impl Window {
     /// Returns whether it was contiguous with the previous one; if not, the
     /// current prefix becomes the extDict. Also shrinks the extDict when the
     /// new chunk overwrites part of it in the (shared) buffer.
-    fn update(&mut self, start: usize, end: usize) -> bool {
+    pub(crate) fn update(&mut self, start: usize, end: usize) -> bool {
         if start == end {
             return true;
         }
@@ -388,7 +388,7 @@ impl Window {
     /// along once the extDict falls out of the window. (The C parameter is
     /// named `blockEnd`, but `ZSTD_compress_frameChunk` anchors it at the
     /// block *start* `ip`.)
-    fn enforce_max_dist(&mut self, idx: u32, max_dist: u32) {
+    pub(crate) fn enforce_max_dist(&mut self, idx: u32, max_dist: u32) {
         if idx > max_dist {
             let new_low_limit = idx - max_dist;
             if self.low_limit < new_low_limit {
@@ -402,7 +402,7 @@ impl Window {
 
     /// `ZSTD_window_hasExtDict`, which decides the dict mode
     /// (`ZSTD_matchState_dictMode`): extDict iff `lowLimit < dictLimit`.
-    fn has_ext_dict(&self) -> bool {
+    pub(crate) fn has_ext_dict(&self) -> bool {
         self.low_limit < self.dict_limit
     }
 
@@ -2033,6 +2033,10 @@ pub(crate) struct FrameCompressor {
     stage: Stage,
     disable_literal_compression: bool,
     window: Window,
+    /// `cctx->ldmState`, present when `ZSTD_resolveEnableLdm` (auto) turns
+    /// long-distance matching on: `strategy >= btopt && windowLog >= 27`,
+    /// i.e. level 22 at unknown or > 64 MiB content sizes.
+    ldm: Option<crate::ldm::LdmState>,
 }
 
 impl FrameCompressor {
@@ -2077,6 +2081,7 @@ impl FrameCompressor {
             stage: Stage::Init,
             disable_literal_compression,
             window: Window::new(),
+            ldm: crate::ldm::LdmParams::auto(&cparams).map(crate::ldm::LdmState::new),
         }
     }
 
@@ -2103,16 +2108,19 @@ impl FrameCompressor {
         chunk_end: usize,
         last_frame_chunk: bool,
     ) -> Result<(), Error> {
-        // `ZSTD_resolveEnableLdm` (auto): C engages long-distance matching
-        // once `strategy >= btopt && windowLog >= 27`, which changes the
-        // match candidates. LDM is not ported yet; error out rather than
-        // emit different bytes. Through the level-based API this is level 22
-        // with an unknown or > 64 MiB content size.
-        if self.cparams.strategy >= Strategy::Btopt && self.cparams.window_log >= 27 {
+        // `ZSTD_resolveEnableLdm` (auto): C enables long-distance matching for
+        // `strategy >= btopt && windowLog >= 27` (level 22 at unknown or
+        // > 64 MiB content sizes). The LDM match finder is ported
+        // ([`crate::ldm`]) and wired into the optimal parser, but is not yet
+        // bit-exact — a rare spurious raw-match candidate perturbs the
+        // optimal parse on large inputs — so these configurations return a
+        // clean error rather than diverge. Removing this gate re-activates
+        // the (already wired) LDM. See ROADMAP.md.
+        if self.ldm.is_some() {
             return Err(Error::Encode(
                 "this configuration enables long-distance matching in C \
-                 (strategy >= btopt and windowLog >= 27), which is not \
-                 ported yet",
+                 (strategy >= btopt and windowLog >= 27); LDM is ported but \
+                 not yet bit-exact",
             ));
         }
         let out_start = out.len();
@@ -2146,6 +2154,10 @@ impl FrameCompressor {
                 Matcher::Opt(ctx) => ctx.next_to_update = self.window.dict_limit as usize,
                 _ => {}
             }
+        }
+        // The LDM state keeps its own window, updated in lockstep.
+        if let Some(ldm) = &mut self.ldm {
+            ldm.window.update(chunk_start, chunk_end);
         }
         if self.checksum {
             self.xxh.update(&data[chunk_start..chunk_end]);
@@ -2275,6 +2287,23 @@ impl FrameCompressor {
                     }
                     Matcher::Opt(ctx) => {
                         let ext_dict = self.window.has_ext_dict();
+                        // `ZSTD_buildSeqStore`: with LDM enabled, generate
+                        // the block's raw sequences first; the opt parser
+                        // takes them as extra candidates
+                        // (`ZSTD_ldm_blockCompress`, btopt+ branch).
+                        let mut ldm_seqs: Vec<crate::ldm::RawSeq> = Vec::new();
+                        if let Some(ldm) = &mut self.ldm {
+                            let capacity =
+                                self.block_size_max / ldm.params.min_match_length as usize;
+                            crate::ldm::generate_sequences(
+                                ldm,
+                                &mut ldm_seqs,
+                                capacity,
+                                data,
+                                pos,
+                                pos + block_size,
+                            )?;
+                        }
                         crate::opt::compress_block_opt(
                             ctx,
                             &mut store,
@@ -2284,6 +2313,11 @@ impl FrameCompressor {
                             pos + block_size,
                             &mut self.window,
                             ext_dict,
+                            if self.ldm.is_some() {
+                                Some(&ldm_seqs)
+                            } else {
+                                None
+                            },
                         )
                     }
                 };

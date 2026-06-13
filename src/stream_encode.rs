@@ -60,6 +60,9 @@ pub struct StreamEncoder {
     /// `ZSTD_CCtx_setPledgedSrcSize`: applies at (deferred) init time.
     requested_pledged: Option<u64>,
     checksum: bool,
+    /// `ZSTD_CCtx_loadDictionary`: the dictionary primes the frame via an
+    /// internally-built CDict (Path B). `None` for plain streaming.
+    dict: Option<Vec<u8>>,
     /// `None` until the first operation (`zcss_init`): parameters are
     /// resolved lazily so that a first-call `finish` can auto-pledge.
     state: Option<StreamState>,
@@ -84,6 +87,34 @@ impl StreamEncoder {
             level,
             requested_pledged: None,
             checksum: false,
+            dict: None,
+            state: None,
+            frame_ended: false,
+        }
+    }
+
+    /// A streaming encoder primed with a dictionary (`ZSTD_CCtx_loadDictionary`
+    /// semantics: an internal CDict is built and **attached**, Path B). Output is
+    /// byte-identical to C `ZSTD_compressStream2` after `ZSTD_CCtx_loadDictionary`
+    /// (e.g. `zstd::stream::write::Encoder::with_dictionary`) for the same
+    /// operations.
+    ///
+    /// Current scope: the unknown-content-size (attach) path — the natural
+    /// streaming case. A stream whose source grows past the window (so C would
+    /// drop the attached dictionary) returns a clean [`Error::Encode`]; so does a
+    /// pledged size above the strategy's attach cutoff (the copy path) and a
+    /// dictionary with <= 8 bytes of content. Raw and trained dictionaries are
+    /// both supported.
+    pub fn with_dictionary(level: i32, dict: &[u8]) -> Self {
+        StreamEncoder {
+            level,
+            requested_pledged: None,
+            checksum: false,
+            dict: if dict.is_empty() {
+                None
+            } else {
+                Some(dict.to_vec())
+            },
             state: None,
             frame_ended: false,
         }
@@ -100,6 +131,7 @@ impl StreamEncoder {
             level,
             requested_pledged: Some(size),
             checksum: false,
+            dict: None,
             state: None,
             frame_ended: false,
         }
@@ -145,27 +177,45 @@ impl StreamEncoder {
     /// `ZSTD_CCtx_init_compressStream2` + `ZSTD_compressBegin_internal`
     /// (buffered): resolve parameters (auto-pledging if the first operation
     /// is `ZSTD_e_end`) and size the input staging buffer.
-    fn init(&mut self, end_op: EndOp, in_size: usize) {
+    fn init(&mut self, end_op: EndOp, in_size: usize) -> Result<(), Error> {
         let pledged = if end_op == EndOp::End {
             // "auto-determine pledgedSrcSize" — overrides any prior pledge.
             Some(in_size as u64)
         } else {
             self.requested_pledged
         };
-        let fc = FrameCompressor::new(self.level, pledged, self.checksum);
-        let block_size = fc.block_size_max();
-        let in_buff_size = fc.window_size() + block_size;
-        // `inBuffTarget = blockSizeMax + (blockSizeMax == pledgedSrcSize)`:
-        // for a pledge of exactly one block, avoid the automatic flush on
-        // reaching end of block, which would cost a 3-byte empty last block.
-        let in_buff_target = block_size + (pledged == Some(block_size as u64)) as usize;
-        self.state = Some(StreamState {
-            fc,
-            in_buff: vec![0u8; in_buff_size],
-            in_to_compress: 0,
-            in_buff_pos: 0,
-            in_buff_target,
+        // `inBuffTarget = blockSizeMax + (blockSizeMax == pledgedSrcSize)`: for a
+        // pledge of exactly one block, avoid the automatic flush on reaching end
+        // of block, which would cost a 3-byte empty last block.
+        let one_block_pledge = |bs: usize| (pledged == Some(bs as u64)) as usize;
+        self.state = Some(if let Some(dict) = &self.dict {
+            // `ZSTD_CCtx_loadDictionary` → internal CDict → attach. The dict
+            // content is a permanent prefix of the staging buffer; input is staged
+            // (and the first chunk compressed) from `content_len`.
+            let init =
+                crate::compress::streaming_cdict_init(dict, self.level, pledged, self.checksum)?;
+            let block_size = init.fc.block_size_max();
+            let in_buff_target = init.content_len + block_size + one_block_pledge(block_size);
+            StreamState {
+                fc: init.fc,
+                in_buff: init.in_buff,
+                in_to_compress: init.content_len,
+                in_buff_pos: init.content_len,
+                in_buff_target,
+            }
+        } else {
+            let fc = FrameCompressor::new(self.level, pledged, self.checksum);
+            let block_size = fc.block_size_max();
+            let in_buff_size = fc.window_size() + block_size;
+            StreamState {
+                fc,
+                in_buff: vec![0u8; in_buff_size],
+                in_to_compress: 0,
+                in_buff_pos: 0,
+                in_buff_target: block_size + one_block_pledge(block_size),
+            }
         });
+        Ok(())
     }
 
     /// `ZSTD_compressStream_generic`, buffered mode. The output never blocks
@@ -176,7 +226,7 @@ impl StreamEncoder {
             return Err(Error::Encode("frame already finished"));
         }
         if self.state.is_none() {
-            self.init(op, input.len());
+            self.init(op, input.len())?;
         }
         let st = self.state.as_mut().expect("initialized above");
         let block_size = st.fc.block_size_max();
@@ -195,6 +245,16 @@ impl StreamEncoder {
             if op == EndOp::Flush && st.in_buff_pos == st.in_to_compress {
                 // Nothing pending.
                 break;
+            }
+
+            // Streaming CDict attach: stop cleanly before the source grows past
+            // the window (where C's checkDictValidity/enforceMaxDist would drop
+            // the attached dict — that loadedDictEnd machinery isn't ported).
+            if st.fc.cdict_attach_overflow(st.in_buff_pos) {
+                return Err(Error::Encode(
+                    "streaming source outgrew the window with an attached dictionary \
+                     (large dict streams are not supported yet)",
+                ));
             }
 
             // Compress the staged chunk.

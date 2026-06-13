@@ -537,6 +537,27 @@ impl Window {
         }
     }
 
+    /// Like [`preloaded_attached_dict`](Self::preloaded_attached_dict) but for
+    /// *streaming*: the source length is not known up front, so `nextSrc` points
+    /// at the *start* of the source region (position `content_len`) rather than
+    /// past it, and `window_preloaded` is left off so the first
+    /// `compress_continue` registers each chunk contiguously (no extDict flip)
+    /// via `ZSTD_window_update`. The dict still lives in the attached match state
+    /// (`lowLimit == dictLimit`, no extDict); the concatenated `content ++ input`
+    /// staging buffer keeps `dictIndexDelta == 0`.
+    pub(crate) fn streaming_attached_dict(content_len: usize) -> Self {
+        let start = WINDOW_START_INDEX as u32;
+        let src_start = start + content_len as u32;
+        Window {
+            seg_bias: start,
+            dict_bias: start,
+            low_limit: src_start,
+            dict_limit: src_start,
+            next_src_pos: content_len,
+            next_src_idx: src_start,
+        }
+    }
+
     /// `ZSTD_window_update`: register `buf[start..end]` as the next chunk.
     /// Returns whether it was contiguous with the previous one; if not, the
     /// current prefix becomes the extDict. Also shrinks the extDict when the
@@ -3146,6 +3167,19 @@ impl FrameCompressor {
         self.block_size_max
     }
 
+    /// For the streaming CDict-attach path: whether compressing a block ending at
+    /// staging-buffer position `block_end` would carry the source past the window
+    /// (`block_end + seg_bias > maxDist`), where C's `ZSTD_checkDictValidity` /
+    /// `ZSTD_window_enforceMaxDist` would drop the attached dict or slide the
+    /// window. That loadedDictEnd-aware machinery isn't ported, so the streaming
+    /// encoder must stop with a clean error before this point. Always false when
+    /// no dict is attached.
+    pub(crate) fn cdict_attach_overflow(&self, block_end: usize) -> bool {
+        self.dict_match_state.is_some()
+            && (block_end + self.window.seg_bias as usize) as u64
+                > (1u64 << self.cparams.window_log)
+    }
+
     /// `ZSTD_compressContinue_internal` (frame mode): write the frame header
     /// on first use, then compress `data[chunk_start..chunk_end]` into one or
     /// more terminated blocks (`ZSTD_compress_frameChunk`).
@@ -3675,6 +3709,196 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Parse a CDict's dictionary buffer (`ZSTD_compress_insertDictionary` for the
+/// CDict): a trained (`ZDICT`) dict seeds the first block's entropy tables,
+/// repeat offsets and ID; a raw dict uses the default block state and the whole
+/// buffer as content. Returns `(content, entropy, rep, dictID)`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn parse_cdict(dict: &[u8]) -> Result<(&[u8], FseEntropyState, [u32; 3], u32), Error> {
+    if dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY {
+        let seed = crate::dict_encode::load_c_entropy(dict)?;
+        Ok((
+            &dict[seed.entropy_size..],
+            seed.entropy,
+            seed.rep,
+            seed.dict_id,
+        ))
+    } else {
+        Ok((dict, FseEntropyState::new(), [1, 4, 8], 0))
+    }
+}
+
+/// Build the working [`FrameCompressor`] for the CDict ATTACH path
+/// (`ZSTD_resetCCtx_byAttachingCDict`): working tables sized from the CDict
+/// cParams adjusted for the source (dict zeroed by `cpm_attachDict`), windowLog
+/// taken from the no-dict source cParams, and the CDict's own match state
+/// (`ms->dictMatchState`) built over `content`. Shared by the one-shot
+/// [`compress_with_cdict`] and the streaming attach path; the caller arranges
+/// the history buffer with `content` as its prefix and sets the window. The
+/// `entropy`/`rep`/`dictID` (`prevCBlock = cdict.cBlockState`) are set by the
+/// caller.
+pub(crate) fn attach_cdict_compressor(
+    content: &[u8],
+    cdict_cparams: CParams,
+    level: i32,
+    pledged: Option<u64>,
+    checksum: bool,
+) -> FrameCompressor {
+    let content_len = content.len();
+    let src_size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
+    let mut working = adjust_cparams_internal(cdict_cparams, src_size, 0, CParamMode::NoAttachDict);
+    working.window_log = get_cparams(level, src_size, 0).window_log;
+    let mut fc = FrameCompressor::from_cparams(working, pledged, checksum);
+
+    let mls = cdict_cparams.min_match.clamp(4, 7);
+    fc.dict_match_state = Some(match cdict_cparams.strategy {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
+            // The CDict's own lazy match state (its params, salt 0), filled over
+            // the content; consulted read-only by the dictMatchState search. The
+            // working context keeps its own empty tables, but its backend (hash
+            // chain / row / binary tree) must match the CDict's
+            // (`ZSTD_resetCCtx_byAttachingCDict` overrides useRowMatchFinder;
+            // btlazy2 is always the binary tree).
+            let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
+            let mut dms =
+                crate::lazy::LazyCtx::with_row_match_finder(&cdict_cparams, cdict_uses_row);
+            dms.use_cdict_hash_salt();
+            dms.load_dictionary(content, content_len);
+            fc.matcher = Matcher::Lazy(crate::lazy::LazyCtx::with_row_match_finder(
+                &working,
+                cdict_uses_row,
+            ));
+            DictMatchState::Lazy(LazyDictMatchState {
+                ms: Box::new(dms),
+                content_len,
+            })
+        }
+        Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+            // The CDict's own optimal-parser binary tree (its params); the
+            // working OptCtx keeps its own empty tree (no backend to override).
+            let mut dms = crate::opt::OptCtx::new(&cdict_cparams);
+            dms.load_dictionary(content, content_len);
+            DictMatchState::Opt(OptDictMatchState {
+                ms: Box::new(dms),
+                content_len,
+            })
+        }
+        Strategy::Dfast => {
+            let mut hash_long = vec![0u32; 1usize << cdict_cparams.hash_log];
+            let mut hash_small = vec![0u32; 1usize << cdict_cparams.chain_log];
+            fill_dfast_hash_tables_for_cdict(
+                &mut hash_long,
+                &mut hash_small,
+                content,
+                content_len,
+                cdict_cparams.hash_log,
+                cdict_cparams.chain_log,
+                mls,
+            );
+            DictMatchState::Dfast(DfastDictMatchState {
+                hash_long,
+                hash_small,
+                hlog_l: cdict_cparams.hash_log,
+                hlog_s: cdict_cparams.chain_log,
+                content_len,
+            })
+        }
+        _ => {
+            let mut hash_table = vec![0u32; 1usize << cdict_cparams.hash_log];
+            fill_fast_hash_table_for_cdict(
+                &mut hash_table,
+                content,
+                content_len,
+                cdict_cparams.hash_log,
+                mls,
+            );
+            DictMatchState::Fast(FastDictMatchState {
+                hash_table,
+                hlog: cdict_cparams.hash_log,
+                content_len,
+            })
+        }
+    });
+    fc
+}
+
+/// `ZSTD_shouldAttachDict` / `attachDictSizeCutoffs`: the per-strategy
+/// pledged-size threshold below which the CDict is attached rather than copied.
+pub(crate) fn cdict_attach_cutoff(strategy: Strategy) -> usize {
+    match strategy {
+        Strategy::Greedy
+        | Strategy::Lazy
+        | Strategy::Lazy2
+        | Strategy::Btlazy2
+        | Strategy::Btopt => 32 * 1024,
+        Strategy::Dfast => 16 * 1024,
+        // fast, btultra, btultra2
+        _ => 8 * 1024,
+    }
+}
+
+/// What the streaming encoder needs to drive a CDict-attach frame: the
+/// configured compressor and the staging buffer with the dict content as its
+/// permanent prefix (`in_buff[..content_len]`), input staged from `content_len`.
+pub(crate) struct StreamCdictInit {
+    pub(crate) fc: FrameCompressor,
+    pub(crate) in_buff: Vec<u8>,
+    pub(crate) content_len: usize,
+}
+
+/// Prepare a streaming CDict-attach frame (`ZSTD_CCtx_loadDictionary` →
+/// internal CDict → `ZSTD_resetCCtx_byAttachingCDict`, with the unknown / small
+/// pledged size that attaches rather than copies). The dict content becomes a
+/// permanent prefix of the staging buffer (the concat model, `dictIndexDelta
+/// == 0`), and the window starts in the streaming-attach state so each chunk is
+/// registered contiguously. The copy path (a large pledged size) is rejected
+/// for now, as is a dictionary with <= 8 bytes of content.
+pub(crate) fn streaming_cdict_init(
+    dict: &[u8],
+    level: i32,
+    pledged: Option<u64>,
+    checksum: bool,
+) -> Result<StreamCdictInit, Error> {
+    let (content, entropy, rep, dict_id) = parse_cdict(dict)?;
+    let content_len = content.len();
+    if content_len <= HASH_READ_SIZE {
+        return Err(Error::Encode(
+            "CDict (Path B): dictionaries with <= 8 bytes of content are not supported yet",
+        ));
+    }
+    let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
+    // Streaming defaults to an unknown size, which attaches. A pledged size above
+    // the strategy cutoff would copy the dict (extDict) — not ported for streams.
+    if pledged.is_some_and(|p| p as usize > cdict_attach_cutoff(cdict_cparams.strategy)) {
+        return Err(Error::Encode(
+            "streaming with a CDict above the attach cutoff (copy path) is not supported yet",
+        ));
+    }
+
+    let mut fc = attach_cdict_compressor(content, cdict_cparams, level, pledged, checksum);
+    fc.window = Window::streaming_attached_dict(content_len);
+    fc.entropy = entropy;
+    fc.rep = rep;
+    fc.dict_id = dict_id;
+    // Lazy/opt resume table insertion at the src start (the first contiguous
+    // chunk's nextToUpdate floor also does this, but set it explicitly).
+    match &mut fc.matcher {
+        Matcher::Lazy(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
+        _ => {}
+    }
+
+    let block_size = fc.block_size_max();
+    let window_size = fc.window_size();
+    let mut in_buff = vec![0u8; content_len + window_size + block_size];
+    in_buff[..content_len].copy_from_slice(content);
+    Ok(StreamCdictInit {
+        fc,
+        in_buff,
+        content_len,
+    })
+}
+
 /// `ZSTD_compress_usingCDict` (what `zstd::bulk::Compressor::with_dictionary`
 /// uses): one-shot compression with the dictionary loaded as a **CDict**
 /// (Path B). Produces **different bytes** than [`compress_with_dict`] (Path A):
@@ -3698,21 +3922,8 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     // tiny dictionaries (gated below) and the rare large-window LDM-with-dict
     // case (gated after the context is built).
 
-    // Parse the dictionary (`ZSTD_compress_insertDictionary` for the CDict):
-    // a trained dict seeds the first block's tables/reps/ID; a raw dict uses the
-    // default block state and the whole buffer as content.
-    let (content, entropy, rep, dict_id): (&[u8], FseEntropyState, [u32; 3], u32) =
-        if dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY {
-            let seed = crate::dict_encode::load_c_entropy(dict)?;
-            (
-                &dict[seed.entropy_size..],
-                seed.entropy,
-                seed.rep,
-                seed.dict_id,
-            )
-        } else {
-            (dict, FseEntropyState::new(), [1, 4, 8], 0)
-        };
+    // Parse the dictionary (`ZSTD_compress_insertDictionary` for the CDict).
+    let (content, entropy, rep, dict_id) = parse_cdict(dict)?;
 
     let content_len = content.len();
     let src_len = src.len();
@@ -3726,20 +3937,9 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         ));
     }
 
-    // `ZSTD_shouldAttachDict` / `attachDictSizeCutoffs`: attach iff srcSize <= the
-    // strategy cutoff — fast 8 KB, dfast 16 KB, greedy/lazy/lazy2/btlazy2/btopt
-    // 32 KB, btultra/btultra2 8 KB — otherwise copy the dict into the context.
-    let cutoff = match cdict_cparams.strategy {
-        Strategy::Greedy
-        | Strategy::Lazy
-        | Strategy::Lazy2
-        | Strategy::Btlazy2
-        | Strategy::Btopt => 32 * 1024,
-        Strategy::Dfast => 16 * 1024,
-        // fast, btultra, btultra2
-        _ => 8 * 1024,
-    };
-    let attach = src_len <= cutoff;
+    // `ZSTD_shouldAttachDict`: attach iff srcSize <= the strategy cutoff,
+    // otherwise copy the dict into the context.
+    let attach = src_len <= cdict_attach_cutoff(cdict_cparams.strategy);
 
     let pledged = Some(src_size);
     let mut data = Vec::with_capacity(content_len + src_len);
@@ -3747,86 +3947,10 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     data.extend_from_slice(src);
 
     let mut fc = if attach {
-        // `ZSTD_resetCCtx_byAttachingCDict`: working tables sized from the CDict
-        // cParams adjusted for the source (dict zeroed by `cpm_attachDict`), the
-        // window log taken from the no-dict source cParams.
-        let mut working =
-            adjust_cparams_internal(cdict_cparams, src_size, 0, CParamMode::NoAttachDict);
-        working.window_log = get_cparams(level, src_size, 0).window_log;
-        let mut fc = FrameCompressor::from_cparams(working, pledged, false);
-
-        // Build the CDict's own table(s) over the content.
-        let mls = cdict_cparams.min_match.clamp(4, 7);
-        fc.dict_match_state = Some(match cdict_cparams.strategy {
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
-                // The CDict's own lazy match state (its params, salt 0), filled
-                // over the content; consulted read-only by the dictMatchState
-                // search. The working context (built above) keeps its own empty
-                // tables, but its backend (hash chain / row / binary tree) must
-                // match the CDict's — `ZSTD_resetCCtx_byAttachingCDict` overrides
-                // useRowMatchFinder; btlazy2 is always the binary tree.
-                let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
-                let mut dms =
-                    crate::lazy::LazyCtx::with_row_match_finder(&cdict_cparams, cdict_uses_row);
-                dms.use_cdict_hash_salt();
-                dms.load_dictionary(&data, content_len);
-                fc.matcher = Matcher::Lazy(crate::lazy::LazyCtx::with_row_match_finder(
-                    &working,
-                    cdict_uses_row,
-                ));
-                DictMatchState::Lazy(LazyDictMatchState {
-                    ms: Box::new(dms),
-                    content_len,
-                })
-            }
-            Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
-                // The CDict's own optimal-parser binary tree (its params), filled
-                // over the content; consulted read-only by the dictMatchState arm.
-                // The working OptCtx (from `from_cparams`) keeps its own empty
-                // tree — the opt parser has no row/chain backend to override.
-                let mut dms = crate::opt::OptCtx::new(&cdict_cparams);
-                dms.load_dictionary(&data, content_len);
-                DictMatchState::Opt(OptDictMatchState {
-                    ms: Box::new(dms),
-                    content_len,
-                })
-            }
-            Strategy::Dfast => {
-                let mut hash_long = vec![0u32; 1usize << cdict_cparams.hash_log];
-                let mut hash_small = vec![0u32; 1usize << cdict_cparams.chain_log];
-                fill_dfast_hash_tables_for_cdict(
-                    &mut hash_long,
-                    &mut hash_small,
-                    content,
-                    content_len,
-                    cdict_cparams.hash_log,
-                    cdict_cparams.chain_log,
-                    mls,
-                );
-                DictMatchState::Dfast(DfastDictMatchState {
-                    hash_long,
-                    hash_small,
-                    hlog_l: cdict_cparams.hash_log,
-                    hlog_s: cdict_cparams.chain_log,
-                    content_len,
-                })
-            }
-            _ => {
-                let mut hash_table = vec![0u32; 1usize << cdict_cparams.hash_log];
-                fill_fast_hash_table_for_cdict(
-                    &mut hash_table,
-                    content,
-                    content_len,
-                    cdict_cparams.hash_log,
-                    mls,
-                );
-                DictMatchState::Fast(FastDictMatchState {
-                    hash_table,
-                    hlog: cdict_cparams.hash_log,
-                    content_len,
-                })
-            }
-        });
+        // `ZSTD_resetCCtx_byAttachingCDict` (the dms over `content`); arrange the
+        // window over the concatenated `content ++ src` buffer in the post-reset
+        // attach state (src begins at `cdictEnd`, no extDict).
+        let mut fc = attach_cdict_compressor(content, cdict_cparams, level, pledged, false);
         fc.window = Window::preloaded_attached_dict(content_len, src_len);
         fc.window_preloaded = true;
         fc

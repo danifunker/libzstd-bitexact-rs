@@ -453,7 +453,7 @@ pub(crate) fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
 /// `ZSTD_index_overlap_check`: whether a repcode index is far enough below the
 /// prefix start that its 4-byte read stays clear of the dict/prefix seam (admits
 /// prefix-side repcodes outright and dict-side ones only when safe).
-fn index_overlap_check(prefix_lowest_index: u32, rep_index: u32) -> bool {
+pub(crate) fn index_overlap_check(prefix_lowest_index: u32, rep_index: u32) -> bool {
     prefix_lowest_index.wrapping_sub(1).wrapping_sub(rep_index) >= 3
 }
 
@@ -3043,6 +3043,7 @@ pub(crate) struct FrameCompressor {
 enum DictMatchState {
     Fast(FastDictMatchState),
     Dfast(DfastDictMatchState),
+    Lazy(LazyDictMatchState),
 }
 
 struct FastDictMatchState {
@@ -3060,6 +3061,14 @@ struct DfastDictMatchState {
     hash_small: Vec<u32>,
     hlog_l: u32,
     hlog_s: u32,
+    content_len: usize,
+}
+
+/// The greedy/lazy/lazy2 variant: the CDict's own (untagged) lazy match state —
+/// hash chain or row table — built over the dict content with the CDict's
+/// parameters and salt 0. Read-only during the attach search.
+struct LazyDictMatchState {
+    ms: Box<crate::lazy::LazyCtx>,
     content_len: usize,
 }
 
@@ -3343,7 +3352,19 @@ impl FrameCompressor {
                         }
                     }
                     Matcher::Lazy(ctx) => {
-                        if self.window.has_ext_dict() {
+                        if let Some(DictMatchState::Lazy(dms)) = &self.dict_match_state {
+                            crate::lazy::compress_block_lazy_dict_match_state(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                &self.window,
+                                &dms.ms,
+                                dms.content_len,
+                            )
+                        } else if self.window.has_ext_dict() {
                             crate::lazy::compress_block_lazy_extdict(
                                 ctx,
                                 &mut store,
@@ -3642,8 +3663,10 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
 /// context either **attaches** the CDict (small inputs ≤ the strategy cutoff) or
 /// **copies** its de-tagged tables (larger inputs).
 ///
-/// Current scope: the fast and dfast strategies; other strategies (and tiny
-/// dictionaries) return a clean [`Error::Encode`] until their sub-commits land.
+/// Current scope: the fast, dfast, greedy, lazy and lazy2 strategies, both raw
+/// and trained dictionaries, on both the attach and copy sides of the cutoff;
+/// other strategies (and tiny dictionaries) return a clean [`Error::Encode`]
+/// until their sub-commits land.
 pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
@@ -3651,9 +3674,12 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
 
     // The CDict's own cParams (`cpm_createCDict`, the *whole* dict buffer size).
     let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
-    if !matches!(cdict_cparams.strategy, Strategy::Fast | Strategy::Dfast) {
+    if !matches!(
+        cdict_cparams.strategy,
+        Strategy::Fast | Strategy::Dfast | Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
+    ) {
         return Err(Error::Encode(
-            "CDict (Path B) currently supports only the fast and dfast strategies",
+            "CDict (Path B) currently supports only the fast, dfast, greedy, lazy and lazy2 strategies",
         ));
     }
 
@@ -3686,8 +3712,10 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     }
 
     // `ZSTD_shouldAttachDict`: attach iff srcSize <= the strategy cutoff (fast =
-    // 8 KB, dfast = 16 KB), otherwise copy the dict's tables into the context.
+    // 8 KB, dfast = 16 KB, greedy/lazy/lazy2 = 32 KB), otherwise copy the dict's
+    // tables into the context (`attachDictSizeCutoffs`).
     let cutoff = match cdict_cparams.strategy {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => 32 * 1024,
         Strategy::Dfast => 16 * 1024,
         _ => 8 * 1024,
     };
@@ -3707,9 +3735,29 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         working.window_log = get_cparams(level, src_size, 0).window_log;
         let mut fc = FrameCompressor::from_cparams(working, pledged, false);
 
-        // Build the CDict's own tagged table(s) over the content.
+        // Build the CDict's own table(s) over the content.
         let mls = cdict_cparams.min_match.clamp(4, 7);
         fc.dict_match_state = Some(match cdict_cparams.strategy {
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+                // The CDict's own lazy match state (its params, salt 0), filled
+                // over the content; consulted read-only by the dictMatchState
+                // search. The working context (built above) keeps its own empty
+                // tables, but its row/chain backend must match the CDict's
+                // (`ZSTD_resetCCtx_byAttachingCDict` overrides useRowMatchFinder).
+                let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
+                let mut dms =
+                    crate::lazy::LazyCtx::with_row_match_finder(&cdict_cparams, cdict_uses_row);
+                dms.use_cdict_hash_salt();
+                dms.load_dictionary(&data, content_len);
+                fc.matcher = Matcher::Lazy(crate::lazy::LazyCtx::with_row_match_finder(
+                    &working,
+                    cdict_uses_row,
+                ));
+                DictMatchState::Lazy(LazyDictMatchState {
+                    ms: Box::new(dms),
+                    content_len,
+                })
+            }
             Strategy::Dfast => {
                 let mut hash_long = vec![0u32; 1usize << cdict_cparams.hash_log];
                 let mut hash_small = vec![0u32; 1usize << cdict_cparams.chain_log];
@@ -3750,17 +3798,33 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         fc.window_preloaded = true;
         fc
     } else {
-        // `ZSTD_resetCCtx_byCopyingCDict`: the de-tagged CDict table equals an
-        // untagged `dtlm_full` fill, and the window holds the dict as a prefix
+        // `ZSTD_resetCCtx_byCopyingCDict`: the window holds the dict as a prefix
         // (extDict on the `src` append) — i.e. the Path A flow with the CDict's
-        // own cParams and the wider fill.
+        // own cParams and windowLog overridden to the working context's.
         let mut working = cdict_cparams;
         working.window_log = get_cparams(level, src_size, dict.len() as u64).window_log;
         let mut fc = FrameCompressor::from_cparams(working, pledged, false);
-        match &mut fc.matcher {
-            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx_full(ctx, &data, content_len),
-            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx_full(ctx, &data, content_len),
-            _ => {}
+        match cdict_cparams.strategy {
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+                // Lazy tables aren't tagged (`ZSTD_CDictIndicesAreTagged` is
+                // fast/dfast only), so the copied CDict tables equal a plain Path A
+                // (`load_dictionary`) fill — same params, the CDict's row/chain
+                // backend, and the CDict's salt (0, copied for the row finder).
+                let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
+                let mut ctx = crate::lazy::LazyCtx::with_row_match_finder(&working, cdict_uses_row);
+                ctx.use_cdict_hash_salt();
+                ctx.load_dictionary(&data, content_len);
+                fc.matcher = Matcher::Lazy(ctx);
+            }
+            // The de-tagged CDict fast/dfast table equals an untagged `dtlm_full`
+            // fill, reproduced directly in the working tables.
+            _ => match &mut fc.matcher {
+                Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx_full(ctx, &data, content_len),
+                Matcher::Dfast(ctx) => {
+                    fill_dfast_hash_tables_for_cctx_full(ctx, &data, content_len)
+                }
+                _ => {}
+            },
         }
         fc.window = Window::preloaded_ext_dict(content_len, src_len);
         fc.window_preloaded = true;
@@ -3771,6 +3835,15 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     fc.entropy = entropy;
     fc.rep = rep;
     fc.dict_id = dict_id;
+
+    // Lazy resumes table insertion at the src start; the window-preloaded path
+    // skips compress_continue's non-contiguous `nextToUpdate = dictLimit` reset.
+    // (Fast/dfast don't track nextToUpdate; the attach window's dictLimit is the
+    // src start, the copy window's is the dict/src seam — both the right resume
+    // point.)
+    if let Matcher::Lazy(ctx) = &mut fc.matcher {
+        ctx.next_to_update = fc.window.dict_limit as usize;
+    }
 
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
     fc.compress_end(&mut out, &data, content_len, content_len + src_len)?;

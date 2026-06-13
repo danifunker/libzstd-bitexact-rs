@@ -5,11 +5,13 @@
 //! which produces **different bytes** than `ZSTD_compress_usingDict` (Path A,
 //! [`compress_with_dict`]).
 //!
-//! Sub-commits 1-2 implement the **fast** and **dfast** strategies. This test
-//! targets the levels whose CDict uses an implemented strategy and spans payload
-//! sizes on both sides of the attach/copy cutoff, so both the **attach** (small
-//! `src`, dictMatchState matcher) and **copy** (large `src`, de-tagged tables)
-//! paths are exercised, plus a round-trip through our own decoder.
+//! Sub-commits 1-3 implement the **fast**, **dfast**, **greedy**, **lazy** and
+//! **lazy2** strategies. This test targets the levels whose CDict uses an
+//! implemented strategy and spans payload sizes on both sides of the attach/copy
+//! cutoff, so both the **attach** (small `src`, dictMatchState matcher) and
+//! **copy** (large `src`, de-tagged/reproduced tables) paths are exercised —
+//! including the lazy family's two backends (hash chain when the CDict windowLog
+//! ≤ 14, the row finder above it) — plus a round-trip through our own decoder.
 
 use libzstd_bitexact::{
     DecodeOptions, Dictionary, compress_with_cdict, cparams_create_cdict_for_testing,
@@ -53,9 +55,23 @@ const WORDS: &[&[u8]] = &[
 
 /// A raw-content dictionary built from the same vocabulary as the payloads.
 fn raw_dict_content() -> Vec<u8> {
+    raw_dict_of_size(8192)
+}
+
+/// A larger raw dictionary, sized so the CDict's windowLog exceeds 14 at the
+/// lazy-family levels — exercising the **row** match finder's dictMatchState arm
+/// (the 8 KB dict stays on the hash chain). Kept at 24 KB: large enough for
+/// windowLog 15, but below the smallest per-level `maxDictSize` so the dict is
+/// loaded whole (C's suffix-only truncation for huge dicts is a separate,
+/// not-yet-ported, cross-strategy concern — see `ZSTD_loadDictionaryContent`).
+fn big_raw_dict_content() -> Vec<u8> {
+    raw_dict_of_size(24 * 1024)
+}
+
+fn raw_dict_of_size(target: usize) -> Vec<u8> {
     let mut rng = Rng::new(0xD1C7_0001);
-    let mut d = Vec::with_capacity(8192);
-    while d.len() < 8192 {
+    let mut d = Vec::with_capacity(target);
+    while d.len() < target {
         d.extend_from_slice(WORDS[rng.below(WORDS.len())]);
         d.push(b' ');
     }
@@ -104,6 +120,9 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
 
 const FAST: u32 = 1;
 const DFAST: u32 = 2;
+const GREEDY: u32 = 3;
+const LAZY: u32 = 4;
+const LAZY2: u32 = 5;
 
 /// The levels whose CDict (for this dict size) uses an implemented strategy.
 fn supported_levels(dict_len: usize) -> Vec<i32> {
@@ -111,24 +130,39 @@ fn supported_levels(dict_len: usize) -> Vec<i32> {
         .filter(|&l| {
             matches!(
                 cparams_create_cdict_for_testing(l, dict_len as u64)[6],
-                FAST | DFAST
+                FAST | DFAST | GREEDY | LAZY | LAZY2
             )
         })
         .collect()
 }
 
-fn check_dict(dict_bytes: &[u8]) {
+/// Whether the CDict's lazy family would use the row finder (windowLog > 14) vs
+/// the hash chain — mirrors `ZSTD_resolveRowMatchFinderMode`/`use_row_match_finder`.
+fn cdict_uses_row(level: i32, dict_len: usize) -> bool {
+    let cp = cparams_create_cdict_for_testing(level, dict_len as u64);
+    matches!(cp[6], GREEDY | LAZY | LAZY2) && cp[0] > 14
+}
+
+/// Backend coverage observed for the lazy family: (row, chain) match-finder hits.
+struct LazyCoverage {
+    row: u64,
+    chain: u64,
+}
+
+fn check_dict(dict_bytes: &[u8]) -> LazyCoverage {
     let dict_obj = Dictionary::new(dict_bytes).expect("dict parse");
     let levels = supported_levels(dict_bytes.len());
-    let mut by_strategy = [0u64; 3];
+    let mut by_strategy = [0u64; 10];
     assert!(
         !levels.is_empty(),
-        "expected some fast/dfast-strategy CDict levels for a {}-byte dict",
+        "expected some implemented-strategy CDict levels for a {}-byte dict",
         dict_bytes.len()
     );
 
     let mut attach = 0u64;
     let mut copy = 0u64;
+    let mut lazy_row = 0u64;
+    let mut lazy_chain = 0u64;
     for data in payloads() {
         for &level in &levels {
             let ours = compress_with_cdict(&data, dict_bytes, level).unwrap_or_else(|e| {
@@ -159,10 +193,24 @@ fn check_dict(dict_bytes: &[u8]) {
 
             let strat = cparams_create_cdict_for_testing(level, dict_bytes.len() as u64)[6];
             by_strategy[strat as usize] += 1;
-            if data.len() <= 8 * 1024 {
+            // The strategy-specific attach/copy cutoff (fast 8K, dfast 16K,
+            // greedy/lazy/lazy2 32K) decides which reset path ran.
+            let cutoff = match strat {
+                GREEDY | LAZY | LAZY2 => 32 * 1024,
+                DFAST => 16 * 1024,
+                _ => 8 * 1024,
+            };
+            if data.len() <= cutoff {
                 attach += 1;
             } else {
                 copy += 1;
+            }
+            if matches!(strat, GREEDY | LAZY | LAZY2) {
+                if cdict_uses_row(level, dict_bytes.len()) {
+                    lazy_row += 1;
+                } else {
+                    lazy_chain += 1;
+                }
             }
         }
     }
@@ -170,20 +218,39 @@ fn check_dict(dict_bytes: &[u8]) {
         attach > 0 && copy > 0,
         "must exercise both attach ({attach}) and copy ({copy}) paths"
     );
+    let lazy_total =
+        by_strategy[GREEDY as usize] + by_strategy[LAZY as usize] + by_strategy[LAZY2 as usize];
     assert!(
-        by_strategy[FAST as usize] > 0 && by_strategy[DFAST as usize] > 0,
-        "must exercise both fast ({}) and dfast ({}) strategies",
-        by_strategy[FAST as usize],
-        by_strategy[DFAST as usize]
+        lazy_total > 0,
+        "must exercise the lazy family (greedy/lazy/lazy2)"
     );
+    println!(
+        "dict {} bytes: strategies {:?}, attach {attach}, copy {copy}, lazy_row {lazy_row}, lazy_chain {lazy_chain}",
+        dict_bytes.len(),
+        &by_strategy[1..=5],
+    );
+    LazyCoverage {
+        row: lazy_row,
+        chain: lazy_chain,
+    }
 }
 
 #[test]
 fn fast_cdict_raw_is_bit_exact_and_round_trips() {
-    check_dict(&raw_dict_content());
+    // The 8 KB dict keeps the lazy family on the hash-chain backend.
+    let cov = check_dict(&raw_dict_content());
+    assert!(cov.chain > 0, "8 KB dict should hit the hash-chain backend");
 }
 
 #[test]
 fn fast_cdict_trained_is_bit_exact_and_round_trips() {
     check_dict(&trained_dict());
+}
+
+#[test]
+fn big_cdict_raw_exercises_row_finder() {
+    // A 48 KB dict pushes the CDict windowLog past 14, so the lazy family uses
+    // the row match finder's dictMatchState arm (attach and copy).
+    let cov = check_dict(&big_raw_dict_content());
+    assert!(cov.row > 0, "48 KB dict should hit the row backend");
 }

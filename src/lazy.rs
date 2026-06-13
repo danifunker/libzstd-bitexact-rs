@@ -23,7 +23,8 @@
 //! exactly here.
 
 use crate::compress::{
-    CParams, Strategy, Window, count_2segments, count_eq, hash_ptr, read32, read64,
+    CParams, Strategy, Window, count_2segments, count_eq, hash_ptr, index_overlap_check, read32,
+    read64,
 };
 use crate::sequences_encode::SeqStore;
 
@@ -117,9 +118,21 @@ pub(crate) struct LazyCtx {
 
 impl LazyCtx {
     pub(crate) fn new(cparams: &CParams) -> Self {
+        Self::with_row_match_finder(cparams, use_row_match_finder(cparams))
+    }
+
+    /// Like [`new`](Self::new) but the row-vs-hash-chain backend is forced
+    /// rather than derived from `cparams`. The CDict attach/copy resets
+    /// (`ZSTD_resetCCtx_byAttachingCDict` / `…byCopyingCDict`) set the working
+    /// context's `useRowMatchFinder` from the **CDict's** (line
+    /// `params.useRowMatchFinder = cdict->useRowMatchFinder`), whose own
+    /// windowLog decided it — that can differ from what the working cParams'
+    /// (input-resized) windowLog would pick. Btlazy2 always uses the binary
+    /// tree, ignoring `use_row`.
+    pub(crate) fn with_row_match_finder(cparams: &CParams, use_row: bool) -> Self {
         let method = if cparams.strategy == Strategy::Btlazy2 {
             SearchMethod::BinaryTree
-        } else if use_row_match_finder(cparams) {
+        } else if use_row {
             SearchMethod::RowHash
         } else {
             SearchMethod::HashChain
@@ -227,6 +240,26 @@ impl LazyCtx {
         // `src`, never re-touching the dict's last few positions.
         self.next_to_update = WINDOW_START_INDEX + dict_len;
     }
+
+    /// Zero the row-hash salt to match a CDict match state. `ZSTD_reset_matchState`
+    /// always uses salt 0 when resetting a CDict (`forWho == ZSTD_resetTarget_CDict`),
+    /// and `ZSTD_resetCCtx_byCopyingCDict` copies that salt into the working
+    /// context. Call before [`load_dictionary`](Self::load_dictionary) so the row
+    /// fill hashes with the same (zero) salt the dictMatchState search expects —
+    /// the dms row finder reads tags with the *unsalted* `ZSTD_hashPtr`.
+    pub(crate) fn use_cdict_hash_salt(&mut self) {
+        self.hash_salt = 0;
+    }
+}
+
+/// An attached CDict's match state (`ms->dictMatchState`) passed to the
+/// dictMatchState search arms. In the concatenated `content ++ src` buffer the
+/// dict occupies indices `[WINDOW_START_INDEX, WINDOW_START_INDEX + content_len)`,
+/// so `dmsIndexDelta == 0` and a dict index maps to a buffer position exactly
+/// like the working context's (`pos = index - WINDOW_START_INDEX`).
+pub(crate) struct AttachedDict<'a> {
+    ms: &'a LazyCtx,
+    content_len: usize,
 }
 
 // --- Hash-chain search -------------------------------------------------------
@@ -260,6 +293,7 @@ fn insert_and_find_first_index(
 /// better-than-3 match is saved, exactly like the C `offsetPtr` contract.
 /// Dict-side candidates skip the best-length quick filter and count across
 /// the seam, exactly as in C.
+#[allow(clippy::too_many_arguments)]
 fn hc_find_best_match(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -268,6 +302,7 @@ fn hc_find_best_match(
     off_base: &mut u64,
     win: &Window,
     ext_dict: bool,
+    dms: Option<&AttachedDict>,
 ) -> usize {
     let seg_bias = win.seg_bias as usize;
     let to_pos = |idx: usize| idx - seg_bias;
@@ -326,6 +361,49 @@ fn hc_find_best_match(
         }
         match_index = ctx.chain_table[(match_index & chain_mask) as usize];
         nb_attempts -= 1;
+    }
+
+    // `ZSTD_HcFindBestMatch` dictMatchState arm: walk the attached CDict's own
+    // hash chain with the search budget (`nbAttempts`) left after the working
+    // chain. The dict is a separate match state; in our concat buffer
+    // `dmsIndexDelta == 0`, so a dict index maps to a position like the working
+    // context's and the saved offset is `curr - matchIndex` directly.
+    if let Some(att) = dms {
+        let d = att.ms;
+        let dms_size = (WINDOW_START_INDEX + att.content_len) as u32; // dmsEnd - dmsBase
+        let dms_lowest = WINDOW_START_INDEX as u32; // dms.window.dictLimit
+        let dms_chain_size = 1u32 << d.chain_log;
+        let dms_chain_mask = dms_chain_size - 1;
+        let dms_min_chain = dms_size.saturating_sub(dms_chain_size);
+        let dms_end_pos = att.content_len; // dmsEnd position
+        let prefix_start_pos = att.content_len; // prefixStart (= src start)
+        let mut mi = d.hash_table[hash_ptr(data, to_pos(ip), d.hash_log, ctx.mls)];
+        while mi >= dms_lowest && nb_attempts > 0 {
+            let match_pos = mi as usize - WINDOW_START_INDEX;
+            let mut current_ml = 0usize;
+            if read32(data, match_pos) == read32(data, to_pos(ip)) {
+                current_ml = count_2segments(
+                    data,
+                    to_pos(ip) + 4,
+                    match_pos + 4,
+                    to_pos(iend),
+                    dms_end_pos,
+                    prefix_start_pos,
+                ) + 4;
+            }
+            if current_ml > ml {
+                ml = current_ml;
+                *off_base = (curr - mi) as u64 + 3; // OFFSET_TO_OFFBASE, dmsIndexDelta 0
+                if ip + current_ml == iend {
+                    break;
+                }
+            }
+            if mi <= dms_min_chain {
+                break;
+            }
+            mi = d.chain_table[(mi & dms_chain_mask) as usize];
+            nb_attempts -= 1;
+        }
     }
     ml
 }
@@ -462,6 +540,7 @@ fn row_get_match_mask(tag_row: &[u8], tag: u8, head: u32, row_entries: u32) -> u
 
 /// `ZSTD_RowFindBestMatch` (noDict and extDict). Dict-side candidates skip
 /// the best-length quick filter and count across the seam, exactly as in C.
+#[allow(clippy::too_many_arguments)]
 fn row_find_best_match(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -470,6 +549,7 @@ fn row_find_best_match(
     off_base: &mut u64,
     win: &Window,
     ext_dict: bool,
+    dms: Option<&AttachedDict>,
 ) -> usize {
     let seg_bias = win.seg_bias as usize;
     let to_pos = |idx: usize| idx - seg_bias;
@@ -575,6 +655,71 @@ fn row_find_best_match(
             *off_base = (curr - match_index) as u64 + 3;
             if ip + current_ml == iend {
                 break;
+            }
+        }
+    }
+
+    // `ZSTD_RowFindBestMatch` dictMatchState arm: probe the attached CDict's own
+    // tag row with the search budget left after the working row. The dms tag row
+    // is hashed with the CDict's `rowHashLog` but the *unsalted* `ZSTD_hashPtr`
+    // (the CDict's salt is 0, so the salted fill and unsalted probe agree); the
+    // row stride uses the shared `rowLog` (working searchLog == CDict searchLog).
+    if let Some(att) = dms {
+        let d = att.ms;
+        let dms_lowest = WINDOW_START_INDEX as u32; // dms.window.dictLimit
+        let dms_end_pos = att.content_len; // dmsEnd position
+        let prefix_start_pos = att.content_len; // prefixStart (= src start)
+        let dms_hash = hash_ptr_salted(
+            data,
+            to_pos(ip),
+            d.row_hash_log + ROW_HASH_TAG_BITS,
+            ctx.mls,
+            d.hash_salt,
+        ) as u32;
+        let dms_rel_row = ((dms_hash >> ROW_HASH_TAG_BITS) << ctx.row_log) as usize;
+        let dms_tag = dms_hash & ROW_HASH_TAG_MASK;
+        let dms_head = d.tag_table[dms_rel_row] as u32 & row_mask;
+        let mut dms_matches = row_get_match_mask(
+            &d.tag_table[dms_rel_row..dms_rel_row + row_entries as usize],
+            dms_tag as u8,
+            dms_head,
+            row_entries,
+        );
+        let mut dms_buffer = [0u32; ROW_HASH_MAX_ENTRIES];
+        let mut dms_num = 0usize;
+        while dms_matches > 0 && nb_attempts > 0 {
+            let match_pos = ((dms_head + dms_matches.trailing_zeros()) & row_mask) as usize;
+            dms_matches &= dms_matches - 1;
+            if match_pos == 0 {
+                continue;
+            }
+            let mi = d.hash_table[dms_rel_row + match_pos];
+            if mi < dms_lowest {
+                break;
+            }
+            dms_buffer[dms_num] = mi;
+            dms_num += 1;
+            nb_attempts -= 1;
+        }
+        for &mi in &dms_buffer[..dms_num] {
+            let match_pos = mi as usize - WINDOW_START_INDEX;
+            let mut current_ml = 0usize;
+            if read32(data, match_pos) == read32(data, to_pos(ip)) {
+                current_ml = count_2segments(
+                    data,
+                    to_pos(ip) + 4,
+                    match_pos + 4,
+                    to_pos(iend),
+                    dms_end_pos,
+                    prefix_start_pos,
+                ) + 4;
+            }
+            if current_ml > ml {
+                ml = current_ml;
+                *off_base = (curr - mi) as u64 + 3; // dmsIndexDelta 0
+                if ip + current_ml == iend {
+                    break;
+                }
             }
         }
     }
@@ -1037,7 +1182,11 @@ fn bt_find_best_match(
     dubt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
 }
 
-/// `ZSTD_searchMax`.
+/// `ZSTD_searchMax`. `dms` (`ms->dictMatchState`) is consulted only by the
+/// hash-chain and row finders (the dictMatchState dispatch is greedy/lazy/lazy2);
+/// the binary tree's dictMatchState arm is a separate increment, so it is never
+/// reached with `dms.is_some()`.
+#[allow(clippy::too_many_arguments)]
 fn search_max(
     ctx: &mut LazyCtx,
     data: &[u8],
@@ -1046,10 +1195,15 @@ fn search_max(
     off_base: &mut u64,
     win: &Window,
     ext_dict: bool,
+    dms: Option<&AttachedDict>,
 ) -> usize {
     match ctx.method {
-        SearchMethod::HashChain => hc_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict),
-        SearchMethod::RowHash => row_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict),
+        SearchMethod::HashChain => {
+            hc_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict, dms)
+        }
+        SearchMethod::RowHash => {
+            row_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict, dms)
+        }
         SearchMethod::BinaryTree => {
             bt_find_best_match(ctx, data, ip, iend, off_base, win, ext_dict)
         }
@@ -1158,7 +1312,7 @@ pub(crate) fn compress_block_lazy(
         // First search (depth 0).
         {
             let mut offbase_found: u64 = 999_999_999;
-            let ml2 = search_max(ctx, data, ip, iend, &mut offbase_found, win, false);
+            let ml2 = search_max(ctx, data, ip, iend, &mut offbase_found, win, false, None);
             if ml2 > match_length {
                 match_length = ml2;
                 start = ip;
@@ -1197,7 +1351,7 @@ pub(crate) fn compress_block_lazy(
                 }
                 {
                     let mut ofb_candidate: u64 = 999_999_999;
-                    let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, false);
+                    let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, false, None);
                     let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
                     let gain1 = (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 4;
                     if ml2 >= 4 && gain2 > gain1 {
@@ -1231,7 +1385,8 @@ pub(crate) fn compress_block_lazy(
                     }
                     {
                         let mut ofb_candidate: u64 = 999_999_999;
-                        let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, false);
+                        let ml2 =
+                            search_max(ctx, data, ip, iend, &mut ofb_candidate, win, false, None);
                         let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
                         let gain1 =
                             (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 7;
@@ -1344,6 +1499,381 @@ fn store_and_repcodes(
             to_pos(*ip) + 4,
             to_pos(*ip - *offset_2 as usize) + 4,
             to_pos(iend),
+        ) + 4;
+        std::mem::swap(offset_1, offset_2);
+        store.store_seq(&[], 1, m_len as u32);
+        *ip += m_len;
+        *anchor = *ip;
+    }
+}
+
+// --- The lazy dictMatchState driver (CDict attach) --------------------------------
+
+/// `ZSTD_compressBlock_lazy_generic` with `dictMode == ZSTD_dictMatchState`,
+/// depths 0..=2 — the CDict **attach** match finder. The dictionary lives in a
+/// separate match state `dms` (its own filled tables, salt 0); `ctx` is the
+/// working context, whose tables start empty and fill as `src` is parsed. We lay
+/// the history out as one buffer `content ++ src`, so the working window is
+/// non-extDict (src begins at `dictLimit`), `dmsIndexDelta == 0`, and a dict
+/// index maps to a position like the working context's. Repcodes may reach into
+/// the dict (validated by `ZSTD_index_overlap_check`, not a window-distance
+/// bound). Note this is the **noDict-family** driver (skip step `((ip-anchor)>>8)
+/// +1`), not the extDict one — C routes dictMatchState through
+/// `ZSTD_compressBlock_lazy_generic`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_lazy_dict_match_state(
+    ctx: &mut LazyCtx,
+    store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    data: &[u8],
+    block_start: usize,
+    block_end: usize,
+    win: &Window,
+    dms: &LazyCtx,
+    content_len: usize,
+) -> usize {
+    let bias = win.seg_bias as usize;
+    let to_pos = |idx: usize| idx - bias;
+    let istart = block_start + bias;
+    let iend = block_end + bias;
+    let i_limit: i64 = iend as i64
+        - 8
+        - if ctx.method == SearchMethod::RowHash {
+            ROW_HASH_CACHE_SIZE as i64
+        } else {
+            0
+        };
+    // window.dictLimit = src start; the dict (= content) ends here too.
+    let prefix_start_index = win.dict_limit; // 2 + content_len
+    let dict_end_pos = content_len; // dmsEnd position
+    let prefix_lowest_pos = content_len; // prefixLowest position (src start)
+    let depth = ctx.depth;
+    let attached = AttachedDict {
+        ms: dms,
+        content_len,
+    };
+
+    let mut ip = istart;
+    let mut anchor = istart;
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    // dictAndPrefixLength = (ip - prefixLowest) + (dictEnd - dictLowest); for a
+    // first block ip == prefixLowest, so this is the dict content length (> 0 by
+    // the caller's gate), and there is no `ip += (… == 0)` bump. No offsetSaved
+    // rescue in dictMatchState mode (C only does it for ZSTD_noDict); the reps
+    // are assumed valid (`offset_1,2 <= dictAndPrefixLength`).
+    let dict_and_prefix_length = (istart - prefix_start_index as usize) + content_len;
+    ip += (dict_and_prefix_length == 0) as usize;
+
+    ctx.lazy_skipping = false;
+    if ctx.method == SearchMethod::RowHash {
+        let from = ctx.next_to_update;
+        row_fill_hash_cache(ctx, data, from, i_limit, bias);
+    }
+
+    while (ip as i64) < i_limit {
+        let mut match_length = 0usize;
+        let mut off_base: u64 = 1; // REPCODE1_TO_OFFBASE
+        let mut start = ip + 1;
+
+        // Check repcode at ip+1 (may reach into the dict).
+        {
+            let rep_index = (ip as u32).wrapping_add(1).wrapping_sub(offset_1);
+            if index_overlap_check(prefix_start_index, rep_index) {
+                let rep_pos = rep_index as usize - bias;
+                if read32(data, rep_pos) == read32(data, to_pos(ip + 1)) {
+                    let rep_end = if rep_index < prefix_start_index {
+                        dict_end_pos
+                    } else {
+                        block_end
+                    };
+                    match_length = count_2segments(
+                        data,
+                        to_pos(ip + 1) + 4,
+                        rep_pos + 4,
+                        block_end,
+                        rep_end,
+                        prefix_lowest_pos,
+                    ) + 4;
+                    if depth == 0 {
+                        store_and_repcodes_dms(
+                            ctx,
+                            store,
+                            data,
+                            &mut ip,
+                            &mut anchor,
+                            start,
+                            match_length,
+                            off_base,
+                            &mut offset_1,
+                            &mut offset_2,
+                            i_limit,
+                            win,
+                            block_end,
+                            content_len,
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // First search (depth 0).
+        {
+            let mut ofb_found: u64 = 999_999_999;
+            let ml2 = search_max(
+                ctx,
+                data,
+                ip,
+                iend,
+                &mut ofb_found,
+                win,
+                false,
+                Some(&attached),
+            );
+            if ml2 > match_length {
+                match_length = ml2;
+                start = ip;
+                off_base = ofb_found;
+            }
+        }
+
+        if match_length < 4 {
+            let step = ((ip - anchor) >> K_SEARCH_STRENGTH) + 1;
+            ip += step;
+            ctx.lazy_skipping = step > K_LAZY_SKIPPING_STEP;
+            continue;
+        }
+
+        // Try to find a better solution.
+        if depth >= 1 {
+            while (ip as i64) < i_limit {
+                ip += 1;
+                // Check repcode.
+                {
+                    let rep_index = (ip as u32).wrapping_sub(offset_1);
+                    if index_overlap_check(prefix_start_index, rep_index) {
+                        let rep_pos = rep_index as usize - bias;
+                        if read32(data, rep_pos) == read32(data, to_pos(ip)) {
+                            let rep_end = if rep_index < prefix_start_index {
+                                dict_end_pos
+                            } else {
+                                block_end
+                            };
+                            let ml_rep = count_2segments(
+                                data,
+                                to_pos(ip) + 4,
+                                rep_pos + 4,
+                                block_end,
+                                rep_end,
+                                prefix_lowest_pos,
+                            ) + 4;
+                            let gain2 = (ml_rep * 3) as i32;
+                            let gain1 =
+                                (match_length * 3) as i32 - highbit32(off_base as u32) as i32 + 1;
+                            if ml_rep >= 4 && gain2 > gain1 {
+                                match_length = ml_rep;
+                                off_base = 1;
+                                start = ip;
+                            }
+                        }
+                    }
+                }
+                // Search match, depth 1.
+                {
+                    let mut ofb_candidate: u64 = 999_999_999;
+                    let ml2 = search_max(
+                        ctx,
+                        data,
+                        ip,
+                        iend,
+                        &mut ofb_candidate,
+                        win,
+                        false,
+                        Some(&attached),
+                    );
+                    let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
+                    let gain1 = (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 4;
+                    if ml2 >= 4 && gain2 > gain1 {
+                        match_length = ml2;
+                        off_base = ofb_candidate;
+                        start = ip;
+                        continue;
+                    }
+                }
+
+                // Let's find an even better one.
+                if depth == 2 && (ip as i64) < i_limit {
+                    ip += 1;
+                    // Check repcode.
+                    {
+                        let rep_index = (ip as u32).wrapping_sub(offset_1);
+                        if index_overlap_check(prefix_start_index, rep_index) {
+                            let rep_pos = rep_index as usize - bias;
+                            if read32(data, rep_pos) == read32(data, to_pos(ip)) {
+                                let rep_end = if rep_index < prefix_start_index {
+                                    dict_end_pos
+                                } else {
+                                    block_end
+                                };
+                                let ml_rep = count_2segments(
+                                    data,
+                                    to_pos(ip) + 4,
+                                    rep_pos + 4,
+                                    block_end,
+                                    rep_end,
+                                    prefix_lowest_pos,
+                                ) + 4;
+                                let gain2 = (ml_rep * 4) as i32;
+                                let gain1 = (match_length * 4) as i32
+                                    - highbit32(off_base as u32) as i32
+                                    + 1;
+                                if ml_rep >= 4 && gain2 > gain1 {
+                                    match_length = ml_rep;
+                                    off_base = 1;
+                                    start = ip;
+                                }
+                            }
+                        }
+                    }
+                    // Search match, depth 2.
+                    {
+                        let mut ofb_candidate: u64 = 999_999_999;
+                        let ml2 = search_max(
+                            ctx,
+                            data,
+                            ip,
+                            iend,
+                            &mut ofb_candidate,
+                            win,
+                            false,
+                            Some(&attached),
+                        );
+                        let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
+                        let gain1 =
+                            (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 7;
+                        if ml2 >= 4 && gain2 > gain1 {
+                            match_length = ml2;
+                            off_base = ofb_candidate;
+                            start = ip;
+                            continue;
+                        }
+                    }
+                }
+                break; // nothing found: store previous solution
+            }
+        }
+
+        // Catch up (real offsets only), reaching into the dict when needed.
+        if off_base > 3 {
+            let offset = (off_base - 3) as usize;
+            let match_index = start - offset; // biased index
+            let in_dict = (match_index as u32) < prefix_start_index;
+            let mut match_pos = match_index - bias; // = to_pos(start) - offset
+            let m_start_pos = if in_dict { 0 } else { prefix_lowest_pos };
+            while start > anchor
+                && match_pos > m_start_pos
+                && data[to_pos(start) - 1] == data[match_pos - 1]
+            {
+                start -= 1;
+                match_pos -= 1;
+                match_length += 1;
+            }
+            offset_2 = offset_1;
+            offset_1 = offset as u32;
+        }
+
+        store_and_repcodes_dms(
+            ctx,
+            store,
+            data,
+            &mut ip,
+            &mut anchor,
+            start,
+            match_length,
+            off_base,
+            &mut offset_1,
+            &mut offset_2,
+            i_limit,
+            win,
+            block_end,
+            content_len,
+        );
+    }
+
+    // Save reps for the next block (offsetSaved stays 0 in dictMatchState mode).
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+
+    to_pos(iend) - to_pos(anchor)
+}
+
+/// `_storeSequence` + the immediate-repcode tail of the dictMatchState driver:
+/// two-segment reads with the dict reached via `dmsIndexDelta == 0`, repcode
+/// validity by `ZSTD_index_overlap_check` (no window-distance bound).
+#[allow(clippy::too_many_arguments)]
+fn store_and_repcodes_dms(
+    ctx: &mut LazyCtx,
+    store: &mut SeqStore,
+    data: &[u8],
+    ip: &mut usize,
+    anchor: &mut usize,
+    start: usize,
+    match_length: usize,
+    off_base: u64,
+    offset_1: &mut u32,
+    offset_2: &mut u32,
+    i_limit: i64,
+    win: &Window,
+    block_end: usize,
+    content_len: usize,
+) {
+    let bias = win.seg_bias as usize;
+    let to_pos = |idx: usize| idx - bias;
+    let prefix_start_index = win.dict_limit;
+    let dict_end_pos = content_len;
+    let prefix_lowest_pos = content_len;
+
+    store.store_seq(
+        &data[to_pos(*anchor)..to_pos(start)],
+        off_base as u32,
+        match_length as u32,
+    );
+    *ip = start + match_length;
+    *anchor = *ip;
+
+    if ctx.lazy_skipping {
+        // Found a match: leave skipping mode and refill the row cache.
+        if ctx.method == SearchMethod::RowHash {
+            let from = ctx.next_to_update;
+            row_fill_hash_cache(ctx, data, from, i_limit, bias);
+        }
+        ctx.lazy_skipping = false;
+    }
+
+    // Check immediate repcode.
+    while (*ip as i64) <= i_limit {
+        let rep_index = (*ip as u32).wrapping_sub(*offset_2);
+        if !index_overlap_check(prefix_start_index, rep_index) {
+            break;
+        }
+        let rep_pos = rep_index as usize - bias;
+        if read32(data, to_pos(*ip)) != read32(data, rep_pos) {
+            break;
+        }
+        let rep_end = if rep_index < prefix_start_index {
+            dict_end_pos
+        } else {
+            block_end
+        };
+        let m_len = count_2segments(
+            data,
+            to_pos(*ip) + 4,
+            rep_pos + 4,
+            block_end,
+            rep_end,
+            prefix_lowest_pos,
         ) + 4;
         std::mem::swap(offset_1, offset_2);
         store.store_seq(&[], 1, m_len as u32);
@@ -1478,7 +2008,7 @@ pub(crate) fn compress_block_lazy_extdict(
         // First search (depth 0).
         {
             let mut ofb_candidate: u64 = 999_999_999;
-            let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true);
+            let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true, None);
             if ml2 > match_length {
                 match_length = ml2;
                 start = ip;
@@ -1531,7 +2061,7 @@ pub(crate) fn compress_block_lazy_extdict(
                 // Search match, depth 1.
                 {
                     let mut ofb_candidate: u64 = 999_999_999;
-                    let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true);
+                    let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true, None);
                     let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
                     let gain1 = (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 4;
                     if ml2 >= 4 && gain2 > gain1 {
@@ -1576,7 +2106,8 @@ pub(crate) fn compress_block_lazy_extdict(
                     // Search match, depth 2.
                     {
                         let mut ofb_candidate: u64 = 999_999_999;
-                        let ml2 = search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true);
+                        let ml2 =
+                            search_max(ctx, data, ip, iend, &mut ofb_candidate, win, true, None);
                         let gain2 = (ml2 * 4) as i32 - highbit32(ofb_candidate as u32) as i32;
                         let gain1 =
                             (match_length * 4) as i32 - highbit32(off_base as u32) as i32 + 7;

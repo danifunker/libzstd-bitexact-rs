@@ -8,7 +8,7 @@
 //! acceleration levels), any input size, no dictionary, no checksum — the
 //! `ZSTD_compress` defaults. [`compress_with_dict`] additionally primes the
 //! match finder from a raw dictionary (`ZSTD_compress_usingDict`, extDict
-//! path), currently limited to the fast strategy. This includes the
+//! path), currently limited to the fast and dfast strategies. This includes the
 //! configurations where C
 //! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
 //! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
@@ -1502,6 +1502,26 @@ impl DfastCtx {
     }
 }
 
+/// `ZSTD_fillDoubleHashTableForCCtx` (dfast, `dtlm_fast`, untagged): seed both
+/// dict tables from `data[0..dict_len]` before compressing `src`. Each step-3
+/// position is inserted into the short table (`chainLog` bits, `mls`) and the
+/// long table (`hashLog` bits, `mls == 8`), as a biased index. With `dtlm_fast`
+/// only the `i == 0` position of each step is loaded, so the loop bound is the
+/// same as the single-hash fill: `ip + 9 < dict_len` (C's `ip + 2 <= dictEnd -
+/// HASH_READ_SIZE`). The caller guarantees `dict_len > HASH_READ_SIZE`.
+fn fill_dfast_hash_tables_for_cctx(ctx: &mut DfastCtx, data: &[u8], dict_len: usize) {
+    let hlog_l = ctx.hlog_l;
+    let hlog_s = ctx.hlog_s;
+    let mls = ctx.mls;
+    let mut ip = 0usize;
+    while ip + 9 < dict_len {
+        let curr = (ip + WINDOW_START_INDEX) as u32;
+        ctx.hash_small[hash_ptr(data, ip, hlog_s, mls)] = curr;
+        ctx.hash_long[hash_ptr(data, ip, hlog_l, 8)] = curr;
+        ip += 3;
+    }
+}
+
 /// `ZSTD_compressBlock_doubleFast` (noDict path). Same conventions as
 /// [`compress_block_fast`]: biased indices, sequences into `store`, returns the
 /// trailing-literals size, and `seg_bias` / `lowest_valid` map positions to
@@ -2681,13 +2701,13 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 /// libzstd 1.5.7 for the supported scope; unsupported configurations return
 /// [`Error::Encode`] rather than diverging.
 ///
-/// Current scope (raw / content-only dictionaries, **fast** strategy): the
-/// dict-aware cParams must resolve to `ZSTD_fast` — true for levels 1-2 and the
-/// negative (acceleration) levels at typical sizes. A trained (`ZDICT`)
-/// dictionary, or any level/size whose cParams select another strategy, returns
-/// a clean `Error::Encode`. An empty `dict` is equivalent to [`compress`]; a
-/// dict shorter than 8 bytes is ignored (as in C), though it still influences
-/// the derived parameters.
+/// Current scope (raw / content-only dictionaries, **fast** and **dfast**
+/// strategies): the dict-aware cParams must resolve to `ZSTD_fast` or
+/// `ZSTD_dfast` — true for the lower levels and the negative (acceleration)
+/// levels at typical sizes. A trained (`ZDICT`) dictionary, or any level/size
+/// whose cParams select another strategy, returns a clean `Error::Encode`. An
+/// empty `dict` is equivalent to [`compress`]; a dict shorter than 8 bytes is
+/// ignored (as in C), though it still influences the derived parameters.
 pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         // Match indices are 32-bit; larger histories need overflow correction.
@@ -2705,9 +2725,9 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     // cParams use the dictionary size, exactly as `ZSTD_compress_usingDict` ->
     // `ZSTD_getParams_internal(level, srcSize, dictSize, cpm_noAttachDict)`.
     let cparams = get_cparams(level, src.len() as u64, dict.len() as u64);
-    if cparams.strategy != Strategy::Fast {
+    if !matches!(cparams.strategy, Strategy::Fast | Strategy::Dfast) {
         return Err(Error::Encode(
-            "dictionary compression currently supports only the fast strategy",
+            "dictionary compression currently supports only the fast and dfast strategies",
         ));
     }
 
@@ -2732,12 +2752,15 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     data.extend_from_slice(dict);
     data.extend_from_slice(src);
 
-    // `ZSTD_fillHashTableForCCtx`. Skipped when `dictSize <= HASH_READ_SIZE`,
-    // where C's `ZSTD_loadDictionaryContent` returns before filling — the
-    // extDict is still live, just with an empty table.
+    // Seed the strategy's dict table(s). Skipped when `dictSize <=
+    // HASH_READ_SIZE`, where C's `ZSTD_loadDictionaryContent` returns before
+    // filling — the extDict is still live, just with empty tables.
     if dict_len > HASH_READ_SIZE {
-        if let Matcher::Fast(ctx) = &mut fc.matcher {
-            fill_fast_hash_table_for_cctx(ctx, &data, dict_len);
+        match &mut fc.matcher {
+            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, dict_len),
+            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, dict_len),
+            // Unreachable: the strategy gate above admits only fast and dfast.
+            _ => {}
         }
     }
     fc.window = Window::preloaded_ext_dict(dict_len, src_len);

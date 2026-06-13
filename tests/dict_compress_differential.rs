@@ -1,16 +1,16 @@
 //! Differential tests for **dictionary compression** (`compress_with_dict`),
-//! Task 2 increment 1: raw (content-only) dictionaries, fast strategy, extDict
-//! path. The oracle is C libzstd 1.5.7's `ZSTD_compress_usingDict` (via the safe
-//! `zstd_safe::CCtx::compress_using_dict` wrapper) — NOT `with_dictionary`,
-//! which is the separate CDict / dictMatchState path that produces different
-//! bytes.
+//! Task 2 increments 1-2: raw (content-only) dictionaries, fast and dfast
+//! strategies, extDict path. The oracle is C libzstd 1.5.7's
+//! `ZSTD_compress_usingDict` (via the safe `zstd_safe::CCtx::compress_using_dict`
+//! wrapper) — NOT `with_dictionary`, which is the separate CDict /
+//! dictMatchState path that produces different bytes.
 //!
 //! For each (dict, payload, level) we resolve the strategy the dict-aware
 //! cParams select (through the doc-hidden `cparams_for_testing` hook):
-//!   * fast strategy  -> `compress_with_dict` must be byte-identical to the C
+//!   * fast or dfast -> `compress_with_dict` must be byte-identical to the C
 //!     oracle, and must round-trip through our own decoder with the dictionary;
 //!   * any other strategy -> `compress_with_dict` must reject cleanly (the
-//!     increment-1 gate), with no divergent output.
+//!     current gate), with no divergent output.
 
 use libzstd_bitexact::{
     DecodeOptions, Dictionary, compress, compress_with_dict, cparams_for_testing,
@@ -81,8 +81,9 @@ fn payloads() -> Vec<Vec<u8>> {
     out
 }
 
-/// `ZSTD_strategy::ZSTD_fast` discriminant — element [6] of `cparams_for_testing`.
+/// `ZSTD_strategy` discriminants — element [6] of `cparams_for_testing`.
 const FAST: u32 = 1;
+const DFAST: u32 = 2;
 
 /// The strategy our (and C's) dict-aware cParams select for a known srcSize.
 fn strategy_of(level: i32, src_len: usize, dict_len: usize) -> u32 {
@@ -100,7 +101,7 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
 }
 
 #[test]
-fn raw_dict_fast_is_bit_exact_and_round_trips_else_rejected() {
+fn raw_dict_fast_and_dfast_are_bit_exact_and_round_trip_else_rejected() {
     let big = raw_dict_content();
     // Dictionary sizes spanning the C boundaries:
     //   < 8  -> dict ignored entirely (still influences cParams);
@@ -117,11 +118,12 @@ fn raw_dict_fast_is_bit_exact_and_round_trips_else_rejected() {
         big[..1024].to_vec(),
         big.clone(),
     ];
-    // Negative + 1/2 resolve to fast at these sizes; 3/9/19 resolve to
-    // dfast/lazy/opt, exercising the increment-1 gate.
+    // Negative + 1/2 resolve to fast and 3 to dfast at these sizes (both
+    // supported); 9/19 resolve to lazy/opt, exercising the gate.
     let levels = [-3, -1, 1, 2, 3, 9, 19];
 
     let mut fast_checks = 0u64;
+    let mut dfast_checks = 0u64;
     let mut gate_checks = 0u64;
     for dict in &dicts {
         for data in payloads() {
@@ -129,10 +131,10 @@ fn raw_dict_fast_is_bit_exact_and_round_trips_else_rejected() {
                 let strat = strategy_of(level, data.len(), dict.len());
                 let ours = compress_with_dict(&data, dict, level);
 
-                if strat == FAST {
+                if strat == FAST || strat == DFAST {
                     let ours = ours.unwrap_or_else(|e| {
                         panic!(
-                            "compress_with_dict errored on fast config (dict={}, src={}, level={level}): {e}",
+                            "compress_with_dict errored on supported config (dict={}, src={}, level={level}): {e}",
                             dict.len(),
                             data.len()
                         )
@@ -164,11 +166,15 @@ fn raw_dict_fast_is_bit_exact_and_round_trips_else_rejected() {
                         dict.len(),
                         data.len()
                     );
-                    fast_checks += 1;
+                    if strat == FAST {
+                        fast_checks += 1;
+                    } else {
+                        dfast_checks += 1;
+                    }
                 } else {
                     assert!(
                         ours.is_err(),
-                        "non-fast strategy {strat} must be gated (dict={}, src={}, level={level})",
+                        "unsupported strategy {strat} must be gated (dict={}, src={}, level={level})",
                         dict.len(),
                         data.len()
                     );
@@ -178,8 +184,8 @@ fn raw_dict_fast_is_bit_exact_and_round_trips_else_rejected() {
         }
     }
     assert!(
-        fast_checks > 0 && gate_checks > 0,
-        "matrix should exercise both the fast path ({fast_checks}) and the gate ({gate_checks})"
+        fast_checks > 0 && dfast_checks > 0 && gate_checks > 0,
+        "matrix must exercise fast ({fast_checks}), dfast ({dfast_checks}), and the gate ({gate_checks})"
     );
 }
 

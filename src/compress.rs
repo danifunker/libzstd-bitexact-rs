@@ -571,8 +571,16 @@ impl Window {
             self.low_limit = self.dict_limit;
             self.dict_limit = self.next_src_idx;
             self.dict_bias = self.seg_bias;
-            // base = ip - distanceFromBase, i.e. buf[start] gets the next index.
-            self.seg_bias = self.next_src_idx - start as u32;
+            // `base = ip - distanceFromBase`, i.e. `buf[start]` gets the next
+            // index. C does this as pointer arithmetic, so `base` may legitimately
+            // point *before* the buffer: a separate window (e.g. the LDM window,
+            // updated over the same `dict ++ src` staging buffer but whose input
+            // must start at `WINDOW_START_INDEX`) yields `seg_bias = 2 - content_len`,
+            // which wraps. The U32 index domain wraps consistently, so the
+            // downstream `pos + seg_bias` recovers the right indices — match
+            // `wrapping_sub`/`wrapping_add` to C rather than tripping the debug
+            // overflow check (release already wraps).
+            self.seg_bias = self.next_src_idx.wrapping_sub(start as u32);
             if self.dict_limit - self.low_limit < HASH_READ_SIZE as u32 {
                 // Too small extDict: forget it.
                 self.low_limit = self.dict_limit;
@@ -580,7 +588,7 @@ impl Window {
             contiguous = false;
         }
         self.next_src_pos = end;
-        self.next_src_idx = self.seg_bias + end as u32;
+        self.next_src_idx = self.seg_bias.wrapping_add(end as u32);
         // If input and dictionary overlap (same buffer), reduce the
         // dictionary to the part not overwritten by the input. Pointer
         // comparisons in C; signed offsets here since the dict bias can

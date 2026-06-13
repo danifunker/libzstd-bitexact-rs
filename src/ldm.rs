@@ -347,7 +347,11 @@ fn generate_sequences_internal(
     };
     let dict_start_pos = lowest_index.wrapping_sub(dict_bias); // extDict only
     let dict_end_pos = dict_limit.wrapping_sub(dict_bias); // extDict only
-    let low_prefix_pos = dict_limit - seg_bias;
+    // `seg_bias` wraps (C's `base = ip - distanceFromBase` pointing before the
+    // buffer) when the LDM window is updated over a `dict ++ src` staging buffer
+    // whose input starts at `WINDOW_START_INDEX` — so this position conversion
+    // must wrap too, exactly like the two siblings above.
+    let low_prefix_pos = dict_limit.wrapping_sub(seg_bias);
     // Input bounds.
     let istart = chunk_start;
     let iend = chunk_end;

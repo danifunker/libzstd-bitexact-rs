@@ -23,14 +23,16 @@ differential-testing every code path against the real libzstd, not by review.
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
 | Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
 | **Compression, bit-exact with C — every level (1–22 and negatives)** | ✅ byte-identical, differential-tested |
-| Streaming compression (`ZSTD_compressStream2` flush/end parity) | ✅ byte-identical; unlimited length at fast levels, up to window+block elsewhere¹ |
+| Streaming compression (`ZSTD_compressStream2` flush/end parity) | ✅ byte-identical; unlimited length at every level¹ |
 | Dictionary compression, multithreaded mode | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ¹ Streams longer than `windowSize + blockSize` turn the C window into an
-*extDict*; the extDict match finder is ported for the fast strategy (levels
-1–2 and negatives at unknown content size), so those stream without length
-limits. The other strategies return a clean error at that point instead of
-diverging — their extDict variants are the next milestone.
+*extDict*; the extDict match finders are ported for all nine strategies, so
+every level streams without length limits (up to C's 3500 MiB
+overflow-correction threshold). The one carve-out: configurations where C
+auto-enables long-distance matching (`strategy >= btopt && windowLog >= 27`
+— level 22 at unknown or > 64 MiB content sizes) return a clean error
+instead of diverging until LDM is ported.
 
 ## Usage
 

@@ -211,9 +211,27 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
       `maxRep` from the block end instead of `ZSTD_getLowestPrefixIndex` at
       the block start, zeroing near-window repcodes C keeps (pinned by a
       mutation-tested crafted regression).
-- [ ] extDict match finders for the remaining strategies (dfast, lazy
-      hash-chain/row, btlazy2, bt-opt), lifting the streaming length limit at
-      every level.
+- [x] extDict match finders for the remaining strategies, lifting the
+      streaming length limit at every level: dfast
+      (`ZSTD_compressBlock_doubleFast_extDict_generic`), the lazy family
+      (`ZSTD_compressBlock_lazy_extDict_generic` over the row, hash-chain
+      and DUBT backends, the latter including dict-side backlog sorting in
+      `ZSTD_insertDUBT1`), and the bt-opt strategies
+      (`ZSTD_insertBtAndGetAllMatches` extDict mode; btultra2's extDict
+      blocks map to the btultra entry point per
+      `ZSTD_selectBlockCompressor`, and its initStats slide now moves the
+      shared window exactly like `ZSTD_initStats_ultra` moves
+      `window.base`). Found and fixed along the way: a missing piece of
+      `ZSTD_buildSeqStore` — the "limited update after a very long match"
+      clamp on `nextToUpdate` — whose absence silently flipped the row
+      updater's gap-skip rule and planted divergent tables (surfaced only
+      megabytes later when a wrapped stream looked the entries up).
+      All gated by per-strategy multi-wrap differential tests in
+      `tests/stream_compress_differential.rs`.
+- [ ] Long-distance matching (LDM, `zstd_ldm.c`): C auto-enables it for
+      `strategy >= btopt && windowLog >= 27` (`ZSTD_resolveEnableLdm`),
+      i.e. level 22 at unknown or > 64 MiB content sizes. Those
+      configurations currently return a clean error instead of diverging.
 - [ ] Index overflow correction (`ZSTD_window_correctOverflow`), lifting the
       3500 MiB total-input cap (one-shot inputs are capped at 4 GiB − 2 by
       32-bit match indices regardless).

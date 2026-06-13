@@ -1896,6 +1896,379 @@ fn fill_dfast_hash_tables_for_cctx(ctx: &mut DfastCtx, data: &[u8], dict_len: us
     }
 }
 
+/// `ZSTD_fillDoubleHashTableForCDict` (dfast, `dtlm_full`, **tagged**): the short
+/// table gets the `i == 0` position of each step; the long table gets `i == 0`
+/// plus the `i == 1, 2` positions when their bucket is still empty. Both tables
+/// are addressed with `+ SHORT_CACHE_TAG_BITS` extra bits and store tagged
+/// indices. Caller sizes them `1 << hlog_l` / `1 << hlog_s`.
+#[allow(clippy::too_many_arguments)]
+fn fill_dfast_hash_tables_for_cdict(
+    hash_long: &mut [u32],
+    hash_small: &mut [u32],
+    data: &[u8],
+    dict_len: usize,
+    hlog_l: u32,
+    hlog_s: u32,
+    mls: u32,
+) {
+    let h_bits_l = hlog_l + SHORT_CACHE_TAG_BITS;
+    let h_bits_s = hlog_s + SHORT_CACHE_TAG_BITS;
+    let mut ip = 0usize;
+    while ip + 9 < dict_len {
+        let curr = (ip + WINDOW_START_INDEX) as u32;
+        for i in 0..3usize {
+            let sm = hash_ptr(data, ip + i, h_bits_s, mls);
+            let lg = hash_ptr(data, ip + i, h_bits_l, 8);
+            if i == 0 {
+                write_tagged_index(hash_small, sm, curr + i as u32);
+            }
+            if i == 0 || hash_long[lg >> SHORT_CACHE_TAG_BITS] == 0 {
+                write_tagged_index(hash_long, lg, curr + i as u32);
+            }
+        }
+        ip += 3;
+    }
+}
+
+/// `ZSTD_fillDoubleHashTableForCCtx` with `dtlm_full` (untagged): the de-tagged
+/// form of a dfast CDict, used by the copy path.
+fn fill_dfast_hash_tables_for_cctx_full(ctx: &mut DfastCtx, data: &[u8], dict_len: usize) {
+    let hlog_l = ctx.hlog_l;
+    let hlog_s = ctx.hlog_s;
+    let mls = ctx.mls;
+    let mut ip = 0usize;
+    while ip + 9 < dict_len {
+        let curr = (ip + WINDOW_START_INDEX) as u32;
+        for i in 0..3usize {
+            let sm = hash_ptr(data, ip + i, hlog_s, mls);
+            let lg = hash_ptr(data, ip + i, hlog_l, 8);
+            if i == 0 {
+                ctx.hash_small[sm] = curr + i as u32;
+            }
+            if i == 0 || ctx.hash_long[lg] == 0 {
+                ctx.hash_long[lg] = curr + i as u32;
+            }
+        }
+        ip += 3;
+    }
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState_generic`: the dfast CDict
+/// **attach** match finder — the working context's own long+short tables plus
+/// the attached CDict's tagged long+short tables, in the `content ++ src` buffer
+/// (`dictIndexDelta == 0`). `data`/`block_start`/`block_end`/`content_len` as in
+/// [`compress_block_fast_dict_match_state`]; `dict_hash_long`/`dict_hash_small`
+/// are the CDict's tagged tables with base logs `dict_hlog_l`/`dict_hlog_s`.
+#[allow(clippy::too_many_arguments)]
+fn compress_block_dfast_dict_match_state(
+    ctx: &mut DfastCtx,
+    store: &mut SeqStore,
+    rep: &mut [u32; 3],
+    data: &[u8],
+    block_start: usize,
+    block_end: usize,
+    content_len: usize,
+    dict_hash_long: &[u32],
+    dict_hash_small: &[u32],
+    dict_hlog_l: u32,
+    dict_hlog_s: u32,
+) -> usize {
+    let bias = WINDOW_START_INDEX;
+    let hlog_l = ctx.hlog_l;
+    let hlog_s = ctx.hlog_s;
+    let mls = ctx.mls;
+    let dict_h_bits_l = dict_hlog_l + SHORT_CACHE_TAG_BITS;
+    let dict_h_bits_s = dict_hlog_s + SHORT_CACHE_TAG_BITS;
+    let tag_mask = (1u32 << SHORT_CACHE_TAG_BITS) - 1;
+
+    let prefix_lowest_index = (bias + content_len) as u32;
+    let dict_start_index = bias as u32;
+    let prefix_start_pos = content_len;
+    let dict_end_pos = content_len;
+    let iend_pos = block_end;
+
+    let iend = block_end + bias;
+    if block_end - block_start < HASH_READ_SIZE {
+        return block_end - block_start;
+    }
+    let ilimit = iend - HASH_READ_SIZE;
+    let istart = block_start + bias;
+    let dict_and_prefix_length = (istart - prefix_lowest_index as usize) + content_len;
+
+    let mut offset_1 = rep[0];
+    let mut offset_2 = rep[1];
+
+    let mut anchor = istart;
+    let mut ip = istart + (dict_and_prefix_length == 0) as usize;
+
+    'outer: while ip < ilimit {
+        let curr = ip as u32;
+        let h2 = hash_ptr(data, ip - bias, hlog_l, 8);
+        let h = hash_ptr(data, ip - bias, hlog_s, mls);
+        let dict_hat_l = hash_ptr(data, ip - bias, dict_h_bits_l, 8);
+        let dict_hat_s = hash_ptr(data, ip - bias, dict_h_bits_s, mls);
+        let dict_idx_tag_l = dict_hash_long[dict_hat_l >> SHORT_CACHE_TAG_BITS];
+        let dict_idx_tag_s = dict_hash_small[dict_hat_s >> SHORT_CACHE_TAG_BITS];
+        let dict_tags_match_l = (dict_idx_tag_l & tag_mask) == (dict_hat_l as u32 & tag_mask);
+        let dict_tags_match_s = (dict_idx_tag_s & tag_mask) == (dict_hat_s as u32 & tag_mask);
+        let match_index_l = ctx.hash_long[h2];
+        let mut match_index_s = ctx.hash_small[h];
+        let rep_index = curr + 1 - offset_1;
+        ctx.hash_long[h2] = curr;
+        ctx.hash_small[h] = curr;
+
+        let m_length: usize;
+
+        if index_overlap_check(prefix_lowest_index, rep_index)
+            && read32(data, rep_index as usize - bias) == read32(data, (ip + 1) - bias)
+        {
+            // repcode
+            let mend = if rep_index < prefix_lowest_index {
+                dict_end_pos
+            } else {
+                iend_pos
+            };
+            m_length = 4 + count_2segments(
+                data,
+                (ip + 1 - bias) + 4,
+                (rep_index as usize - bias) + 4,
+                iend_pos,
+                mend,
+                prefix_start_pos,
+            );
+            ip += 1;
+            store.store_seq(&data[anchor - bias..ip - bias], 1, m_length as u32);
+        } else {
+            // long / short match cascade. The labeled block yields
+            // (offset, matchLength) with `ip` already rewound by the catch-up,
+            // or `continue`s the outer loop when nothing is found.
+            let (offset, ml) = 'found: {
+                // prefix long match
+                if match_index_l >= prefix_lowest_index
+                    && read64(data, match_index_l as usize - bias) == read64(data, ip - bias)
+                {
+                    let mut ml = 8 + count_eq(
+                        data,
+                        (ip - bias) + 8,
+                        (match_index_l as usize - bias) + 8,
+                        iend_pos,
+                    );
+                    let off = curr - match_index_l;
+                    let mut m = match_index_l as usize;
+                    while ip > anchor
+                        && m > prefix_lowest_index as usize
+                        && data[(ip - bias) - 1] == data[(m - bias) - 1]
+                    {
+                        ip -= 1;
+                        m -= 1;
+                        ml += 1;
+                    }
+                    break 'found (off, ml);
+                }
+                // dict long match
+                if dict_tags_match_l {
+                    let dml = dict_idx_tag_l >> SHORT_CACHE_TAG_BITS;
+                    if dml > dict_start_index
+                        && read64(data, dml as usize - bias) == read64(data, ip - bias)
+                    {
+                        let mut ml = 8 + count_2segments(
+                            data,
+                            (ip - bias) + 8,
+                            (dml as usize - bias) + 8,
+                            iend_pos,
+                            dict_end_pos,
+                            prefix_start_pos,
+                        );
+                        let off = curr - dml;
+                        let mut dm = dml as usize;
+                        while ip > anchor
+                            && dm > dict_start_index as usize
+                            && data[(ip - bias) - 1] == data[(dm - bias) - 1]
+                        {
+                            ip -= 1;
+                            dm -= 1;
+                            ml += 1;
+                        }
+                        break 'found (off, ml);
+                    }
+                }
+
+                // short candidate -> search a long match at ip+1; else give up.
+                let short_found = if match_index_s > prefix_lowest_index {
+                    read32(data, match_index_s as usize - bias) == read32(data, ip - bias)
+                } else if dict_tags_match_s {
+                    let dms = dict_idx_tag_s >> SHORT_CACHE_TAG_BITS;
+                    match_index_s = dms;
+                    dms > dict_start_index
+                        && read32(data, dms as usize - bias) == read32(data, ip - bias)
+                } else {
+                    false
+                };
+                if !short_found {
+                    ip += ((ip - anchor) >> K_SEARCH_STRENGTH) + 1;
+                    continue 'outer;
+                }
+
+                // _search_next_long
+                let hl3 = hash_ptr(data, (ip + 1) - bias, hlog_l, 8);
+                let dict_hat_l3 = hash_ptr(data, (ip + 1) - bias, dict_h_bits_l, 8);
+                let match_index_l3 = ctx.hash_long[hl3];
+                let dict_idx_tag_l3 = dict_hash_long[dict_hat_l3 >> SHORT_CACHE_TAG_BITS];
+                let dict_tags_match_l3 =
+                    (dict_idx_tag_l3 & tag_mask) == (dict_hat_l3 as u32 & tag_mask);
+                ctx.hash_long[hl3] = curr + 1;
+
+                // prefix long +1 match
+                if match_index_l3 >= prefix_lowest_index
+                    && read64(data, match_index_l3 as usize - bias) == read64(data, (ip + 1) - bias)
+                {
+                    let mut ml = 8 + count_eq(
+                        data,
+                        (ip + 1 - bias) + 8,
+                        (match_index_l3 as usize - bias) + 8,
+                        iend_pos,
+                    );
+                    ip += 1;
+                    let off = (curr + 1) - match_index_l3;
+                    let mut m = match_index_l3 as usize;
+                    while ip > anchor
+                        && m > prefix_lowest_index as usize
+                        && data[(ip - bias) - 1] == data[(m - bias) - 1]
+                    {
+                        ip -= 1;
+                        m -= 1;
+                        ml += 1;
+                    }
+                    break 'found (off, ml);
+                }
+                // dict long +1 match
+                if dict_tags_match_l3 {
+                    let dml3 = dict_idx_tag_l3 >> SHORT_CACHE_TAG_BITS;
+                    if dml3 > dict_start_index
+                        && read64(data, dml3 as usize - bias) == read64(data, (ip + 1) - bias)
+                    {
+                        let mut ml = 8 + count_2segments(
+                            data,
+                            (ip + 1 - bias) + 8,
+                            (dml3 as usize - bias) + 8,
+                            iend_pos,
+                            dict_end_pos,
+                            prefix_start_pos,
+                        );
+                        ip += 1;
+                        let off = (curr + 1) - dml3;
+                        let mut dm = dml3 as usize;
+                        while ip > anchor
+                            && dm > dict_start_index as usize
+                            && data[(ip - bias) - 1] == data[(dm - bias) - 1]
+                        {
+                            ip -= 1;
+                            dm -= 1;
+                            ml += 1;
+                        }
+                        break 'found (off, ml);
+                    }
+                }
+
+                // No long +1 match: take the short match found earlier.
+                if match_index_s < prefix_lowest_index {
+                    let mut ml = 4 + count_2segments(
+                        data,
+                        (ip - bias) + 4,
+                        (match_index_s as usize - bias) + 4,
+                        iend_pos,
+                        dict_end_pos,
+                        prefix_start_pos,
+                    );
+                    let off = curr - match_index_s;
+                    let mut m = match_index_s as usize;
+                    while ip > anchor
+                        && m > dict_start_index as usize
+                        && data[(ip - bias) - 1] == data[(m - bias) - 1]
+                    {
+                        ip -= 1;
+                        m -= 1;
+                        ml += 1;
+                    }
+                    (off, ml)
+                } else {
+                    let mut ml = 4 + count_eq(
+                        data,
+                        (ip - bias) + 4,
+                        (match_index_s as usize - bias) + 4,
+                        iend_pos,
+                    );
+                    let off = curr - match_index_s;
+                    let mut m = match_index_s as usize;
+                    while ip > anchor
+                        && m > prefix_lowest_index as usize
+                        && data[(ip - bias) - 1] == data[(m - bias) - 1]
+                    {
+                        ip -= 1;
+                        m -= 1;
+                        ml += 1;
+                    }
+                    (off, ml)
+                }
+            };
+
+            // _match_found
+            offset_2 = offset_1;
+            offset_1 = offset;
+            store.store_seq(&data[anchor - bias..ip - bias], offset + 3, ml as u32);
+            m_length = ml;
+        }
+
+        // _match_stored
+        ip += m_length;
+        anchor = ip;
+        if ip <= ilimit {
+            // Complementary insertion (candidates could be > iend-8).
+            let index_to_insert = curr + 2;
+            ctx.hash_long[hash_ptr(data, index_to_insert as usize - bias, hlog_l, 8)] =
+                index_to_insert;
+            ctx.hash_long[hash_ptr(data, (ip - 2) - bias, hlog_l, 8)] = (ip - 2) as u32;
+            ctx.hash_small[hash_ptr(data, index_to_insert as usize - bias, hlog_s, mls)] =
+                index_to_insert;
+            ctx.hash_small[hash_ptr(data, (ip - 1) - bias, hlog_s, mls)] = (ip - 1) as u32;
+
+            while ip <= ilimit {
+                let current2 = ip as u32;
+                let rep_index2 = current2.wrapping_sub(offset_2);
+                if index_overlap_check(prefix_lowest_index, rep_index2)
+                    && read32(data, rep_index2 as usize - bias) == read32(data, ip - bias)
+                {
+                    let rep_end2 = if rep_index2 < prefix_lowest_index {
+                        dict_end_pos
+                    } else {
+                        iend_pos
+                    };
+                    let rep_length2 = 4 + count_2segments(
+                        data,
+                        (ip - bias) + 4,
+                        (rep_index2 as usize - bias) + 4,
+                        iend_pos,
+                        rep_end2,
+                        prefix_start_pos,
+                    );
+                    std::mem::swap(&mut offset_1, &mut offset_2);
+                    store.store_seq(&data[anchor - bias..ip - bias], 1, rep_length2 as u32);
+                    ctx.hash_small[hash_ptr(data, ip - bias, hlog_s, mls)] = current2;
+                    ctx.hash_long[hash_ptr(data, ip - bias, hlog_l, 8)] = current2;
+                    ip += rep_length2;
+                    anchor = ip;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+    iend_pos - (anchor - bias)
+}
+
 /// `ZSTD_compressBlock_doubleFast` (noDict path). Same conventions as
 /// [`compress_block_fast`]: biased indices, sequences into `store`, returns the
 /// trailing-literals size, and `seg_bias` / `lowest_valid` map positions to
@@ -2659,19 +3032,34 @@ pub(crate) struct FrameCompressor {
     /// [`compress_with_dict`].
     dict_id: u32,
     /// `ms->dictMatchState` for the CDict (Path B) *attach* path: the
-    /// dictionary's own tagged match table, consulted by the dictMatchState
+    /// dictionary's own tagged match table(s), consulted by the dictMatchState
     /// match finders. `None` on every other path (no dict, extDict, or copy).
-    dict_match_state: Option<FastDictMatchState>,
+    dict_match_state: Option<DictMatchState>,
 }
 
-/// The dictionary's own (tagged) fast match table referenced by an attached
-/// CDict (`ms->dictMatchState`). Held by [`FrameCompressor`] only on the CDict
-/// attach path; the working context's own table fills as `src` is parsed.
+/// The dictionary's own (tagged) match table(s) referenced by an attached CDict
+/// (`ms->dictMatchState`), per strategy. Held by [`FrameCompressor`] only on the
+/// CDict attach path; the working context's own table(s) fill as `src` is parsed.
+enum DictMatchState {
+    Fast(FastDictMatchState),
+    Dfast(DfastDictMatchState),
+}
+
 struct FastDictMatchState {
     /// Tagged hash table (`ZSTD_writeTaggedIndex`), sized `1 << hlog`.
     hash_table: Vec<u32>,
     hlog: u32,
     /// The dictionary content length (the prefix of the `content ++ src` buffer).
+    content_len: usize,
+}
+
+/// The dfast variant: a long table (`hashLog + 8` bits, mls 8) and a short table
+/// (`chainLog + 8` bits, mls), both tagged.
+struct DfastDictMatchState {
+    hash_long: Vec<u32>,
+    hash_small: Vec<u32>,
+    hlog_l: u32,
+    hlog_s: u32,
     content_len: usize,
 }
 
@@ -2881,7 +3269,7 @@ impl FrameCompressor {
                         // `ZSTD_selectBlockCompressor(strategy, ..,
                         // ZSTD_matchState_dictMode(ms))`: dictMatchState (an
                         // attached CDict) > extDict > noDict.
-                        if let Some(dms) = &self.dict_match_state {
+                        if let Some(DictMatchState::Fast(dms)) = &self.dict_match_state {
                             compress_block_fast_dict_match_state(
                                 ctx,
                                 &mut store,
@@ -2917,7 +3305,21 @@ impl FrameCompressor {
                         }
                     }
                     Matcher::Dfast(ctx) => {
-                        if self.window.has_ext_dict() {
+                        if let Some(DictMatchState::Dfast(dms)) = &self.dict_match_state {
+                            compress_block_dfast_dict_match_state(
+                                ctx,
+                                &mut store,
+                                &mut next_rep,
+                                data,
+                                pos,
+                                pos + block_size,
+                                dms.content_len,
+                                &dms.hash_long,
+                                &dms.hash_small,
+                                dms.hlog_l,
+                                dms.hlog_s,
+                            )
+                        } else if self.window.has_ext_dict() {
                             compress_block_dfast_extdict(
                                 ctx,
                                 &mut store,
@@ -3240,7 +3642,7 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
 /// context either **attaches** the CDict (small inputs ≤ the strategy cutoff) or
 /// **copies** its de-tagged tables (larger inputs).
 ///
-/// Current scope: the fast strategy only; other strategies (and tiny
+/// Current scope: the fast and dfast strategies; other strategies (and tiny
 /// dictionaries) return a clean [`Error::Encode`] until their sub-commits land.
 pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
@@ -3249,9 +3651,9 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
 
     // The CDict's own cParams (`cpm_createCDict`, the *whole* dict buffer size).
     let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
-    if cdict_cparams.strategy != Strategy::Fast {
+    if !matches!(cdict_cparams.strategy, Strategy::Fast | Strategy::Dfast) {
         return Err(Error::Encode(
-            "CDict (Path B) currently supports only the fast strategy",
+            "CDict (Path B) currently supports only the fast and dfast strategies",
         ));
     }
 
@@ -3284,9 +3686,12 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
     }
 
     // `ZSTD_shouldAttachDict`: attach iff srcSize <= the strategy cutoff (fast =
-    // 8 KB), otherwise copy the dictionary's tables into the working context.
-    const FAST_ATTACH_CUTOFF: usize = 8 * 1024;
-    let attach = src_len <= FAST_ATTACH_CUTOFF;
+    // 8 KB, dfast = 16 KB), otherwise copy the dict's tables into the context.
+    let cutoff = match cdict_cparams.strategy {
+        Strategy::Dfast => 16 * 1024,
+        _ => 8 * 1024,
+    };
+    let attach = src_len <= cutoff;
 
     let pledged = Some(src_size);
     let mut data = Vec::with_capacity(content_len + src_len);
@@ -3302,20 +3707,44 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         working.window_log = get_cparams(level, src_size, 0).window_log;
         let mut fc = FrameCompressor::from_cparams(working, pledged, false);
 
-        // Build the CDict's own tagged table over the content.
-        let mut dict_table = vec![0u32; 1usize << cdict_cparams.hash_log];
+        // Build the CDict's own tagged table(s) over the content.
         let mls = cdict_cparams.min_match.clamp(4, 7);
-        fill_fast_hash_table_for_cdict(
-            &mut dict_table,
-            content,
-            content_len,
-            cdict_cparams.hash_log,
-            mls,
-        );
-        fc.dict_match_state = Some(FastDictMatchState {
-            hash_table: dict_table,
-            hlog: cdict_cparams.hash_log,
-            content_len,
+        fc.dict_match_state = Some(match cdict_cparams.strategy {
+            Strategy::Dfast => {
+                let mut hash_long = vec![0u32; 1usize << cdict_cparams.hash_log];
+                let mut hash_small = vec![0u32; 1usize << cdict_cparams.chain_log];
+                fill_dfast_hash_tables_for_cdict(
+                    &mut hash_long,
+                    &mut hash_small,
+                    content,
+                    content_len,
+                    cdict_cparams.hash_log,
+                    cdict_cparams.chain_log,
+                    mls,
+                );
+                DictMatchState::Dfast(DfastDictMatchState {
+                    hash_long,
+                    hash_small,
+                    hlog_l: cdict_cparams.hash_log,
+                    hlog_s: cdict_cparams.chain_log,
+                    content_len,
+                })
+            }
+            _ => {
+                let mut hash_table = vec![0u32; 1usize << cdict_cparams.hash_log];
+                fill_fast_hash_table_for_cdict(
+                    &mut hash_table,
+                    content,
+                    content_len,
+                    cdict_cparams.hash_log,
+                    mls,
+                );
+                DictMatchState::Fast(FastDictMatchState {
+                    hash_table,
+                    hlog: cdict_cparams.hash_log,
+                    content_len,
+                })
+            }
         });
         fc.window = Window::preloaded_attached_dict(content_len, src_len);
         fc.window_preloaded = true;
@@ -3328,8 +3757,10 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         let mut working = cdict_cparams;
         working.window_log = get_cparams(level, src_size, dict.len() as u64).window_log;
         let mut fc = FrameCompressor::from_cparams(working, pledged, false);
-        if let Matcher::Fast(ctx) = &mut fc.matcher {
-            fill_fast_hash_table_for_cctx_full(ctx, &data, content_len);
+        match &mut fc.matcher {
+            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx_full(ctx, &data, content_len),
+            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx_full(ctx, &data, content_len),
+            _ => {}
         }
         fc.window = Window::preloaded_ext_dict(content_len, src_len);
         fc.window_preloaded = true;

@@ -5,11 +5,11 @@
 //! which produces **different bytes** than `ZSTD_compress_usingDict` (Path A,
 //! [`compress_with_dict`]).
 //!
-//! Sub-commit 1 implements the **fast** strategy only. This test targets the
-//! levels whose CDict uses the fast strategy and spans payload sizes on both
-//! sides of the 8 KB attach/copy cutoff, so both the **attach** (small `src`,
-//! dictMatchState matcher) and **copy** (large `src`, de-tagged tables) paths
-//! are exercised, plus a round-trip through our own decoder.
+//! Sub-commits 1-2 implement the **fast** and **dfast** strategies. This test
+//! targets the levels whose CDict uses an implemented strategy and spans payload
+//! sizes on both sides of the attach/copy cutoff, so both the **attach** (small
+//! `src`, dictMatchState matcher) and **copy** (large `src`, de-tagged tables)
+//! paths are exercised, plus a round-trip through our own decoder.
 
 use libzstd_bitexact::{
     DecodeOptions, Dictionary, compress_with_cdict, cparams_create_cdict_for_testing,
@@ -103,20 +103,27 @@ fn oracle(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
 }
 
 const FAST: u32 = 1;
+const DFAST: u32 = 2;
 
-/// The levels whose CDict (for this dict size) uses the fast strategy.
-fn fast_levels(dict_len: usize) -> Vec<i32> {
+/// The levels whose CDict (for this dict size) uses an implemented strategy.
+fn supported_levels(dict_len: usize) -> Vec<i32> {
     (-3..=22)
-        .filter(|&l| cparams_create_cdict_for_testing(l, dict_len as u64)[6] == FAST)
+        .filter(|&l| {
+            matches!(
+                cparams_create_cdict_for_testing(l, dict_len as u64)[6],
+                FAST | DFAST
+            )
+        })
         .collect()
 }
 
 fn check_dict(dict_bytes: &[u8]) {
     let dict_obj = Dictionary::new(dict_bytes).expect("dict parse");
-    let levels = fast_levels(dict_bytes.len());
+    let levels = supported_levels(dict_bytes.len());
+    let mut by_strategy = [0u64; 3];
     assert!(
         !levels.is_empty(),
-        "expected some fast-strategy CDict levels for a {}-byte dict",
+        "expected some fast/dfast-strategy CDict levels for a {}-byte dict",
         dict_bytes.len()
     );
 
@@ -150,6 +157,8 @@ fn check_dict(dict_bytes: &[u8]) {
                 data.len()
             );
 
+            let strat = cparams_create_cdict_for_testing(level, dict_bytes.len() as u64)[6];
+            by_strategy[strat as usize] += 1;
             if data.len() <= 8 * 1024 {
                 attach += 1;
             } else {
@@ -160,6 +169,12 @@ fn check_dict(dict_bytes: &[u8]) {
     assert!(
         attach > 0 && copy > 0,
         "must exercise both attach ({attach}) and copy ({copy}) paths"
+    );
+    assert!(
+        by_strategy[FAST as usize] > 0 && by_strategy[DFAST as usize] > 0,
+        "must exercise both fast ({}) and dfast ({}) strategies",
+        by_strategy[FAST as usize],
+        by_strategy[DFAST as usize]
     );
 }
 

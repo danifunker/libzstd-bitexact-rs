@@ -24,11 +24,10 @@
 //! top levels), the buffer wraps and the previous segment becomes an
 //! *extDict*. All nine strategies' extDict match finders are ported, and
 //! index overflow correction recycles the 32-bit index space past 3500 MiB,
-//! so every level streams without any length limit — except configurations
-//! where C auto-enables long-distance matching (`strategy >= btopt &&
-//! windowLog >= 27`, i.e. level 22 at unknown content size). LDM is ported
-//! ([`crate::ldm`]) but not yet bit-exact on large inputs, so those
-//! configurations report a clean [`Error::Encode`] instead of diverging.
+//! so every level streams without any length limit — including the
+//! configurations where C auto-enables long-distance matching (`strategy >=
+//! btopt && windowLog >= 27`, i.e. level 22 at unknown content size), whose
+//! LDM match finder ([`crate::ldm`]) is bit-exact.
 
 use crate::compress::FrameCompressor;
 use crate::error::Error;

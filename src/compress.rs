@@ -6,10 +6,10 @@
 //!
 //! Current scope: **every compression level** (1-22 and the negative /
 //! acceleration levels), any input size, no dictionary, no checksum — the
-//! `ZSTD_compress` defaults. The one exception: configurations where C
+//! `ZSTD_compress` defaults. This includes the configurations where C
 //! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
-//! 27`, i.e. level 22 beyond 64 MiB) error out until LDM is ported.
-//! All nine strategies are implemented: fast and
+//! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
+//! bit-exact. All nine strategies are implemented: fast and
 //! dfast here, greedy/lazy/lazy2/btlazy2 in [`crate::lazy`], and
 //! btopt/btultra/btultra2 in [`crate::opt`]. Block boundaries follow
 //! `ZSTD_optimalBlockSize` (the 1.5.7 pre-block splitter,
@@ -2190,21 +2190,6 @@ impl FrameCompressor {
         chunk_end: usize,
         last_frame_chunk: bool,
     ) -> Result<(), Error> {
-        // `ZSTD_resolveEnableLdm` (auto): C enables long-distance matching for
-        // `strategy >= btopt && windowLog >= 27` (level 22 at unknown or
-        // > 64 MiB content sizes). The LDM match finder is ported
-        // ([`crate::ldm`]) and wired into the optimal parser, but is not yet
-        // bit-exact — a rare spurious raw-match candidate perturbs the
-        // optimal parse on large inputs — so these configurations return a
-        // clean error rather than diverge. Removing this gate re-activates
-        // the (already wired) LDM. See ROADMAP.md.
-        if self.ldm.is_some() {
-            return Err(Error::Encode(
-                "this configuration enables long-distance matching in C \
-                 (strategy >= btopt and windowLog >= 27); LDM is ported but \
-                 not yet bit-exact",
-            ));
-        }
         let out_start = out.len();
         if self.stage == Stage::Init {
             write_frame_header(out, &self.cparams, self.pledged, self.checksum);

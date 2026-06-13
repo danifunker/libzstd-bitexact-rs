@@ -13,13 +13,16 @@
 //! compressor on the literal stretches — is unreachable without an LDM
 //! parameter API and is not ported.
 //!
-//! **Status: wired but gated.** This matcher reproduces C's raw sequences for
-//! the common case, but on large inputs it occasionally emits one extra
-//! match candidate that C does not (a fingerprint-table / split divergence
-//! under investigation), so the optimal parse diverges. Until that is
-//! bit-exact, [`crate::compress::FrameCompressor`] returns a clean error for
-//! the configurations that would enable LDM rather than emit divergent
-//! output; removing that gate re-activates this module.
+//! **Status: bit-exact.** The raw sequences are byte-identical to
+//! `ZSTD_ldm_generateSequences`, verified against the C oracle at level 22
+//! (unknown-size streaming and one-shot above 64 MiB). The one subtlety that
+//! had to be matched bug-for-bug is in [`GearHash::reset`]: zstd 1.5.7's
+//! `ZSTD_ldm_gear_reset` is a no-op (it computes a fresh rolling hash but is
+//! missing the `state->rolling = hash;` writeback), so the gear hash is never
+//! re-seeded — every block's split scan begins from the
+//! `ZSTD_ldm_gear_init` constant. Re-seeding it (the "obvious" port) silently
+//! shifts each block's first `minMatchLength` splits and manufactures extra
+//! raw matches once the hash table is populated.
 
 use crate::compress::{CParams, Strategy, Window, count_2segments, count_eq};
 use crate::error::Error;
@@ -213,15 +216,29 @@ impl GearHash {
         }
     }
 
-    /// `ZSTD_ldm_gear_reset`: feed `minMatchLength` bytes without registering
-    /// splits.
-    fn reset(&mut self, data: &[u8], at: usize, min_match_length: usize) {
-        let mut hash = self.rolling;
-        for &b in &data[at..at + min_match_length] {
-            hash = (hash << 1).wrapping_add(GEAR_TAB[b as usize]);
-        }
-        self.rolling = hash;
-    }
+    /// `ZSTD_ldm_gear_reset` — **a no-op in zstd 1.5.7, reproduced bug-for-bug.**
+    ///
+    /// The C function reads `state->rolling` into a local, feeds
+    /// `minMatchLength` bytes into that local, then returns *without ever
+    /// writing the result back* — it is missing the `state->rolling = hash;`
+    /// store. So despite its name it never re-seeds the gear hash. Two
+    /// consequences must be matched exactly for bit-exactness:
+    ///
+    /// 1. Each block's `feed` starts from the `ZSTD_ldm_gear_init` value
+    ///    (`0xFFFFFFFF`), *not* from a hash of the block's first
+    ///    `minMatchLength` bytes. The high (`stopMask`) bits of the seed only
+    ///    influence the first `minMatchLength` split decisions of the block
+    ///    before being shifted out, so a wrong seed silently shifts those
+    ///    early splits — harmless on the first block (empty table) but, once
+    ///    the table is populated, it manufactures extra raw matches that
+    ///    perturb the optimal parse megabytes later.
+    /// 2. The overlap-skip "reset" likewise does nothing: the rolling hash
+    ///    simply continues across the skipped region.
+    ///
+    /// Verified against the C oracle (`ZSTD_ldm_generateSequences`): with the
+    /// writeback present our raw sequences diverged at the second block; as a
+    /// no-op they are byte-identical. The call sites are kept for traceability.
+    fn reset(&mut self, _data: &[u8], _at: usize, _min_match_length: usize) {}
 
     /// `ZSTD_ldm_gear_feed`: record up to [`LDM_BATCH_SIZE`] split points in
     /// `data[at..at + size]`; returns the number of bytes processed.

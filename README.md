@@ -29,11 +29,11 @@ differential-testing every code path against the real libzstd, not by review.
 ¹ Streams longer than `windowSize + blockSize` turn the C window into an
 *extDict*; the extDict match finders are ported for all nine strategies, and
 index overflow correction recycles the 32-bit index space past 3500 MiB, so
-every level streams without any length limit. The one carve-out:
-configurations where C auto-enables long-distance matching (`strategy >=
-btopt && windowLog >= 27` — level 22 at unknown or > 64 MiB content sizes)
-return a clean error instead of diverging; LDM is ported but not yet
-bit-exact on large inputs.
+every level streams without any length limit. This includes the configurations
+where C auto-enables long-distance matching (`strategy >= btopt && windowLog
+>= 27` — level 22 at unknown or > 64 MiB content sizes): LDM is ported and
+bit-exact, including a faithful reproduction of zstd 1.5.7's no-op
+`ZSTD_ldm_gear_reset`.
 
 ## Usage
 

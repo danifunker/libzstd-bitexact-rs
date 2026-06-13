@@ -228,18 +228,20 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
       megabytes later when a wrapped stream looked the entries up).
       All gated by per-strategy multi-wrap differential tests in
       `tests/stream_compress_differential.rs`.
-- [~] Long-distance matching (LDM, `zstd_ldm.c`): C auto-enables it for
+- [x] Long-distance matching (LDM, `zstd_ldm.c`): C auto-enables it for
       `strategy >= btopt && windowLog >= 27` (`ZSTD_resolveEnableLdm`),
-      i.e. level 22 at unknown or > 64 MiB content sizes. **Ported and wired**
-      (`src/ldm.rs`: the gear-hash splitter, the XXH64-fingerprint bucket
-      table, `ZSTD_ldm_generateSequences`, and the optimal-parser candidate
-      plumbing `ZSTD_optLdm_*` in `src/opt.rs`) but **not yet bit-exact**: on
-      large inputs the matcher occasionally emits one extra raw-match
-      candidate that C does not (a fingerprint-table / gear-split divergence
-      still under investigation), perturbing the optimal parse. Until that is
-      fixed, those configurations return a clean error rather than diverge
-      (`FrameCompressor::compress_continue`'s `self.ldm.is_some()` gate);
-      removing the gate re-activates the wired LDM.
+      i.e. level 22 at unknown or > 64 MiB content sizes. **Ported and
+      bit-exact** (`src/ldm.rs`: the gear-hash splitter, the XXH64-fingerprint
+      bucket table, `ZSTD_ldm_generateSequences`, and the optimal-parser
+      candidate plumbing `ZSTD_optLdm_*` in `src/opt.rs`). The decisive
+      subtlety: zstd 1.5.7's `ZSTD_ldm_gear_reset` is a no-op (missing the
+      `state->rolling = hash;` writeback), so the gear hash is never re-seeded
+      at a block/skip boundary — every block's split scan starts from the
+      `ZSTD_ldm_gear_init` constant. Re-seeding it shifts each block's first
+      `minMatchLength` splits and fabricates extra raw matches once the table
+      is populated; `GearHash::reset` matches the C no-op bug-for-bug. Verified
+      by `ldm_streams_are_bit_exact` (level-22 unknown-size streaming) and
+      `ldm_one_shot_above_64mib_is_bit_exact` (the > 64 MiB one-shot cliff).
 - [x] Index overflow correction (`ZSTD_window_correctOverflow` +
       `ZSTD_reduceIndex`), run per block from `ZSTD_compress_frameChunk`:
       once the running index reaches `ZSTD_CURRENT_MAX` (3500 MiB) the

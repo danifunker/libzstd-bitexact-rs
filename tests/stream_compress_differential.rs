@@ -9,8 +9,8 @@
 //! extDict match finders are ported (multi-wrap parity covered by
 //! `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy,btlazy2,btopt}_levels`).
 //! Long-distance matching (which C auto-enables for level 22 at unknown
-//! content size) is ported but not yet bit-exact, so those configurations
-//! return a clean error (`ldm_configurations_error_cleanly`).
+//! content size) is bit-exact, covered by `ldm_streams_are_bit_exact` and
+//! `ldm_one_shot_above_64mib_is_bit_exact`.
 
 use libzstd_bitexact::StreamEncoder;
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
@@ -322,10 +322,10 @@ fn chunked_streams_are_bit_exact() {
         }
     }
     // Higher levels: fewer chunk shapes, text only (runtime). Level 22 at
-    // unknown content size enables LDM (windowLog 27) and is gated — see
-    // `ldm_configurations_error_cleanly` — so 21 is the top here.
+    // unknown content size enables long-distance matching (windowLog 27);
+    // its bit-exactness is covered in depth by `ldm_streams_are_bit_exact`.
     for &chunk in &[65_536usize, 131_072] {
-        for level in [13, 17, 19, 21] {
+        for level in [13, 17, 19, 21, 22] {
             assert_stream_bit_exact(
                 level,
                 None,
@@ -992,8 +992,7 @@ fn wrapped_streams_are_bit_exact_at_btopt_levels() {
     // Levels 20-21 never wrap at test-friendly sizes (32/64 MiB windows),
     // but multi-block streaming at unknown content size (btultra2 initStats
     // slide + block scheduling) still needs parity beyond the small chunked
-    // tests. (Level 22 adds LDM on top, which is gated —
-    // `ldm_configurations_error_cleanly`.)
+    // tests. (Level 22 adds LDM on top, covered by `ldm_streams_are_bit_exact`.)
     let big = &text[..5 << 20];
     for level in [20, 21] {
         assert_stream_bit_exact(
@@ -1028,35 +1027,45 @@ fn wrapped_streams_are_bit_exact_at_btopt_levels() {
 
 // --- Long-distance matching (level 22 at unknown content size) ---------------------
 
-/// Level 22 at unknown content size resolves to windowLog 27, and C
+/// Level 22 at unknown content size resolves to windowLog 27, where C
 /// auto-enables long-distance matching (`ZSTD_resolveEnableLdm` fires for
-/// `strategy >= btopt` with `windowLog` at least 27). The LDM match finder is
-/// ported and wired into the optimal parser, but is not yet bit-exact on
-/// large inputs, so these configurations return a clean error rather than
-/// emit divergent output.
+/// `strategy >= btopt` with `windowLog` at least 27). The LDM match finder
+/// ([`crate::ldm`]) generates raw-sequence candidates that the optimal parser
+/// consumes; this output must be byte-identical to C.
+///
+/// The bit-exactness hazard lives across block boundaries: zstd 1.5.7's
+/// `ZSTD_ldm_gear_reset` is a no-op (a missing rolling-hash writeback), so
+/// every block's gear hash is seeded from the same constant and the first
+/// `minMatchLength` splits of a *populated*-table block are where a faithful
+/// port and a "corrected" one diverge. Several blocks of word salad (which
+/// has abundant long-range repeats) exercise exactly that.
 #[test]
-fn ldm_configurations_error_cleanly() {
-    // Unknown content size at level 22 resolves to windowLog 27 → LDM on.
-    let data = word_salad(0x1D31, 200_000);
-    let mut enc = StreamEncoder::new(22);
-    let mut out = Vec::new();
-    let err = (|| -> Result<(), libzstd_bitexact::Error> {
-        enc.compress(&data, &mut out)?;
-        enc.flush(&mut out)?;
-        Ok(())
-    })()
-    .expect_err("LDM-enabled configurations must error until LDM is bit-exact");
-    assert!(
-        format!("{err}").contains("long-distance"),
-        "unexpected error: {err}"
+#[cfg_attr(debug_assertions, ignore = "level 22 + LDM; runs in release (CI gate)")]
+fn ldm_streams_are_bit_exact() {
+    let text = word_salad(0x1D40, 4 << 20);
+    for &chunk in &[65_536usize, 131_072, 200_000] {
+        assert_stream_bit_exact(22, None, false, &chunked(&text, chunk), b"", "ldm-stream");
+    }
+    // Whole input in a single push, and trailing data carried on the finish.
+    assert_stream_bit_exact(22, None, false, &[Step::Push(&text)], b"", "ldm-one-push");
+    let (head, tail) = text.split_at(2 << 20);
+    assert_stream_bit_exact(
+        22,
+        None,
+        false,
+        &chunked(head, 300_000),
+        tail,
+        "ldm-finish-tail",
     );
 
-    // One-shot above 64 MiB also enables LDM (known srcSize → windowLog 27).
-    let big = vec![0u8; (64 << 20) + 1];
-    assert!(
-        libzstd_bitexact::compress(&big, 22).is_err(),
-        "one-shot > 64 MiB at level 22 must error (LDM)"
-    );
+    // A second seed, with a mid-stream flush forcing an unaligned block start.
+    let other = word_salad(0x1D31, 2 << 20);
+    let mut steps = Vec::new();
+    for c in other.chunks(300_000) {
+        steps.push(Step::Push(c));
+        steps.push(Step::Flush);
+    }
+    assert_stream_bit_exact(22, None, false, &steps, b"", "ldm-flush");
 
     // A small *pledged* size at level 22 keeps windowLog below 27: no LDM,
     // still bit-exact (also covered throughout the one-shot suites).
@@ -1069,6 +1078,29 @@ fn ldm_configurations_error_cleanly() {
         b"",
         "level22-small-pledge",
     );
+}
+
+/// The one-shot LDM enable cliff: a *known* content size above 64 MiB also
+/// resolves to windowLog 27 and enables LDM (the configuration that, before
+/// LDM was bit-exact, returned a clean error). Heavy — compresses 64 MiB+ at
+/// the slowest level — so it runs only when explicitly requested.
+#[test]
+#[ignore = "compresses 64 MiB+ at level 22 to exercise the one-shot LDM cliff; minutes-long"]
+fn ldm_one_shot_above_64mib_is_bit_exact() {
+    let data = word_salad(0x1D40, (64 << 20) + 1);
+    let ours = libzstd_bitexact::compress(&data, 22).expect("LDM one-shot must succeed");
+    let theirs = zstd::bulk::compress(&data, 22).expect("C one-shot oracle");
+    assert_eq!(
+        ours.len(),
+        theirs.len(),
+        "one-shot > 64 MiB at level 22 (LDM): length differs"
+    );
+    assert!(
+        ours == theirs,
+        "one-shot > 64 MiB at level 22 (LDM): not bit-exact"
+    );
+    let back = libzstd_bitexact::decompress(&ours).expect("round-trip");
+    assert_eq!(back, data, "round-trip mismatch");
 }
 
 // --- Index overflow correction (> 3500 MiB streams) --------------------------------

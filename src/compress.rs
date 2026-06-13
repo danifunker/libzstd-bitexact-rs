@@ -6,7 +6,10 @@
 //!
 //! Current scope: **every compression level** (1-22 and the negative /
 //! acceleration levels), any input size, no dictionary, no checksum — the
-//! `ZSTD_compress` defaults. This includes the configurations where C
+//! `ZSTD_compress` defaults. [`compress_with_dict`] additionally primes the
+//! match finder from a raw dictionary (`ZSTD_compress_usingDict`, extDict
+//! path), currently limited to the fast strategy. This includes the
+//! configurations where C
 //! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
 //! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
 //! bit-exact. All nine strategies are implemented: fast and
@@ -35,6 +38,9 @@ const WINDOWLOG_MAX: u32 = 31;
 /// `ZSTD_CONTENTSIZE_UNKNOWN`: the source size is not known in advance.
 const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+/// `ZSTD_MAGIC_DICTIONARY`: a dictionary of at least 8 bytes beginning with
+/// this magic is a trained (ZDICT) dictionary rather than raw content.
+const MAGIC_DICTIONARY: u32 = 0xEC30_A437;
 
 // --- Compression parameters --------------------------------------------------
 
@@ -409,6 +415,27 @@ impl Window {
         }
     }
 
+    /// The window state `ZSTD_compress_usingDict` reaches just before
+    /// compressing `src`: the dictionary has been loaded (a contiguous first
+    /// chunk) and the separately-buffered `src` appended non-contiguously, so
+    /// the dict became the extDict. We model the two C buffers as one
+    /// concatenated `dict ++ src`, so both segments share `pos = index -
+    /// ZSTD_WINDOW_START_INDEX` and `seg_bias == dict_bias == 2`:
+    /// `dict` is indices `[2, 2+dict_len)` (the extDict), `src` is
+    /// `[2+dict_len, 2+dict_len+src_len)` (the current segment). `nextSrc`
+    /// points one past `src`, so a later contiguous append would extend it.
+    pub(crate) fn preloaded_ext_dict(dict_len: usize, src_len: usize) -> Self {
+        let start = WINDOW_START_INDEX as u32;
+        Window {
+            seg_bias: start,
+            dict_bias: start,
+            low_limit: start,
+            dict_limit: start + dict_len as u32,
+            next_src_pos: dict_len + src_len,
+            next_src_idx: start + (dict_len + src_len) as u32,
+        }
+    }
+
     /// `ZSTD_window_update`: register `buf[start..end]` as the next chunk.
     /// Returns whether it was contiguous with the previous one; if not, the
     /// current prefix becomes the extDict. Also shrinks the extDict when the
@@ -604,6 +631,28 @@ impl FastCtx {
     /// `ZSTD_reduceIndex` for the fast strategy: only the hash table.
     fn reduce_indices(&mut self, correction: u32) {
         reduce_table(&mut self.hash_table, correction, false);
+    }
+}
+
+/// `ZSTD_fillHashTableForCCtx` (fast strategy, `dtlm_fast`, untagged): seed the
+/// hash table from the dictionary content laid out at `data[0..dict_len]`,
+/// before compressing `src`. Each inserted entry is a *biased* index
+/// (`pos + ZSTD_WINDOW_START_INDEX`), matching how the matcher stores and reads
+/// positions, so the dict entries are found as extDict candidates.
+///
+/// `nextToUpdate` starts at dict position 0; C's loop `ip + 3 < iend + 2` with
+/// `iend = dictEnd - HASH_READ_SIZE` is, in buffer positions, `ip + 9 <
+/// dict_len`. The caller guarantees `dict_len > HASH_READ_SIZE` (otherwise C's
+/// `ZSTD_loadDictionaryContent` returns before the fill, leaving an empty
+/// table).
+fn fill_fast_hash_table_for_cctx(ctx: &mut FastCtx, data: &[u8], dict_len: usize) {
+    let hlog = ctx.hlog;
+    let mls = ctx.mls;
+    let mut ip = 0usize;
+    while ip + 9 < dict_len {
+        let h = hash_ptr(data, ip, hlog, mls);
+        ctx.hash_table[h] = (ip + WINDOW_START_INDEX) as u32;
+        ip += 3;
     }
 }
 
@@ -2186,6 +2235,11 @@ pub(crate) struct FrameCompressor {
     /// long-distance matching on: `strategy >= btopt && windowLog >= 27`,
     /// i.e. level 22 at unknown or > 64 MiB content sizes.
     ldm: Option<crate::ldm::LdmState>,
+    /// Set by `compress_with_dict`: the window has been arranged directly in
+    /// the post-flip extDict state, so the first `compress_continue` must NOT
+    /// run `ZSTD_window_update` (which would recompute the wrong segment
+    /// boundary for the concatenated `dict ++ src` buffer). One-shot only.
+    window_preloaded: bool,
 }
 
 impl FrameCompressor {
@@ -2194,6 +2248,14 @@ impl FrameCompressor {
         // the window resize (`ZSTD_getCParamRowSize` returns
         // ZSTD_CONTENTSIZE_UNKNOWN for unknown srcSize without a dictionary).
         let cparams = get_cparams(level, pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0);
+        Self::from_cparams(cparams, pledged, checksum)
+    }
+
+    /// Build a frame compressor from already-derived compression parameters.
+    /// `ZSTD_compress` reaches this through [`new`](Self::new) (no-dict
+    /// cParams); `compress_with_dict` derives dict-aware cParams and calls it
+    /// directly.
+    pub(crate) fn from_cparams(cparams: CParams, pledged: Option<u64>, checksum: bool) -> Self {
         let window_size_u64 = match pledged {
             Some(n) => (1u64 << cparams.window_log).min(n).max(1),
             None => 1u64 << cparams.window_log,
@@ -2231,6 +2293,7 @@ impl FrameCompressor {
             disable_literal_compression,
             window: Window::new(),
             ldm: crate::ldm::LdmParams::auto(&cparams).map(crate::ldm::LdmState::new),
+            window_preloaded: false,
         }
     }
 
@@ -2270,7 +2333,14 @@ impl FrameCompressor {
 
         // `ZSTD_window_update`: a non-contiguous chunk (the streaming input
         // buffer wrapped) turns the live window into the extDict.
-        if !self.window.update(chunk_start, chunk_end) {
+        //
+        // `compress_with_dict` pre-arranges the window in the post-flip extDict
+        // state for the first (and, one-shot, only) chunk, so the first update
+        // is skipped: running it on the concatenated `dict ++ src` buffer would
+        // see `src` as contiguous with `dict` and miss the flip.
+        if self.window_preloaded {
+            self.window_preloaded = false;
+        } else if !self.window.update(chunk_start, chunk_end) {
             // `ZSTD_compressContinue_internal`: a non-contiguous update
             // restarts table insertion at the new segment
             // (`ms->nextToUpdate = ms->window.dictLimit`).
@@ -2603,6 +2673,78 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     let mut fc = FrameCompressor::new(level, Some(src.len() as u64), false);
     let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
     fc.compress_end(&mut out, src, 0, src.len())?;
+    Ok(out)
+}
+
+/// `ZSTD_compress_usingDict`: one-shot frame compression primed with a
+/// dictionary, so the start of `src` can reference `dict`. Bit-exact with C
+/// libzstd 1.5.7 for the supported scope; unsupported configurations return
+/// [`Error::Encode`] rather than diverging.
+///
+/// Current scope (raw / content-only dictionaries, **fast** strategy): the
+/// dict-aware cParams must resolve to `ZSTD_fast` — true for levels 1-2 and the
+/// negative (acceleration) levels at typical sizes. A trained (`ZDICT`)
+/// dictionary, or any level/size whose cParams select another strategy, returns
+/// a clean `Error::Encode`. An empty `dict` is equivalent to [`compress`]; a
+/// dict shorter than 8 bytes is ignored (as in C), though it still influences
+/// the derived parameters.
+pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
+    if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
+        // Match indices are 32-bit; larger histories need overflow correction.
+        return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
+    }
+    // `ZSTD_compress_insertDictionary`: a dictionary of >= 8 bytes that starts
+    // with the dictionary magic is a trained (ZDICT) dict, whose entropy/rep
+    // seeding is not ported yet. (A dict < 8 bytes is ignored entirely, below.)
+    if dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY {
+        return Err(Error::Encode(
+            "trained (ZDICT) dictionaries are not supported yet",
+        ));
+    }
+
+    // cParams use the dictionary size, exactly as `ZSTD_compress_usingDict` ->
+    // `ZSTD_getParams_internal(level, srcSize, dictSize, cpm_noAttachDict)`.
+    let cparams = get_cparams(level, src.len() as u64, dict.len() as u64);
+    if cparams.strategy != Strategy::Fast {
+        return Err(Error::Encode(
+            "dictionary compression currently supports only the fast strategy",
+        ));
+    }
+
+    let pledged = Some(src.len() as u64);
+    let mut fc = FrameCompressor::from_cparams(cparams, pledged, false);
+
+    // `ZSTD_compress_insertDictionary` ignores a dict shorter than 8 bytes
+    // entirely (the cParams above still reflect its size); compress `src` as a
+    // plain frame.
+    if dict.len() < 8 {
+        let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
+        fc.compress_end(&mut out, src, 0, src.len())?;
+        return Ok(out);
+    }
+
+    // `ZSTD_loadDictionaryContent` followed by the non-contiguous `src` append:
+    // lay the history out as one buffer `dict ++ src` and put the window
+    // directly in the post-flip extDict state.
+    let dict_len = dict.len();
+    let src_len = src.len();
+    let mut data = Vec::with_capacity(dict_len + src_len);
+    data.extend_from_slice(dict);
+    data.extend_from_slice(src);
+
+    // `ZSTD_fillHashTableForCCtx`. Skipped when `dictSize <= HASH_READ_SIZE`,
+    // where C's `ZSTD_loadDictionaryContent` returns before filling — the
+    // extDict is still live, just with an empty table.
+    if dict_len > HASH_READ_SIZE {
+        if let Matcher::Fast(ctx) = &mut fc.matcher {
+            fill_fast_hash_table_for_cctx(ctx, &data, dict_len);
+        }
+    }
+    fc.window = Window::preloaded_ext_dict(dict_len, src_len);
+    fc.window_preloaded = true;
+
+    let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
+    fc.compress_end(&mut out, &data, dict_len, dict_len + src_len)?;
     Ok(out)
 }
 

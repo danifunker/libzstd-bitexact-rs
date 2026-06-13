@@ -27,12 +27,13 @@ differential-testing every code path against the real libzstd, not by review.
 | Dictionary compression, multithreaded mode | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
 
 ¹ Streams longer than `windowSize + blockSize` turn the C window into an
-*extDict*; the extDict match finders are ported for all nine strategies, so
-every level streams without length limits (up to C's 3500 MiB
-overflow-correction threshold). The one carve-out: configurations where C
-auto-enables long-distance matching (`strategy >= btopt && windowLog >= 27`
-— level 22 at unknown or > 64 MiB content sizes) return a clean error
-instead of diverging until LDM is ported.
+*extDict*; the extDict match finders are ported for all nine strategies, and
+index overflow correction recycles the 32-bit index space past 3500 MiB, so
+every level streams without any length limit. The one carve-out:
+configurations where C auto-enables long-distance matching (`strategy >=
+btopt && windowLog >= 27` — level 22 at unknown or > 64 MiB content sizes)
+return a clean error instead of diverging; LDM is ported but not yet
+bit-exact on large inputs.
 
 ## Usage
 

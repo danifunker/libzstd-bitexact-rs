@@ -168,6 +168,19 @@ impl LazyCtx {
             self.next_to_update = curr - 192.min(curr - self.next_to_update - 384);
         }
     }
+
+    /// `ZSTD_reduceIndex` for the lazy family: the hash table always, plus the
+    /// chain/BT table when one is allocated (hash-chain and binary-tree
+    /// backends, not the row finder). btlazy2's BT preserves the unsorted
+    /// mark. `nextToUpdate` shifts with the indices.
+    pub(crate) fn reduce_indices(&mut self, correction: u32) {
+        crate::compress::reduce_table(&mut self.hash_table, correction, false);
+        if self.method != SearchMethod::RowHash {
+            let preserve_mark = self.method == SearchMethod::BinaryTree;
+            crate::compress::reduce_table(&mut self.chain_table, correction, preserve_mark);
+        }
+        self.next_to_update = self.next_to_update.saturating_sub(correction as usize);
+    }
 }
 
 // --- Hash-chain search -------------------------------------------------------

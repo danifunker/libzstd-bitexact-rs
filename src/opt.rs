@@ -177,6 +177,18 @@ impl OptCtx {
         }
     }
 
+    /// `ZSTD_reduceIndex` for the bt-opt strategies: the hash table, the
+    /// binary tree (no unsorted mark — that is btlazy2's), and the 3-byte
+    /// hash table when present. `nextToUpdate` shifts with the indices.
+    pub(crate) fn reduce_indices(&mut self, correction: u32) {
+        crate::compress::reduce_table(&mut self.hash_table, correction, false);
+        crate::compress::reduce_table(&mut self.bt, correction, false);
+        if self.hash_log3 > 0 {
+            crate::compress::reduce_table(&mut self.hash3, correction, false);
+        }
+        self.next_to_update = self.next_to_update.saturating_sub(correction as usize);
+    }
+
     pub(crate) fn new(cparams: &CParams) -> Self {
         let mls = cparams.min_match.clamp(3, 6);
         let hash_log3 = if mls == 3 {

@@ -417,6 +417,59 @@ impl Window {
         self.low_limit = self.dict_limit;
         self.next_src_idx += src_size as u32;
     }
+
+    /// `ZSTD_window_needOverflowCorrection`: the running index reached
+    /// `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit), so the 32-bit index space must
+    /// be recycled. `block_end_pos` is the block end as a buffer position;
+    /// its index is `block_end_pos + seg_bias`.
+    pub(crate) fn needs_overflow_correction(&self, block_end_pos: usize) -> bool {
+        const CURRENT_MAX: u32 = 3500 * (1 << 20);
+        (block_end_pos as u32).wrapping_add(self.seg_bias) > CURRENT_MAX
+    }
+
+    /// `ZSTD_window_correctOverflow`: reduce every index by the returned
+    /// `correction` so the window's high index drops back to roughly
+    /// `maxDist`, keeping the low `cycleLog` bits unchanged (the chains and
+    /// binary trees index modulo a power of two). The caller must apply the
+    /// same `correction` to every stored table index. `block_start_pos` is
+    /// the block start as a buffer position (`src` in C).
+    pub(crate) fn correct_overflow(
+        &mut self,
+        cycle_log: u32,
+        max_dist: u32,
+        block_start_pos: usize,
+    ) -> u32 {
+        let cycle_size = 1u32 << cycle_log;
+        let cycle_mask = cycle_size - 1;
+        let curr = block_start_pos as u32 + self.seg_bias;
+        let current_cycle = curr & cycle_mask;
+        // Ensure newCurrent - maxDist >= ZSTD_WINDOW_START_INDEX.
+        let current_cycle_correction = if current_cycle < WINDOW_START_INDEX as u32 {
+            cycle_size.max(WINDOW_START_INDEX as u32)
+        } else {
+            0
+        };
+        let new_current = current_cycle + current_cycle_correction + max_dist.max(cycle_size);
+        let correction = curr - new_current;
+
+        // `base += correction` (indices drop by `correction`) becomes
+        // `seg_bias -= correction` here; the dict segment moves in lockstep.
+        self.seg_bias -= correction;
+        self.dict_bias -= correction;
+        self.next_src_idx -= correction;
+        let floor = correction + WINDOW_START_INDEX as u32;
+        self.low_limit = if self.low_limit < floor {
+            WINDOW_START_INDEX as u32
+        } else {
+            self.low_limit - correction
+        };
+        self.dict_limit = if self.dict_limit < floor {
+            WINDOW_START_INDEX as u32
+        } else {
+            self.dict_limit - correction
+        };
+        correction
+    }
 }
 
 /// `ZSTD_count_2segments`: count the match length when `match` lives in the
@@ -436,6 +489,24 @@ pub(crate) fn count_2segments(
         return match_length;
     }
     match_length + count_eq(buf, ip + match_length, istart, iend)
+}
+
+/// `ZSTD_reduceTable_internal`: subtract `correction` from every stored index
+/// after an overflow correction, squashing anything below the reserved
+/// `WINDOW_START_INDEX` floor to 0 (an empty slot). `preserve_mark` keeps the
+/// btlazy2 `DUBT_UNSORTED_MARK` (value 1) untouched.
+pub(crate) fn reduce_table(table: &mut [u32], correction: u32, preserve_mark: bool) {
+    const DUBT_UNSORTED_MARK: u32 = 1;
+    let threshold = correction + WINDOW_START_INDEX as u32;
+    for v in table.iter_mut() {
+        if preserve_mark && *v == DUBT_UNSORTED_MARK {
+            // keep the sort sentinel
+        } else if *v < threshold {
+            *v = 0;
+        } else {
+            *v -= correction;
+        }
+    }
 }
 
 // --- The ZSTD_fast match finder ---------------------------------------------------
@@ -461,6 +532,11 @@ impl FastCtx {
             mls: cparams.min_match.clamp(4, 7),
             window_log: cparams.window_log,
         }
+    }
+
+    /// `ZSTD_reduceIndex` for the fast strategy: only the hash table.
+    fn reduce_indices(&mut self, correction: u32) {
+        reduce_table(&mut self.hash_table, correction, false);
     }
 }
 
@@ -1302,6 +1378,12 @@ impl DfastCtx {
             window_log: cparams.window_log,
         }
     }
+
+    /// `ZSTD_reduceIndex` for dfast: the long (hash) and short (chain) tables.
+    fn reduce_indices(&mut self, correction: u32) {
+        reduce_table(&mut self.hash_long, correction, false);
+        reduce_table(&mut self.hash_small, correction, false);
+    }
 }
 
 /// `ZSTD_compressBlock_doubleFast` (noDict path). Same conventions as
@@ -2134,15 +2216,6 @@ impl FrameCompressor {
             return Ok(());
         }
 
-        // Beyond ZSTD_CURRENT_MAX (3500 MiB of total index space) the C
-        // encoder starts running overflow correction, which is not ported.
-        const CURRENT_MAX: u64 = 3500 * (1 << 20);
-        if u64::from(self.window.next_src_idx) + (chunk_end - chunk_start) as u64 > CURRENT_MAX {
-            return Err(Error::Encode(
-                "total input beyond 3500 MiB needs index overflow correction, \
-                 which is not implemented yet",
-            ));
-        }
         // `ZSTD_window_update`: a non-contiguous chunk (the streaming input
         // buffer wrapped) turns the live window into the extDict.
         if !self.window.update(chunk_start, chunk_end) {
@@ -2184,14 +2257,43 @@ impl FrameCompressor {
             let last_block = last_frame_chunk && block_size == remaining;
             let block = &data[pos..pos + block_size];
 
+            // `ZSTD_overflowCorrectIfNeeded`: once the running index reaches
+            // 3500 MiB, recycle the 32-bit index space — slide the window and
+            // subtract the same `correction` from every matcher table. Runs
+            // before enforceMaxDist, exactly as `ZSTD_compress_frameChunk`
+            // does. Lifts the streaming length limit entirely.
+            let max_dist = 1u32 << cparams.window_log;
+            if self.window.needs_overflow_correction(pos + block_size) {
+                let cycle_log = cycle_log(cparams.chain_log, cparams.strategy);
+                let correction = self.window.correct_overflow(cycle_log, max_dist, pos);
+                match &mut self.matcher {
+                    Matcher::Fast(ctx) => ctx.reduce_indices(correction),
+                    Matcher::Dfast(ctx) => ctx.reduce_indices(correction),
+                    Matcher::Lazy(ctx) => ctx.reduce_indices(correction),
+                    Matcher::Opt(ctx) => ctx.reduce_indices(correction),
+                }
+            }
+
             // `ZSTD_window_enforceMaxDist` runs before every block, anchored
             // at the *block start* (`ip`, not `ip + blockSize` — that one
             // only feeds `ZSTD_checkDictValidity`); the dict mode below
             // (extDict vs noDict) is decided on the result. The matchers
             // tighten their own validity bound from the block end.
             let block_start_idx = pos as u32 + self.window.seg_bias;
-            self.window
-                .enforce_max_dist(block_start_idx, 1u32 << cparams.window_log);
+            self.window.enforce_max_dist(block_start_idx, max_dist);
+
+            // `Ensure hash/chain table insertion resumes no sooner than
+            // lowLimit` (`ZSTD_compress_frameChunk`): after a slide or an
+            // overflow correction, nextToUpdate may trail the new lowLimit.
+            match &mut self.matcher {
+                Matcher::Lazy(ctx) => {
+                    ctx.next_to_update = ctx.next_to_update.max(self.window.low_limit as usize)
+                }
+                Matcher::Opt(ctx) => {
+                    ctx.next_to_update = ctx.next_to_update.max(self.window.low_limit as usize)
+                }
+                _ => {}
+            }
 
             // --- ZSTD_compressBlock_internal ---
             let mut c_size_kind: BlockKind;

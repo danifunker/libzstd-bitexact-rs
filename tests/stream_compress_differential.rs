@@ -1070,3 +1070,89 @@ fn ldm_configurations_error_cleanly() {
         "level22-small-pledge",
     );
 }
+
+// --- Index overflow correction (> 3500 MiB streams) --------------------------------
+
+/// Once the running index reaches `ZSTD_CURRENT_MAX` (3500 MiB), C recycles
+/// the 32-bit index space (`ZSTD_window_correctOverflow` + `ZSTD_reduceIndex`).
+/// Streaming past that point must stay byte-identical. This drives ~3.7 GiB
+/// of repeating word-salad through both encoders at level 1 (fast strategy,
+/// 512 KiB window) — generated on the fly so it never lives in RAM all at
+/// once — and compares the full compressed output. Heavy: minutes-long, runs
+/// only when explicitly requested.
+#[test]
+#[ignore = "streams 3.7 GiB to cross the 3500 MiB overflow-correction threshold; minutes-long"]
+fn overflow_correction_streams_are_bit_exact() {
+    use zstd_sys::ZSTD_EndDirective as Dir;
+
+    let level = 1;
+    // A 256 KiB unit (< the level-1 512 KiB window) so the repeats produce
+    // in-window matches that populate — and, across the overflow boundary,
+    // must be reduced in — the hash table.
+    let unit = word_salad(0xABCD, 256 * 1024);
+    let total: u64 = 3700 * (1 << 20); // 3.7 GiB > 3500 MiB
+
+    // C oracle, driven directly so the input is never fully materialized.
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    let mut their_out = Vec::new();
+    let mut scratch = vec![0u8; 1 << 20];
+    let mut enc = StreamEncoder::new(level);
+    let mut our_out = Vec::new();
+
+    let mut fed: u64 = 0;
+    let mut k = 0usize;
+    while fed < total {
+        // One unit per step (256 KiB), cycling the seed slightly so it is not
+        // pure RLE but still highly compressible.
+        let chunk = &unit[..];
+        let mut inb = InBuffer::around(chunk);
+        loop {
+            let mut outb = OutBuffer::around(&mut scratch[..]);
+            cctx.compress_stream2(&mut outb, &mut inb, Dir::ZSTD_e_continue)
+                .map_err(map_code)
+                .unwrap();
+            let p = outb.pos();
+            their_out.extend_from_slice(&scratch[..p]);
+            if inb.pos >= chunk.len() {
+                break;
+            }
+        }
+        enc.compress(chunk, &mut our_out).unwrap();
+        // Keep the comparison incremental so divergence is caught early and
+        // the buffers do not grow without bound on a mismatch.
+        let n = our_out.len().min(their_out.len());
+        assert_eq!(
+            our_out[..n],
+            their_out[..n],
+            "overflow-correction stream diverged after {fed} bytes (step {k})"
+        );
+        fed += chunk.len() as u64;
+        k += 1;
+    }
+    // Flush the frame end on both sides and compare the remainder.
+    loop {
+        let mut inb = InBuffer::around(&[][..]);
+        let mut outb = OutBuffer::around(&mut scratch[..]);
+        let hint = cctx
+            .compress_stream2(&mut outb, &mut inb, Dir::ZSTD_e_end)
+            .map_err(map_code)
+            .unwrap();
+        let p = outb.pos();
+        their_out.extend_from_slice(&scratch[..p]);
+        if hint == 0 {
+            break;
+        }
+    }
+    enc.finish(b"", &mut our_out).unwrap();
+    assert_eq!(
+        our_out, their_out,
+        "overflow-correction frame not bit-exact"
+    );
+    eprintln!(
+        "overflow correction OK: {} MiB in -> {} bytes out",
+        total >> 20,
+        our_out.len()
+    );
+}

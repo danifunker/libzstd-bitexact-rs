@@ -22,11 +22,11 @@
 //! Current scope: when the staged stream outgrows the input buffer
 //! (`windowSize + blockSize` bytes — 640 KiB at level 1 up to 64 MiB+ at the
 //! top levels), the buffer wraps and the previous segment becomes an
-//! *extDict*. All nine strategies' extDict match finders are ported, so
-//! every level streams without length limits (up to the C
-//! overflow-correction threshold of 3500 MiB) — except configurations where
-//! C auto-enables long-distance matching (`strategy >= btopt && windowLog >=
-//! 27`, i.e. level 22 at unknown content size). LDM is ported
+//! *extDict*. All nine strategies' extDict match finders are ported, and
+//! index overflow correction recycles the 32-bit index space past 3500 MiB,
+//! so every level streams without any length limit — except configurations
+//! where C auto-enables long-distance matching (`strategy >= btopt &&
+//! windowLog >= 27`, i.e. level 22 at unknown content size). LDM is ported
 //! ([`crate::ldm`]) but not yet bit-exact on large inputs, so those
 //! configurations report a clean [`Error::Encode`] instead of diverging.
 

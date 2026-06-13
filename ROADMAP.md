@@ -240,9 +240,17 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
       fixed, those configurations return a clean error rather than diverge
       (`FrameCompressor::compress_continue`'s `self.ldm.is_some()` gate);
       removing the gate re-activates the wired LDM.
-- [ ] Index overflow correction (`ZSTD_window_correctOverflow`), lifting the
-      3500 MiB total-input cap (one-shot inputs are capped at 4 GiB − 2 by
-      32-bit match indices regardless).
+- [x] Index overflow correction (`ZSTD_window_correctOverflow` +
+      `ZSTD_reduceIndex`), run per block from `ZSTD_compress_frameChunk`:
+      once the running index reaches `ZSTD_CURRENT_MAX` (3500 MiB) the
+      window slides and every matcher table is reduced by the same
+      `correction` (the segmented `Window` shifts its biases instead of a
+      base pointer; `reduce_table` squashes indices below the reserved floor
+      and preserves btlazy2's unsorted mark). Streaming is now unbounded;
+      one-shot inputs remain capped at 4 GiB − 2 (the whole input is indexed
+      in a single `window_update`, so its high index must fit in `u32`).
+      Gated by a heavy `#[ignore]` differential test that streams 3.7 GiB
+      across the threshold (`overflow_correction_streams_are_bit_exact`).
 - [ ] One-shot `compress` bit-exact verified against multiple upstream zstd
       releases, pinned per version (currently pinned to the single 1.5.7
       oracle bundled by `zstd-sys`).

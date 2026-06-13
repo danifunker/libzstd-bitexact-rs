@@ -6,7 +6,10 @@
 //!
 //! Current scope: **every compression level** (1-22 and the negative /
 //! acceleration levels), any input size, no dictionary, no checksum — the
-//! `ZSTD_compress` defaults. All nine strategies are implemented: fast and
+//! `ZSTD_compress` defaults. The one exception: configurations where C
+//! auto-enables long-distance matching (`strategy >= btopt && windowLog >=
+//! 27`, i.e. level 22 beyond 64 MiB) error out until LDM is ported.
+//! All nine strategies are implemented: fast and
 //! dfast here, greedy/lazy/lazy2/btlazy2 in [`crate::lazy`], and
 //! btopt/btultra/btultra2 in [`crate::opt`]. Block boundaries follow
 //! `ZSTD_optimalBlockSize` (the 1.5.7 pre-block splitter,
@@ -401,6 +404,18 @@ impl Window {
     /// (`ZSTD_matchState_dictMode`): extDict iff `lowLimit < dictLimit`.
     fn has_ext_dict(&self) -> bool {
         self.low_limit < self.dict_limit
+    }
+
+    /// The window mutation of `ZSTD_initStats_ultra` (btultra2's first-block
+    /// double pass): forget the first pass's match history by sliding the
+    /// index space past the block (`window.base -= srcSize; dictLimit +=
+    /// srcSize; lowLimit = dictLimit`). `nextSrc` stays put as a pointer, so
+    /// its index moves with the base.
+    pub(crate) fn slide_for_init_stats(&mut self, src_size: usize) {
+        self.seg_bias += src_size as u32;
+        self.dict_limit += src_size as u32;
+        self.low_limit = self.dict_limit;
+        self.next_src_idx += src_size as u32;
     }
 }
 
@@ -2088,6 +2103,18 @@ impl FrameCompressor {
         chunk_end: usize,
         last_frame_chunk: bool,
     ) -> Result<(), Error> {
+        // `ZSTD_resolveEnableLdm` (auto): C engages long-distance matching
+        // once `strategy >= btopt && windowLog >= 27`, which changes the
+        // match candidates. LDM is not ported yet; error out rather than
+        // emit different bytes. Through the level-based API this is level 22
+        // with an unknown or > 64 MiB content size.
+        if self.cparams.strategy >= Strategy::Btopt && self.cparams.window_log >= 27 {
+            return Err(Error::Encode(
+                "this configuration enables long-distance matching in C \
+                 (strategy >= btopt and windowLog >= 27), which is not \
+                 ported yet",
+            ));
+        }
         let out_start = out.len();
         if self.stage == Stage::Init {
             write_frame_header(out, &self.cparams, self.pledged, self.checksum);
@@ -2109,29 +2136,15 @@ impl FrameCompressor {
             ));
         }
         // `ZSTD_window_update`: a non-contiguous chunk (the streaming input
-        // buffer wrapped) turns the live window into the extDict, which only
-        // some strategies' match finders support so far.
+        // buffer wrapped) turns the live window into the extDict.
         if !self.window.update(chunk_start, chunk_end) {
             // `ZSTD_compressContinue_internal`: a non-contiguous update
             // restarts table insertion at the new segment
             // (`ms->nextToUpdate = ms->window.dictLimit`).
-            if let Matcher::Lazy(ctx) = &mut self.matcher {
-                ctx.next_to_update = self.window.dict_limit as usize;
-            }
-            if !matches!(
-                self.cparams.strategy,
-                Strategy::Fast
-                    | Strategy::Dfast
-                    | Strategy::Greedy
-                    | Strategy::Lazy
-                    | Strategy::Lazy2
-                    | Strategy::Btlazy2
-            ) {
-                return Err(Error::Encode(
-                    "streaming beyond windowSize+blockSize requires the extDict \
-                     match finders, which are not ported for the bt-opt \
-                     strategies (levels 16-22) yet",
-                ));
+            match &mut self.matcher {
+                Matcher::Lazy(ctx) => ctx.next_to_update = self.window.dict_limit as usize,
+                Matcher::Opt(ctx) => ctx.next_to_update = self.window.dict_limit as usize,
+                _ => {}
             }
         }
         if self.checksum {
@@ -2181,7 +2194,7 @@ impl FrameCompressor {
                 // Only the matchers that track nextToUpdate are affected.
                 match &mut self.matcher {
                     Matcher::Lazy(ctx) => ctx.limit_update(pos + self.window.seg_bias as usize),
-                    Matcher::Opt(ctx) => ctx.limit_update(pos),
+                    Matcher::Opt(ctx) => ctx.limit_update(pos + self.window.seg_bias as usize),
                     _ => {}
                 }
                 let mut store = SeqStore::new();
@@ -2260,14 +2273,19 @@ impl FrameCompressor {
                             )
                         }
                     }
-                    Matcher::Opt(ctx) => crate::opt::compress_block_opt(
-                        ctx,
-                        &mut store,
-                        &mut next_rep,
-                        data,
-                        pos,
-                        pos + block_size,
-                    ),
+                    Matcher::Opt(ctx) => {
+                        let ext_dict = self.window.has_ext_dict();
+                        crate::opt::compress_block_opt(
+                            ctx,
+                            &mut store,
+                            &mut next_rep,
+                            data,
+                            pos,
+                            pos + block_size,
+                            &mut self.window,
+                            ext_dict,
+                        )
+                    }
                 };
                 let lits_from = block_size - last_ll_size;
                 store.store_last_literals(&block[lits_from..]);

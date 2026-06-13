@@ -5,11 +5,12 @@
 //! auto-pledge on a first-call end, and the pledged-size quirks.
 //!
 //! Scope note: streams larger than `windowSize + blockSize` wrap the C input
-//! buffer and flip the window into extDict mode. The extDict match finders
-//! up to btlazy2 are ported (multi-wrap parity covered by
-//! `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy,btlazy2}_levels`); the
-//! bt-opt strategies report a clean error at the wrap point
-//! (`oversized_stream_errors_cleanly_for_unported_strategies`).
+//! buffer and flip the window into extDict mode. All nine strategies'
+//! extDict match finders are ported (multi-wrap parity covered by
+//! `wrapped_streams_are_bit_exact_at_{fast,dfast,lazy,btlazy2,btopt}_levels`).
+//! Configurations where C auto-enables long-distance matching (level 22 at
+//! unknown content size) report a clean error instead
+//! (`ldm_configurations_error_cleanly`).
 
 use libzstd_bitexact::StreamEncoder;
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
@@ -322,7 +323,9 @@ fn chunked_streams_are_bit_exact() {
     }
     // Higher levels: fewer chunk shapes, text only (runtime).
     for &chunk in &[65_536usize, 131_072] {
-        for level in [13, 17, 19, 22] {
+        // (Level 22 at unknown content size auto-enables LDM in C — gated,
+        // see `ldm_configurations_error_cleanly` — so 21 is the top here.)
+        for level in [13, 17, 19, 21] {
             assert_stream_bit_exact(
                 level,
                 None,
@@ -910,21 +913,149 @@ fn wrapped_streams_are_bit_exact_at_btlazy2_levels() {
     );
 }
 
+// --- Streams beyond the input buffer (wrap + extDict, btopt/btultra/btultra2) -----
+
+/// Levels 16-22 resolve to the bt-opt strategies. At unknown content size
+/// level 16 wraps every 4.125 MiB and levels 17-19 every 8.125 MiB (levels
+/// 20-22 use 32 MiB+ windows — same code paths, impractical input sizes).
+/// Besides the two-segment `ZSTD_insertBtAndGetAllMatches`, this covers the
+/// post-block splitter over extDict blocks, and for btultra2 the
+/// `ZSTD_initStats_ultra` window slide interacting with a later wrap (and
+/// the extDict remap of btultra2 onto the btultra block compressor).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "heavy differential test, run in release")]
+fn wrapped_streams_are_bit_exact_at_btopt_levels() {
+    // Level 16 (btopt, 4 MiB window): ~9.5 MiB makes two full wraps;
+    // block-aligned chunks let the extDict age out completely.
+    let text = word_salad(0x3E01, (9 << 20) + (1 << 19));
+    for &chunk in &[131_072usize, 131_073] {
+        assert_stream_bit_exact(
+            16,
+            None,
+            false,
+            &chunked(&text, chunk),
+            b"",
+            &format!("btopt-wrap-text-9M-chunk-{chunk}"),
+        );
+    }
+
+    // Levels 17 (btopt), 18 (btultra), 19 (btultra2): 8 MiB window, one wrap.
+    for level in [17, 18, 19] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(&text, 131_072),
+            b"",
+            "btopt-wrap-text-9M-high",
+        );
+    }
+
+    // Mixed runs with periodic flushes across a level-16 wrap.
+    let mixed = mixed_runs(0x3E02, 5 << 20);
+    let mut steps = Vec::new();
+    for (i, c) in mixed.chunks(90_000).enumerate() {
+        steps.push(Step::Push(c));
+        if i % 3 == 2 {
+            steps.push(Step::Flush);
+        }
+    }
+    assert_stream_bit_exact(16, None, false, &steps, b"", "btopt-wrap-flush-mixed-5M");
+
+    // Incompressible data across one wrap.
+    let random = Rng::new(0x3E03).bytes(5 << 20);
+    assert_stream_bit_exact(
+        16,
+        None,
+        false,
+        &chunked(&random, 131_072),
+        b"",
+        "btopt-wrap-random-5M",
+    );
+
+    // Periodic data with the period just under the 4 MiB window.
+    let mut periodic = Vec::with_capacity(9 << 20);
+    let unit: Vec<u8> = (0..4_000_000u32).map(|i| (i * 37 + 11) as u8).collect();
+    while periodic.len() < 9 << 20 {
+        periodic.extend_from_slice(&unit);
+    }
+    periodic.truncate(9 << 20);
+    assert_stream_bit_exact(
+        16,
+        None,
+        false,
+        &chunked(&periodic, 131_072),
+        b"",
+        "btopt-wrap-periodic-9M",
+    );
+
+    // Levels 20-21 never wrap at test-friendly sizes (32/64 MiB windows),
+    // but multi-block streaming at unknown content size (btultra2 initStats
+    // slide + block scheduling) still needs parity beyond the small chunked
+    // tests. Level 22 at unknown size has windowLog 27, which auto-enables
+    // long-distance matching in C — unported, covered by
+    // `ldm_configurations_error_cleanly`.
+    let big = &text[..5 << 20];
+    for level in [20, 21] {
+        assert_stream_bit_exact(
+            level,
+            None,
+            false,
+            &chunked(big, 131_073),
+            b"",
+            "btultra2-nowrap-5M",
+        );
+    }
+
+    // Pledged size and checksum still hold across wraps.
+    let data = &text[..5 << 20];
+    assert_stream_bit_exact(
+        16,
+        Some(data.len() as u64),
+        false,
+        &chunked(data, 131_072),
+        b"",
+        "btopt-wrap-pledged-5M",
+    );
+    assert_stream_bit_exact(
+        19,
+        None,
+        true,
+        &chunked(&text, 200_003),
+        b"",
+        "btultra2-wrap-checksum-9M",
+    );
+}
+
 // --- The current scope limit -------------------------------------------------------
 
 #[test]
-fn oversized_stream_errors_cleanly_for_unported_strategies() {
-    // Level 16 resolves to btopt (unknown size: windowLog 22), whose extDict
-    // variant is not ported yet. Past windowSize + blockSize = 4.125 MiB the
-    // input buffer wraps — we must fail loudly, never emit different bytes.
-    let data = word_salad(0x0CEA, 5 << 20);
-    let mut enc = StreamEncoder::new(16);
+fn ldm_configurations_error_cleanly() {
+    // Level 22 at unknown content size resolves to windowLog 27, and C
+    // auto-enables long-distance matching for `strategy >= btopt &&
+    // windowLog >= 27` (`ZSTD_resolveEnableLdm`). LDM changes the match
+    // candidates and is not ported — we must fail loudly, never emit
+    // different bytes.
+    let data = word_salad(0x1D31, 100_000);
+    let mut enc = StreamEncoder::new(22);
     let mut out = Vec::new();
     let err = (|| -> Result<(), libzstd_bitexact::Error> {
         enc.compress(&data, &mut out)?;
+        enc.flush(&mut out)?;
         Ok(())
     })()
-    .expect_err("wrapping the input buffer must error until extDict lands");
+    .expect_err("LDM-enabled configurations must error until LDM lands");
     let msg = format!("{err}");
-    assert!(msg.contains("extDict"), "unexpected error: {msg}");
+    assert!(msg.contains("long-distance"), "unexpected error: {msg}");
+
+    // A small *pledged* size at level 22 adjusts windowLog below 27: no LDM,
+    // still bit-exact (also covered throughout the one-shot suites).
+    assert_stream_bit_exact(
+        22,
+        Some(data.len() as u64),
+        false,
+        &chunked(&data, 30_000),
+        b"",
+        "level22-small-pledge",
+    );
 }

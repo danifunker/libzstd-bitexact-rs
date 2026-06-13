@@ -1,6 +1,8 @@
-//! The optimal parser (`zstd_opt.c`, noDict): btopt (optLevel 0), btultra
+//! The optimal parser (`zstd_opt.c`): btopt (optLevel 0), btultra
 //! (optLevel 2), and btultra2 (optLevel 2 + a first-block double pass that
-//! seeds the statistics). Levels 16-22.
+//! seeds the statistics). Levels 16-22. In extDict mode (streaming past a
+//! buffer wrap) btultra2 maps to the btultra entry point per the
+//! `ZSTD_selectBlockCompressor` table — the stats pass is noDict-only.
 //!
 //! The parser prices every reachable position of a lookahead window using
 //! adaptive symbol statistics (literals, literal lengths, match lengths,
@@ -15,7 +17,7 @@
 //! *effective* behavior.
 
 use crate::block::{LL_BITS, ML_BITS};
-use crate::compress::{CParams, Strategy, count_eq, hash_ptr, read32};
+use crate::compress::{CParams, Strategy, Window, count_2segments, count_eq, hash_ptr, read32};
 use crate::sequences_encode::{SeqStore, ll_code, ml_code};
 
 const WINDOW_START_INDEX: usize = 2;
@@ -122,12 +124,18 @@ pub(crate) struct OptCtx {
     bt: Vec<u32>,
     hash3: Vec<u32>,
     hash_log3: u32,
-    /// Biased index of the next position to insert.
-    next_to_update: usize,
-    /// Bias from data position to match index (2, grows after initStats).
+    /// Biased index of the next position to insert. Reset to
+    /// `window.dictLimit` by the frame loop on a non-contiguous chunk
+    /// (`ZSTD_compressContinue_internal`).
+    pub(crate) next_to_update: usize,
+    /// Per-block snapshots of the window geometry (C reads `ms->window`
+    /// directly), refreshed by [`compress_block_opt`]: position-to-index
+    /// bias of the current segment, `dictLimit`, `lowLimit`, and the dict
+    /// segment's bias.
     base_bias: usize,
-    /// `window.dictLimit == window.lowLimit` (biased; 2, grows after initStats).
     dict_limit: usize,
+    low_limit: usize,
+    dict_bias: usize,
 
     opt_level: i32,
     is_ultra2: bool,
@@ -160,11 +168,10 @@ pub(crate) struct OptCtx {
 
 impl OptCtx {
     /// `ZSTD_buildSeqStore`'s "limited update after a very long match": pull
-    /// `nextToUpdate` to within 384+192 of the block start. `curr` is
-    /// computed with this context's own bias because the btultra2 initStats
-    /// pass slides it (`ZSTD_initStats_ultra` moves `window.base` in C).
-    pub(crate) fn limit_update(&mut self, block_start: usize) {
-        let curr = block_start + self.base_bias;
+    /// `nextToUpdate` to within 384+192 of the block start. `curr` is the
+    /// biased index of the block start (the caller computes it from the
+    /// window, which carries any btultra2 initStats slide).
+    pub(crate) fn limit_update(&mut self, curr: usize) {
         if curr > self.next_to_update + 384 {
             self.next_to_update = curr - 192.min(curr - self.next_to_update - 384);
         }
@@ -189,6 +196,8 @@ impl OptCtx {
             next_to_update: WINDOW_START_INDEX,
             base_bias: WINDOW_START_INDEX,
             dict_limit: WINDOW_START_INDEX,
+            low_limit: WINDOW_START_INDEX,
+            dict_bias: WINDOW_START_INDEX,
             opt_level: if cparams.strategy == Strategy::Btopt {
                 0
             } else {
@@ -219,8 +228,9 @@ impl OptCtx {
         }
     }
 
+    /// `ZSTD_getLowestMatchIndex(ms, curr, windowLog)`.
     fn window_low(&self, curr: u32) -> u32 {
-        let lowest_valid = self.dict_limit as u32;
+        let lowest_valid = self.low_limit as u32;
         let max_distance = 1u32 << self.window_log;
         if curr - lowest_valid > max_distance {
             curr - max_distance
@@ -406,11 +416,22 @@ fn insert_and_find_first_index_hash3(
     ctx.hash3[hash3_ptr(data, to_pos(ip, bias), ctx.hash_log3)]
 }
 
-/// `ZSTD_insertBt1` (noDict): insert one position, returning how many
-/// positions the update may skip forward.
-fn insert_bt1(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, target: usize) -> usize {
+/// `ZSTD_insertBt1` (noDict and extDict): insert one position, returning how
+/// many positions the update may skip forward. extDict candidate compares
+/// resolve their segment by `matchIndex + matchLength >= dictLimit`, with
+/// the C "preparation" rebase of the ordering-byte read across the seam.
+fn insert_bt1(
+    ctx: &mut OptCtx,
+    data: &[u8],
+    ip: usize,
+    iend: usize,
+    target: usize,
+    ext_dict: bool,
+) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
+    let dict_limit = ctx.dict_limit;
+    let dict_bias = ctx.dict_bias;
     let h = hash_ptr(data, to_pos(ip), ctx.hash_log, ctx.mls);
     let bt_mask = (1u32 << (ctx.chain_log - 1)) - 1;
     let mut match_index = ctx.hash_table[h];
@@ -434,12 +455,34 @@ fn insert_bt1(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, target: usi
         let next = 2 * (match_index & bt_mask) as usize;
         let mut match_length = common_length_smaller.min(common_length_larger);
         let m = match_index as usize;
-        match_length += count_eq(
-            data,
-            to_pos(ip) + match_length,
-            to_pos(m) + match_length,
-            to_pos(iend),
-        );
+
+        // Position of `match[matchLength]` for the ordering byte, valid
+        // after the count inside each branch.
+        let m_read_pos = if !ext_dict || m + match_length >= dict_limit {
+            match_length += count_eq(
+                data,
+                to_pos(ip) + match_length,
+                m + match_length - bias,
+                to_pos(iend),
+            );
+            m + match_length - bias
+        } else {
+            let m_pos = m - dict_bias;
+            match_length += count_2segments(
+                data,
+                to_pos(ip) + match_length,
+                m_pos + match_length,
+                to_pos(iend),
+                dict_limit - dict_bias,
+                dict_limit - bias,
+            );
+            // Preparation for the next read of match[matchLength].
+            if m + match_length >= dict_limit {
+                m + match_length - bias
+            } else {
+                m_pos + match_length
+            }
+        };
 
         if match_length > best_length {
             best_length = match_length;
@@ -452,7 +495,7 @@ fn insert_bt1(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, target: usi
             break; // drop, to guarantee consistency
         }
 
-        if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+        if data[m_read_pos] < data[to_pos(ip) + match_length] {
             if let Some(s) = smaller_slot {
                 ctx.bt[s] = match_index;
             }
@@ -493,19 +536,19 @@ fn insert_bt1(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, target: usi
     positions.max((match_end_idx - (curr + 8)) as usize)
 }
 
-/// `ZSTD_updateTree_internal` (noDict).
-fn update_tree(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize) {
+/// `ZSTD_updateTree_internal`.
+fn update_tree(ctx: &mut OptCtx, data: &[u8], ip: usize, iend: usize, ext_dict: bool) {
     let target = ip;
     let mut idx = ctx.next_to_update;
     while idx < target {
-        let forward = insert_bt1(ctx, data, idx, iend, target);
+        let forward = insert_bt1(ctx, data, idx, iend, target, ext_dict);
         idx += forward;
     }
     ctx.next_to_update = target;
 }
 
-/// `ZSTD_insertBtAndGetAllMatches` (noDict). Returns the number of matches
-/// stored in `ctx.matches`, in strictly increasing length order.
+/// `ZSTD_insertBtAndGetAllMatches` (noDict and extDict). Returns the number
+/// of matches stored in `ctx.matches`, in strictly increasing length order.
 #[allow(clippy::too_many_arguments)]
 fn insert_bt_and_get_all_matches(
     ctx: &mut OptCtx,
@@ -516,9 +559,11 @@ fn insert_bt_and_get_all_matches(
     rep: &[u32; 3],
     ll0: bool,
     length_to_beat: u32,
+    ext_dict: bool,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
+    let dict_bias = ctx.dict_bias;
     let sufficient_len = ctx.sufficient_len;
     let curr = ip as u32;
     let min_match = if ctx.mls == 3 { 3 } else { 4 };
@@ -551,7 +596,7 @@ fn insert_bt_and_get_all_matches(
         };
         let mut rep_len = 0usize;
         // `repOffset - 1 < curr - dictLimit` with intentional wrapping:
-        // discards 0 and overlong offsets.
+        // discards 0 and overlong offsets (`curr > repIndex >= dictLimit`).
         if rep_offset.wrapping_sub(1) < curr - dict_limit {
             let rep_index = curr - rep_offset;
             if rep_index >= window_low
@@ -563,6 +608,25 @@ fn insert_bt_and_get_all_matches(
                     to_pos(ip) + min_match as usize,
                     to_pos(ip) + min_match as usize - rep_offset as usize,
                     to_pos(iend),
+                ) + min_match as usize;
+            }
+        } else if ext_dict {
+            // repIndex < dictLimit (or >= curr): the repcode source lives in
+            // the extDict; validity also demands the 4-byte read stays below
+            // the seam (`ZSTD_index_overlap_check`).
+            let rep_index = curr.wrapping_sub(rep_offset);
+            if rep_offset.wrapping_sub(1) < curr - window_low
+                && (dict_limit - 1).wrapping_sub(rep_index) >= 3
+                && read_minmatch(data, to_pos(ip), min_match)
+                    == read_minmatch(data, rep_index as usize - dict_bias, min_match)
+            {
+                rep_len = count_2segments(
+                    data,
+                    to_pos(ip) + min_match as usize,
+                    rep_index as usize - dict_bias + min_match as usize,
+                    to_pos(iend),
+                    dict_limit as usize - dict_bias,
+                    dict_limit as usize - bias,
                 ) + min_match as usize;
             }
         }
@@ -584,12 +648,23 @@ fn insert_bt_and_get_all_matches(
     if ctx.mls == 3 && best_length < 3 {
         let match_index3 = insert_and_find_first_index_hash3(ctx, data, next_to_update3, ip);
         if match_index3 >= match_low && curr - match_index3 < (1 << 18) {
-            let mlen = count_eq(
-                data,
-                to_pos(ip),
-                to_pos(match_index3 as usize),
-                to_pos(iend),
-            );
+            let mlen = if !ext_dict || match_index3 >= dict_limit {
+                count_eq(
+                    data,
+                    to_pos(ip),
+                    to_pos(match_index3 as usize),
+                    to_pos(iend),
+                )
+            } else {
+                count_2segments(
+                    data,
+                    to_pos(ip),
+                    match_index3 as usize - dict_bias,
+                    to_pos(iend),
+                    dict_limit as usize - dict_bias,
+                    dict_limit as usize - bias,
+                )
+            };
             if mlen >= 3 {
                 best_length = mlen;
                 ctx.matches[0] = Match {
@@ -611,12 +686,34 @@ fn insert_bt_and_get_all_matches(
         let next = 2 * (match_index & bt_mask) as usize;
         let mut match_length = common_length_smaller.min(common_length_larger);
         let m = match_index as usize;
-        match_length += count_eq(
-            data,
-            to_pos(ip) + match_length,
-            to_pos(m) + match_length,
-            to_pos(iend),
-        );
+
+        // Position of `match[matchLength]` for the ordering byte, valid
+        // after the count inside each branch.
+        let m_read_pos = if !ext_dict || m + match_length >= dict_limit as usize {
+            match_length += count_eq(
+                data,
+                to_pos(ip) + match_length,
+                m + match_length - bias,
+                to_pos(iend),
+            );
+            m + match_length - bias
+        } else {
+            let m_pos = m - dict_bias;
+            match_length += count_2segments(
+                data,
+                to_pos(ip) + match_length,
+                m_pos + match_length,
+                to_pos(iend),
+                dict_limit as usize - dict_bias,
+                dict_limit as usize - bias,
+            );
+            // Preparation for the next read of match[matchLength].
+            if m + match_length >= dict_limit as usize {
+                m + match_length - bias
+            } else {
+                m_pos + match_length
+            }
+        };
 
         if match_length > best_length {
             if match_length > (match_end_idx - match_index) as usize {
@@ -633,7 +730,7 @@ fn insert_bt_and_get_all_matches(
             }
         }
 
-        if data[to_pos(m) + match_length] < data[to_pos(ip) + match_length] {
+        if data[m_read_pos] < data[to_pos(ip) + match_length] {
             if let Some(s) = smaller_slot {
                 ctx.bt[s] = match_index;
             }
@@ -681,11 +778,12 @@ fn get_all_matches(
     rep: &[u32; 3],
     ll0: bool,
     length_to_beat: u32,
+    ext_dict: bool,
 ) -> usize {
     if ip < ctx.next_to_update {
         return 0; // skipped area
     }
-    update_tree(ctx, data, ip, iend);
+    update_tree(ctx, data, ip, iend, ext_dict);
     insert_bt_and_get_all_matches(
         ctx,
         data,
@@ -695,12 +793,14 @@ fn get_all_matches(
         rep,
         ll0,
         length_to_beat,
+        ext_dict,
     )
 }
 
 // --- The optimal parser ---------------------------------------------------------
 
 /// `ZSTD_compressBlock_btultra2`'s first-block stats-seeding double pass.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_opt(
     ctx: &mut OptCtx,
     store: &mut SeqStore,
@@ -708,12 +808,25 @@ pub(crate) fn compress_block_opt(
     data: &[u8],
     block_start: usize,
     block_end: usize,
+    win: &mut Window,
+    ext_dict: bool,
 ) -> usize {
+    // Snapshot the window geometry (the C code reads `ms->window` directly).
+    ctx.base_bias = win.seg_bias as usize;
+    ctx.dict_limit = win.dict_limit as usize;
+    ctx.low_limit = win.low_limit as usize;
+    ctx.dict_bias = win.dict_bias as usize;
+
     let src_size = block_end - block_start;
     let curr = block_start + ctx.base_bias;
-    if ctx.is_ultra2
+    // `ZSTD_compressBlock_btultra2` (a noDict-only entry point: extDict
+    // blocks of the btultra2 strategy run `ZSTD_compressBlock_btultra_extDict`
+    // per the `ZSTD_selectBlockCompressor` table, with no stats pass).
+    if !ext_dict
+        && ctx.is_ultra2
         && ctx.ll_sum == 0
         && store.sequences.is_empty()
+        && win.dict_limit == win.low_limit
         && curr == ctx.dict_limit
         && src_size > ZSTD_PREDEF_THRESHOLD
     {
@@ -729,15 +842,20 @@ pub(crate) fn compress_block_opt(
             data,
             block_start,
             block_end,
+            false,
         );
-        ctx.base_bias += src_size;
-        ctx.dict_limit += src_size;
+        win.slide_for_init_stats(src_size);
+        ctx.base_bias = win.seg_bias as usize;
+        ctx.dict_limit = win.dict_limit as usize;
+        ctx.low_limit = win.low_limit as usize;
         ctx.next_to_update = ctx.dict_limit;
     }
-    compress_block_opt_generic(ctx, store, rep, data, block_start, block_end)
+    compress_block_opt_generic(ctx, store, rep, data, block_start, block_end, ext_dict)
 }
 
-/// `ZSTD_compressBlock_opt_generic` (noDict).
+/// `ZSTD_compressBlock_opt_generic`. The driver itself is dictMode-agnostic
+/// (it only prices and emits within the current block); the dict mode lives
+/// in the match finder.
 fn compress_block_opt_generic(
     ctx: &mut OptCtx,
     store: &mut SeqStore,
@@ -745,6 +863,7 @@ fn compress_block_opt_generic(
     data: &[u8],
     block_start: usize,
     block_end: usize,
+    ext_dict: bool,
 ) -> usize {
     let bias = ctx.base_bias;
     let to_pos = |idx: usize| idx - bias;
@@ -783,6 +902,7 @@ fn compress_block_opt_generic(
                 rep,
                 ll0,
                 min_match,
+                ext_dict,
             );
             if nb_matches == 0 {
                 ip += 1;
@@ -924,6 +1044,7 @@ fn compress_block_opt_generic(
                         &opt_rep,
                         ll0,
                         min_match,
+                        ext_dict,
                     );
                     if nb_matches == 0 {
                         cur += 1;

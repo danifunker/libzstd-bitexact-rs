@@ -87,11 +87,12 @@ const DFAST: u32 = 2;
 const GREEDY: u32 = 3;
 const LAZY: u32 = 4;
 const LAZY2: u32 = 5;
+const BTLAZY2: u32 = 6;
 
 /// The strategies `compress_with_dict` currently supports (everything up to and
-/// including lazy2). Any binary-tree strategy (btlazy2/btopt/btultra/btultra2)
-/// is still gated.
-const SUPPORTED: [u32; 5] = [FAST, DFAST, GREEDY, LAZY, LAZY2];
+/// including btlazy2). The optimal-parser strategies (btopt/btultra/btultra2)
+/// are still gated.
+const SUPPORTED: [u32; 6] = [FAST, DFAST, GREEDY, LAZY, LAZY2, BTLAZY2];
 
 /// The (strategy, windowLog) our — and C's — dict-aware cParams select for a
 /// known srcSize. windowLog decides the greedy/lazy/lazy2 backend: the row
@@ -133,9 +134,9 @@ fn raw_dict_supported_strategies_are_bit_exact_and_round_trip_else_rejected() {
     // levels cover: negatives/1/2 -> fast, 3 -> dfast, 4/5 -> greedy, 5/6/7 ->
     // lazy, 6..10 -> lazy2 — each of greedy/lazy/lazy2 in BOTH the row finder
     // (the 60000-byte payload, windowLog 17) and the hash chain (small payloads,
-    // windowLog 14); 9/10/19 select a binary-tree strategy at some sizes,
-    // exercising the gate. The coverage assertions below fail loudly if any
-    // class stops being exercised.
+    // windowLog 14); 9/10 -> btlazy2 at the small (table-3) sizes; 19 ->
+    // btultra2, exercising the gate. The coverage assertions below fail loudly
+    // if any class stops being exercised.
     let levels = [-3, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 19];
 
     // Per-strategy and per-backend coverage, so nothing silently goes untested.

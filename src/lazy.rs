@@ -191,9 +191,10 @@ impl LazyCtx {
     /// `dictEnd - HASH_READ_SIZE`, after which `nextToUpdate` jumps to `dictEnd`,
     /// so the final `HASH_READ_SIZE` dict positions are never inserted (exactly
     /// as in C). Reusing the very functions the matcher uses keeps the fill and
-    /// the search hash-consistent. Caller guarantees `dict_len > HASH_READ_SIZE`
-    /// and a fresh context (`next_to_update == WINDOW_START_INDEX`); not for
-    /// btlazy2 (the binary tree fills via `ZSTD_updateTree`, a later increment).
+    /// the search hash-consistent. btlazy2 instead loads a FULLY SORTED tree via
+    /// `ZSTD_updateTree` (`ZSTD_insertBt1`, noDict) — not the runtime unsorted
+    /// DUBT. Caller guarantees `dict_len > HASH_READ_SIZE` and a fresh context
+    /// (`next_to_update == WINDOW_START_INDEX`).
     pub(crate) fn load_dictionary(&mut self, data: &[u8], dict_len: usize) {
         const HASH_READ_SIZE: usize = 8;
         let seg_bias = WINDOW_START_INDEX;
@@ -208,7 +209,18 @@ impl LazyCtx {
                 let _ = insert_and_find_first_index(self, data, fill_target, seg_bias);
             }
             SearchMethod::BinaryTree => {
-                debug_assert!(false, "btlazy2 dict load not implemented");
+                // btlazy2: C loads the dict into a fully sorted binary tree via
+                // ZSTD_updateTree (ZSTD_insertBt1, ZSTD_noDict), NOT the runtime
+                // unsorted DUBT. windowLow is lowLimit for the whole fill
+                // (isDictionary), i.e. WINDOW_START_INDEX.
+                update_tree_nodict(
+                    self,
+                    data,
+                    fill_target,
+                    dict_len,
+                    seg_bias,
+                    WINDOW_START_INDEX as u32,
+                );
             }
         }
         // `ms->nextToUpdate = iend - base`: resume insertion at the start of
@@ -584,6 +596,118 @@ fn update_dubt(ctx: &mut LazyCtx, data: &[u8], target: usize, seg_bias: usize) {
         ctx.chain_table[slot + 1] = DUBT_UNSORTED_MARK;
         ctx.hash_table[h] = idx as u32;
         idx += 1;
+    }
+    ctx.next_to_update = target;
+}
+
+/// `ZSTD_insertBt1` specialized to `ZSTD_noDict` (one contiguous segment): sort
+/// the position with biased index `curr` into the sorted binary tree, returning
+/// how many positions the fill may skip forward (the C `forward` value). Used
+/// only by the btlazy2 dictionary fill ([`update_tree_nodict`]) — C loads the
+/// dict "fully sorted" via `ZSTD_updateTree`, so the extDict branch never runs
+/// and `window_low` is constant (`lowLimit`, because `isDictionary` holds during
+/// `ZSTD_loadDictionaryContent`). Mirrors [`crate::opt`]'s `insert_bt1` noDict
+/// path on `LazyCtx`'s tables (`chain_table` is the two-slot BT).
+fn insert_bt1_nodict(
+    ctx: &mut LazyCtx,
+    data: &[u8],
+    curr: usize,
+    iend_pos: usize,
+    seg_bias: usize,
+    window_low: u32,
+) -> usize {
+    let bt_mask = (1u32 << (ctx.chain_log - 1)) - 1;
+    let ip_pos = curr - seg_bias;
+    let h = hash_ptr(data, ip_pos, ctx.hash_log, ctx.mls);
+    let mut match_index = ctx.hash_table[h];
+    let mut common_length_smaller = 0usize;
+    let mut common_length_larger = 0usize;
+    let curr_u32 = curr as u32;
+    let bt_low = curr_u32.saturating_sub(bt_mask);
+    let root = 2 * (curr_u32 & bt_mask) as usize;
+    let mut smaller_slot: Option<usize> = Some(root);
+    let mut larger_slot: Option<usize> = Some(root + 1);
+    let mut match_end_idx = curr_u32 + 8 + 1;
+    let mut best_length = 8usize;
+    let mut nb_compares = 1u32 << ctx.search_log;
+
+    ctx.hash_table[h] = curr_u32;
+
+    while nb_compares > 0 && match_index >= window_low {
+        let next = 2 * (match_index & bt_mask) as usize;
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        let m_pos = match_index as usize - seg_bias;
+        match_length += count_eq(data, ip_pos + match_length, m_pos + match_length, iend_pos);
+
+        if match_length > best_length {
+            best_length = match_length;
+            if match_length > (match_end_idx - match_index) as usize {
+                match_end_idx = match_index + match_length as u32;
+            }
+        }
+
+        if ip_pos + match_length == iend_pos {
+            break; // equal: cannot order; drop, to keep the tree consistent
+        }
+
+        if data[m_pos + match_length] < data[ip_pos + match_length] {
+            // match is smaller than current
+            if let Some(s) = smaller_slot {
+                ctx.chain_table[s] = match_index;
+            }
+            common_length_smaller = match_length;
+            if match_index <= bt_low {
+                smaller_slot = None;
+                break;
+            }
+            smaller_slot = Some(next + 1);
+            match_index = ctx.chain_table[next + 1];
+        } else {
+            // match is larger than current
+            if let Some(l) = larger_slot {
+                ctx.chain_table[l] = match_index;
+            }
+            common_length_larger = match_length;
+            if match_index <= bt_low {
+                larger_slot = None;
+                break;
+            }
+            larger_slot = Some(next);
+            match_index = ctx.chain_table[next];
+        }
+        nb_compares -= 1;
+    }
+
+    if let Some(s) = smaller_slot {
+        ctx.chain_table[s] = 0;
+    }
+    if let Some(l) = larger_slot {
+        ctx.chain_table[l] = 0;
+    }
+
+    let positions = if best_length > 384 {
+        192.min(best_length - 384)
+    } else {
+        0
+    };
+    positions.max((match_end_idx - (curr_u32 + 8)) as usize)
+}
+
+/// `ZSTD_updateTree_internal` for `ZSTD_noDict`: sort positions
+/// `[nextToUpdate, target)` into the binary tree. This is the btlazy2 dictionary
+/// fill, `ZSTD_updateTree(ms, dictEnd - HASH_READ_SIZE, dictEnd)`.
+fn update_tree_nodict(
+    ctx: &mut LazyCtx,
+    data: &[u8],
+    target: usize,
+    iend_pos: usize,
+    seg_bias: usize,
+    window_low: u32,
+) {
+    let mut idx = ctx.next_to_update;
+    while idx < target {
+        let forward = insert_bt1_nodict(ctx, data, idx, iend_pos, seg_bias, window_low);
+        idx += forward;
     }
     ctx.next_to_update = target;
 }

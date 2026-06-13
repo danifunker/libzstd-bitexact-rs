@@ -50,6 +50,8 @@ mod stream_encode;
 mod xxhash;
 
 pub use compress::compress;
+#[doc(hidden)]
+pub use compress::cparams_for_testing;
 pub use decompress::{DecodeOptions, WINDOW_LOG_MAX, decompress, decompress_with_limit};
 pub use dictionary::Dictionary;
 pub use error::Error;

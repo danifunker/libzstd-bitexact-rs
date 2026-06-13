@@ -30,6 +30,10 @@ const MIN_CBLOCK_SIZE: usize = 2;
 const BLOCK_HEADER_SIZE: usize = 3;
 const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 const HASHLOG_MIN: u32 = 6;
+/// `ZSTD_WINDOWLOG_MAX` on 64-bit targets (`ZSTD_WINDOWLOG_MAX_64`).
+const WINDOWLOG_MAX: u32 = 31;
+/// `ZSTD_CONTENTSIZE_UNKNOWN`: the source size is not known in advance.
+const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 
 // --- Compression parameters --------------------------------------------------
@@ -160,7 +164,7 @@ const DEFAULT_CPARAMETERS: [[CParamsRow; 23]; 4] = {
         (14, 15, 14,  9,  4,  8, Btlazy2),
         (14, 15, 14,  3,  4, 12, Btopt),
         (14, 15, 14,  4,  3, 24, Btopt),
-        (14, 15, 15,  5,  3, 32, Btultra),
+        (14, 15, 14,  5,  3, 32, Btultra),
         (14, 15, 15,  6,  3, 64, Btultra),
         (14, 15, 15,  7,  3, 256, Btultra),
         (14, 15, 15,  5,  3, 48, Btultra2),
@@ -190,11 +194,49 @@ fn cycle_log(hash_log: u32, strat: Strategy) -> u32 {
     hash_log - bt_scale
 }
 
-/// `ZSTD_getCParams_internal` + `ZSTD_adjustCParams_internal`, specialized to
-/// the no-dictionary one-shot case (`ZSTD_cpm_noAttachDict`, known srcSize).
-pub(crate) fn get_cparams(level: i32, src_size: u64) -> CParams {
-    // ZSTD_getCParamRowSize: srcSize known, no dict -> rSize = srcSize.
-    let r_size = src_size;
+/// `ZSTD_dictAndWindowLog`: the window log enlarged so the hash/chain logs can
+/// reference both the dictionary and the live window (the zstd format treats the
+/// whole dictionary as in-window if any one byte of it is). Used only to
+/// downsize hashLog/chainLog. `src_size` must not be `CONTENTSIZE_UNKNOWN` — the
+/// caller guards, as the C `assert` documents.
+fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
+    // No dictionary ==> no change.
+    if dict_size == 0 {
+        return window_log;
+    }
+    let max_window_size = 1u64 << WINDOWLOG_MAX;
+    let window_size = 1u64 << window_log;
+    let dict_and_window_size = dict_size.wrapping_add(window_size);
+    if window_size >= dict_size.wrapping_add(src_size) {
+        // Window already large enough for dict + src.
+        window_log
+    } else if dict_and_window_size >= max_window_size {
+        WINDOWLOG_MAX
+    } else {
+        // C truncates dictAndWindowSize to U32 before highbit32, then +1.
+        highbit32((dict_and_window_size as u32).wrapping_sub(1)) + 1
+    }
+}
+
+/// `ZSTD_getCParams_internal` + `ZSTD_adjustCParams_internal` for mode
+/// `ZSTD_cpm_noAttachDict` — the derivation used by `ZSTD_compress` and the
+/// `ZSTD_compress_usingDict` (extDict) path. `src_size == CONTENTSIZE_UNKNOWN`
+/// selects the unknown-size behavior; `dict_size == 0` means no dictionary.
+/// Yields the same cParams as the public `ZSTD_getCParams` once that maps a 0
+/// srcSizeHint to UNKNOWN (`cpm_unknown` and `cpm_noAttachDict` derive identical
+/// cParams); `tests/cparams_differential.rs` checks this field-by-field.
+pub(crate) fn get_cparams(level: i32, src_size: u64, dict_size: u64) -> CParams {
+    // --- ZSTD_getCParamRowSize (noAttachDict keeps dictSize as-is) ---
+    let unknown = src_size == CONTENTSIZE_UNKNOWN;
+    let r_size = if unknown && dict_size == 0 {
+        CONTENTSIZE_UNKNOWN
+    } else {
+        // C: srcSizeHint + dictSize + (unknown && dict>0 ? 500 : 0) in U64.
+        // When unknown, srcSizeHint is U64::MAX and the sum wraps exactly as C,
+        // so an unknown src with a dict yields rSize = dictSize + 499.
+        let added: u64 = if unknown && dict_size > 0 { 500 } else { 0 };
+        src_size.wrapping_add(dict_size).wrapping_add(added)
+    };
     let table_id = (r_size <= 256 * 1024) as usize
         + (r_size <= 128 * 1024) as usize
         + (r_size <= 16 * 1024) as usize;
@@ -216,14 +258,16 @@ pub(crate) fn get_cparams(level: i32, src_size: u64) -> CParams {
         strategy: strat,
     };
     if level < 0 {
-        // Acceleration factor for negative levels.
+        // Acceleration factor for negative levels (clamp to ZSTD_minCLevel
+        // before negating so i32::MIN can't overflow).
         cp.target_length = (-level.max(ZSTD_MIN_CLEVEL)) as u32;
     }
 
-    // --- ZSTD_adjustCParams_internal (srcSize known, dictSize 0) ---
-    let max_window_resize = 1u64 << (31 - 1);
-    if src_size <= max_window_resize {
-        let t_size = src_size as u32;
+    // --- ZSTD_adjustCParams_internal (mode noAttachDict) ---
+    // Resize windowLog down when the input (src + dict) is small.
+    let max_window_resize = 1u64 << (WINDOWLOG_MAX - 1);
+    if src_size <= max_window_resize && dict_size <= max_window_resize {
+        let t_size = (src_size + dict_size) as u32;
         let hash_size_min = 1u32 << HASHLOG_MIN;
         let src_log = if t_size < hash_size_min {
             HASHLOG_MIN
@@ -234,23 +278,26 @@ pub(crate) fn get_cparams(level: i32, src_size: u64) -> CParams {
             cp.window_log = src_log;
         }
     }
-    {
-        // dictSize == 0 makes dictAndWindowLog collapse to windowLog.
-        let dict_and_window_log = cp.window_log;
+    // Downsize hashLog/chainLog to the dict-aware window log. Skipped when the
+    // source size is unknown, matching the C guard (dictAndWindowLog asserts a
+    // known srcSize).
+    if src_size != CONTENTSIZE_UNKNOWN {
+        let daw_log = dict_and_window_log(cp.window_log, src_size, dict_size);
         let cyc_log = cycle_log(cp.chain_log, cp.strategy);
-        if cp.hash_log > dict_and_window_log + 1 {
-            cp.hash_log = dict_and_window_log + 1;
+        if cp.hash_log > daw_log + 1 {
+            cp.hash_log = daw_log + 1;
         }
-        if cyc_log > dict_and_window_log {
-            cp.chain_log -= cyc_log - dict_and_window_log;
+        if cyc_log > daw_log {
+            cp.chain_log -= cyc_log - daw_log;
         }
     }
     if cp.window_log < WINDOWLOG_ABSOLUTEMIN {
         cp.window_log = WINDOWLOG_ABSOLUTEMIN;
     }
-    // Row-match-finder hashLog cap: (hashLog - rowLog + 8) <= 32. At this
-    // point C conservatively assumes row mode is on for the strategies that
-    // support it (greedy..lazy2).
+    // (The `cpm_createCDict` tagged-index hashLog cap does not apply here.)
+    // Row-match-finder hashLog cap: (hashLog - rowLog + 8) <= 32. C
+    // conservatively assumes row mode is on for the strategies that support it
+    // (greedy..lazy2; useRowMatchFinder auto -> enable).
     if matches!(
         cp.strategy,
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
@@ -262,6 +309,26 @@ pub(crate) fn get_cparams(level: i32, src_size: u64) -> CParams {
         }
     }
     cp
+}
+
+/// Test hook for `tests/cparams_differential.rs`: `get_cparams` as
+/// `[windowLog, chainLog, hashLog, searchLog, minMatch, targetLength,
+/// strategy]` (strategy as its `ZSTD_strategy` discriminant, 1..=9). The
+/// differential oracle is raw `unsafe` FFI, which `#![forbid(unsafe_code)]`
+/// bars from the library, so it must run from `tests/` — and integration tests
+/// can't reach these `pub(crate)` internals. Not part of the stable public API.
+#[doc(hidden)]
+pub fn cparams_for_testing(level: i32, src_size: u64, dict_size: u64) -> [u32; 7] {
+    let cp = get_cparams(level, src_size, dict_size);
+    [
+        cp.window_log,
+        cp.chain_log,
+        cp.hash_log,
+        cp.search_log,
+        cp.min_match,
+        cp.target_length,
+        cp.strategy as u32,
+    ]
 }
 
 // --- Small shared helpers ------------------------------------------------------
@@ -2126,7 +2193,7 @@ impl FrameCompressor {
         // Unknown content size selects the "default" srcSize class and skips
         // the window resize (`ZSTD_getCParamRowSize` returns
         // ZSTD_CONTENTSIZE_UNKNOWN for unknown srcSize without a dictionary).
-        let cparams = get_cparams(level, pledged.unwrap_or(u64::MAX));
+        let cparams = get_cparams(level, pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0);
         let window_size_u64 = match pledged {
             Some(n) => (1u64 << cparams.window_log).min(n).max(1),
             None => 1u64 << cparams.window_log,

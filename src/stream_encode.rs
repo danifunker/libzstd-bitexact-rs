@@ -229,18 +229,19 @@ impl StreamEncoder {
     /// (buffered): resolve parameters (auto-pledging if the first operation
     /// is `ZSTD_e_end`) and size the input staging buffer.
     fn init(&mut self, end_op: EndOp, in_size: usize) -> Result<(), Error> {
-        // Multithreaded streaming engages for an unknown content size (the
-        // normal streaming case — a first-call `finish` is handled in
-        // `stream_op`). The supported scope is plain unknown-size streaming.
-        if self.nb_workers > 0 && end_op != EndOp::End {
-            if self.dict.is_some() {
-                return Err(Error::Encode(
-                    "multithreaded streaming with a dictionary is not supported yet",
-                ));
-            }
+        // Multithreaded streaming. A first-call `finish` auto-pledges to its
+        // input size (the no-dict large case was already delegated to the
+        // one-shot MT frame in `stream_op`; here it reaches only the dictionary
+        // path, which streams through `MtStreamState`).
+        if self.nb_workers > 0 {
+            let pledged = if end_op == EndOp::End {
+                Some(in_size as u64)
+            } else {
+                self.requested_pledged
+            };
             // Engage MT for an unknown size, or a pledged size above the MT floor;
             // a pledge at or below it falls through to the single-threaded path.
-            let engages = match self.requested_pledged {
+            let engages = match pledged {
                 Some(p) => p > ZSTDMT_JOBSIZE_MIN,
                 None => true,
             };
@@ -250,7 +251,8 @@ impl StreamEncoder {
                     self.job_size,
                     self.overlap_log,
                     self.checksum,
-                    self.requested_pledged,
+                    pledged,
+                    self.dict.as_deref(),
                 )?);
                 return Ok(());
             }

@@ -313,7 +313,21 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          (engagement: workers + unknown size, or a pledge above 512 KiB; a
          first-call `finish` delegates to the one-shot MT frame). Gated by
          `mt_stream_flush_is_bit_exact` / `mt_stream_pledged_size_is_bit_exact`.
-   - [ ] `ZSTDMT` with a dictionary on job 0, and cross-job LDM.
+   - [x] **`ZSTDMT` streaming with a dictionary — BIT-EXACT** (raw + trained,
+         `StreamEncoder::with_dictionary().with_workers()`). C applies the
+         dictionary to **job 0 only** (`jobs[0].cdict`): job 0 is a Path-B CDict
+         **attach** over `content ++ segment0`, writing the frame header with the
+         dictID; later jobs are plain overlap jobs. The decisive subtlety:
+         loading a dictionary resolves the frame cParams in `ZSTD_cpm_attachDict`
+         mode, which **zeroes the dict size** (`getCParamRowSize` +
+         `adjustCParams_internal`), so the section/overlap and every job's base
+         cParams are the plain **no-dict** ones — only job 0's dict tables use the
+         createCDict cParams (so job 0 is exactly `streaming_cdict_init`'s
+         compressor). Gated by `mt_stream_raw_dict_is_bit_exact` /
+         `mt_stream_trained_dict_is_bit_exact`. The copy path (a known frame size
+         above the attach cutoff) is a clean error.
+   - [ ] One-shot `compress_mt` with a dictionary, the MT+dict **copy** path, and
+         cross-job LDM.
 
 ## M6 — Performance
 

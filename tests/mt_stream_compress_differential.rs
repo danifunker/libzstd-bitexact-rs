@@ -8,7 +8,7 @@
 //! later call — both schedule-dependent behaviors this exercises. The oracle is
 //! the bundled C library built with the `zstdmt` feature.
 
-use libzstd_bitexact::StreamEncoder;
+use libzstd_bitexact::{DecodeOptions, Dictionary, StreamEncoder};
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
 
 struct Rng(u64);
@@ -350,16 +350,166 @@ fn mt_stream_checksum_is_bit_exact() {
     check_ck(3, 4, 512 * 1024, 0, true, &[], &big);
 }
 
-/// Dictionaries with workers are not supported yet — must error cleanly.
-#[test]
-fn mt_stream_unsupported_errors_cleanly() {
-    let dict = word_salad(0x99, 4096);
-    let body = word_salad(0x44, 700 * 1024);
+/// Drive C `ZSTD_compressStream2` with a loaded dictionary + MT parameters.
+fn oracle_dict(
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    dict: &[u8],
+    chunks: &[&[u8]],
+    finish: &[u8],
+) -> Vec<u8> {
+    use zstd_sys::ZSTD_EndDirective as Dir;
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    cctx.set_parameter(CParameter::NbWorkers(workers)).unwrap();
+    cctx.set_parameter(CParameter::JobSize(job_size)).unwrap();
+    cctx.load_dictionary(dict).unwrap();
+
     let mut out = Vec::new();
-    let r = StreamEncoder::with_dictionary(3, &dict)
+    let mut scratch = vec![0u8; 1024 * 1024];
+    let mut step = |cctx: &mut CCtx, out: &mut Vec<u8>, inb: &mut InBuffer, dir: Dir| -> usize {
+        let mut outb = OutBuffer::around(&mut scratch[..]);
+        let hint = cctx
+            .compress_stream2(&mut outb, inb, dir)
+            .map_err(map_code)
+            .unwrap();
+        let produced = outb.pos();
+        out.extend_from_slice(&scratch[..produced]);
+        hint
+    };
+    for &data in chunks {
+        let mut inb = InBuffer::around(data);
+        loop {
+            step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_continue);
+            if inb.pos >= data.len() {
+                break;
+            }
+        }
+    }
+    let mut inb = InBuffer::around(finish);
+    loop {
+        let hint = step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_end);
+        if hint == 0 && inb.pos == finish.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// A real ZDICT-trained dictionary (magic `0xEC30A437`): seeds job 0's entropy
+/// tables, repeat offsets, and the frame's `Dictionary_ID`.
+fn trained_dict() -> Vec<u8> {
+    let mut rng = Rng::new(0x7A1A_ED01);
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for _ in 0..4000 {
+        let start = samples.len();
+        let target = 24 + rng.below(128);
+        while samples.len() - start < target {
+            samples.extend_from_slice(WORDS[rng.below(WORDS.len())]);
+            samples.push(b' ');
+        }
+        sizes.push(samples.len() - start);
+    }
+    let mut dict = vec![0u8; 16 * 1024];
+    let dict_size = unsafe {
+        zstd_sys::ZDICT_trainFromBuffer(
+            dict.as_mut_ptr() as *mut core::ffi::c_void,
+            dict.len(),
+            samples.as_ptr() as *const core::ffi::c_void,
+            sizes.as_ptr(),
+            sizes.len() as core::ffi::c_uint,
+        )
+    };
+    assert!(
+        unsafe { zstd_sys::ZDICT_isError(dict_size) } == 0,
+        "ZDICT_trainFromBuffer failed (code {dict_size})"
+    );
+    dict.truncate(dict_size);
+    dict
+}
+
+/// Multithreaded streaming with a dictionary: C builds an internal CDict and
+/// applies it to job 0 only (attach, unknown size); later jobs are plain overlap
+/// jobs. Across strategies and chunk schedules. Byte-exact vs C and round-trips
+/// through our decoder with the dictionary.
+fn run_mt_dict(dict: &[u8]) {
+    let dict_obj = Dictionary::new(dict).expect("dict parse");
+    for &level in &[1i32, 3, 6, 9, 12, 17] {
+        let body = word_salad(0xB0D7 ^ level as u64, 1300 * 1024);
+        let h = body.len() / 2;
+        // Unknown-size streaming (the attach path). A first-call `finish` would
+        // auto-pledge a known size above the cutoff → the copy path, which is a
+        // clean error (covered separately).
+        let cases: &[(Vec<&[u8]>, &[u8])] = &[
+            (vec![&body[..]], &[]),
+            (vec![&body[..h]], &body[h..]),
+            (vec![&body[..h], &body[h..]], &[]),
+            (vec![&body[..1], &body[1..h]], &body[h..]),
+        ];
+        for (chunks, finish) in cases {
+            let theirs = oracle_dict(level, 2, 512 * 1024, dict, chunks, finish);
+            let mut enc =
+                StreamEncoder::with_dictionary(level, dict).with_workers(2, 512 * 1024, 0);
+            let mut mine = Vec::new();
+            for &c in chunks {
+                enc.compress(c, &mut mine).unwrap();
+            }
+            enc.finish(finish, &mut mine).unwrap();
+            if mine != theirs {
+                let first = mine
+                    .iter()
+                    .zip(theirs.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(mine.len().min(theirs.len()));
+                panic!(
+                    "MT dict mismatch: level={level} nchunks={} finish={} \
+                     ours={} theirs={} first_diff_at={first}",
+                    chunks.len(),
+                    finish.len(),
+                    mine.len(),
+                    theirs.len(),
+                );
+            }
+            let mut expect = Vec::new();
+            for &c in chunks {
+                expect.extend_from_slice(c);
+            }
+            expect.extend_from_slice(finish);
+            // The frame references the dictionary (job 0), so decode with it.
+            let decoded = DecodeOptions::new()
+                .dictionary(&dict_obj)
+                .decompress(&mine)
+                .expect("decode with dict");
+            assert_eq!(decoded, expect, "MT dict round-trip: level={level}");
+        }
+    }
+}
+
+#[test]
+fn mt_stream_raw_dict_is_bit_exact() {
+    run_mt_dict(&word_salad(0xD1C7, 16 * 1024));
+}
+
+#[test]
+fn mt_stream_trained_dict_is_bit_exact() {
+    run_mt_dict(&trained_dict());
+}
+
+/// MT + dictionary above the attach cutoff (the copy path — e.g. a first-call
+/// `finish` that auto-pledges a known size > the cutoff) is not supported yet;
+/// it must error cleanly, never diverge.
+#[test]
+fn mt_stream_dict_copy_errors_cleanly() {
+    let dict = word_salad(0xD1C7, 16 * 1024);
+    let body = word_salad(0x1234, 1300 * 1024);
+    let mut out = Vec::new();
+    let r = StreamEncoder::with_dictionary(6, &dict)
         .with_workers(2, 512 * 1024, 0)
-        .compress(&body, &mut out);
-    assert!(r.is_err(), "MT + dictionary must error cleanly");
+        .finish(&body, &mut out);
+    assert!(r.is_err(), "MT + dict copy path must error cleanly");
 }
 
 /// Drive C with a pledged content size set up front.

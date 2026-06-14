@@ -4056,6 +4056,21 @@ pub(crate) struct MtStreamState {
     /// The frame's `pledgedSrcSize`: `Some` for a known content size (job 0
     /// writes an FCS header and cParams resize to it), `None` for unknown.
     frame_pledged: Option<u64>,
+    /// A dictionary applied to **job 0 only** (zstdmt `jobs[0].cdict`): the
+    /// pre-built CDict-attach compressor and the dict content (job 0's prefix).
+    /// `None` for no dictionary; consumed when job 0 is emitted.
+    dict: Option<MtDictJob0>,
+}
+
+/// The job-0 dictionary state for [`MtStreamState`]: C applies the dictionary
+/// (an internally-built CDict) to the first job only, so job 0 is a Path-B
+/// **attach** over `content ++ segment0` and later jobs are plain overlap jobs.
+struct MtDictJob0 {
+    /// The attach compressor (frame cParams, seeded entropy/rep/dictID, attach
+    /// window) — writes the frame header with the dictID and compresses job 0.
+    fc0: FrameCompressor,
+    /// The dictionary content: job 0's concat-buffer prefix.
+    content: Vec<u8>,
 }
 
 impl MtStreamState {
@@ -4068,9 +4083,13 @@ impl MtStreamState {
         overlap_log: i32,
         checksum: bool,
         frame_pledged: Option<u64>,
+        dict: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        // cParams resolve from the pledged size (a known size resizes the window;
-        // unknown selects the default class) — exactly like single-threaded.
+        // With a loaded dictionary, C resolves the frame cParams in
+        // `ZSTD_cpm_attachDict` mode (`ZSTD_getCParamMode`), which **zeroes the
+        // dict size** (both `getCParamRowSize` and `adjustCParams_internal`). So
+        // the frame / section / overlap cParams — and every job's base cParams —
+        // are the plain no-dict ones; only job 0 additionally attaches the CDict.
         let cparams = get_cparams(level, frame_pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0);
         if crate::ldm::LdmParams::auto(&cparams).is_some() {
             return Err(Error::Encode(
@@ -4086,6 +4105,18 @@ impl MtStreamState {
                  is not supported yet",
             ));
         }
+
+        let dict_job0 = match dict {
+            None => None,
+            Some(dict) => Some(Self::build_dict_job0(
+                dict,
+                level,
+                cparams.window_log,
+                frame_pledged,
+                checksum,
+            )?),
+        };
+
         Ok(MtStreamState {
             cparams,
             section_size,
@@ -4098,6 +4129,61 @@ impl MtStreamState {
             xxh: crate::xxhash::Xxh64::new(0),
             job_count: 0,
             frame_pledged,
+            dict: dict_job0,
+        })
+    }
+
+    /// Prepare job 0's CDict-attach compressor (`jobs[0].cdict`). C builds the
+    /// dictionary's CDict with the **createCDict** cParams (`ZSTD_initLocalDict`
+    /// → `createCDict_advanced2`), and job 0 attaches it (unknown / small frame
+    /// size → attach) with the working windowLog taken from the frame cParams
+    /// (the no-dict windowLog). This is exactly [`streaming_cdict_init`]'s
+    /// compressor — only the section/overlap framing around it is MT-specific.
+    /// Copy (large known frame) and tiny dicts are not supported yet.
+    fn build_dict_job0(
+        dict: &[u8],
+        level: i32,
+        frame_window_log: u32,
+        frame_pledged: Option<u64>,
+        checksum: bool,
+    ) -> Result<MtDictJob0, Error> {
+        let (content, entropy, rep, dict_id) = parse_cdict(dict)?;
+        if content.len() <= HASH_READ_SIZE {
+            return Err(Error::Encode(
+                "multithreaded streaming with a <= 8-byte dictionary is not supported yet",
+            ));
+        }
+        let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
+        // `ZSTD_shouldAttachDict`: an unknown frame size attaches; a known size
+        // above the strategy cutoff would copy the dict (not ported for MT).
+        if frame_pledged.is_some_and(|p| p as usize > cdict_attach_cutoff(cdict_cparams.strategy)) {
+            return Err(Error::Encode(
+                "multithreaded streaming with a CDict above the attach cutoff \
+                 (copy path) is not supported yet",
+            ));
+        }
+        let content_len = content.len();
+        // Job 0 attaches the CDict (createCDict cParams for its tables); the
+        // working windowLog is the frame's (no-dict) windowLog.
+        let mut fc0 = attach_cdict_compressor(
+            content,
+            cdict_cparams,
+            frame_pledged,
+            checksum,
+            frame_window_log,
+        );
+        fc0.entropy = entropy;
+        fc0.rep = rep;
+        fc0.dict_id = dict_id;
+        fc0.window = Window::streaming_attached_dict(content_len);
+        match &mut fc0.matcher {
+            Matcher::Lazy(ctx) => ctx.next_to_update = fc0.window.dict_limit as usize,
+            Matcher::Opt(ctx) => ctx.next_to_update = fc0.window.dict_limit as usize,
+            _ => {}
+        }
+        Ok(MtDictJob0 {
+            fc0,
+            content: content.to_vec(),
         })
     }
 
@@ -4172,27 +4258,45 @@ impl MtStreamState {
             return Ok(());
         }
         let job_filled = self.filled;
-        let total = self.prefix_len + job_filled;
-        // Job 0 carries the whole-frame size (a known size → FCS header sized for
-        // the whole frame; `None` → windowed header); later jobs pledge their own
-        // segment size (which clamps that job's window).
-        let pledged = if self.first {
-            self.frame_pledged
+        if self.first && self.dict.is_some() {
+            // Job 0 with a dictionary: the CDict-attach path over the
+            // `content ++ segment0` concat buffer. The pre-built `fc0` writes the
+            // frame header (with the dictID + its checksum flag) and compresses
+            // job 0; later jobs are plain overlap jobs over `self.cparams`.
+            let d = self.dict.take().expect("dict present");
+            let cl = d.content.len();
+            let mut data = Vec::with_capacity(cl + job_filled);
+            data.extend_from_slice(&d.content);
+            data.extend_from_slice(&self.buf[..job_filled]);
+            let mut fc0 = d.fc0;
+            if is_last {
+                fc0.compress_end(out, &data, cl, cl + job_filled)?;
+            } else {
+                fc0.compress_continue(out, &data, cl, cl + job_filled, false)?;
+            }
         } else {
-            Some(job_filled as u64)
-        };
-        compress_mt_job(
-            out,
-            self.cparams,
-            &self.buf[..total],
-            self.prefix_len,
-            pledged,
-            self.first,
-            is_last,
-            // C keeps the checksum flag on for job 0 only (header bit; a single
-            // job appends its own digest), clearing it on later jobs.
-            self.checksum && self.first,
-        )?;
+            let total = self.prefix_len + job_filled;
+            // Job 0 carries the whole-frame size (a known size → FCS header sized
+            // for the whole frame; `None` → windowed header); later jobs pledge
+            // their own segment size (which clamps that job's window).
+            let pledged = if self.first {
+                self.frame_pledged
+            } else {
+                Some(job_filled as u64)
+            };
+            compress_mt_job(
+                out,
+                self.cparams,
+                &self.buf[..total],
+                self.prefix_len,
+                pledged,
+                self.first,
+                is_last,
+                // C keeps the checksum flag on for job 0 only (header bit; a single
+                // job appends its own digest), clearing it on later jobs.
+                self.checksum && self.first,
+            )?;
+        }
         self.job_count += 1;
         if !is_last {
             // Next job's prefix = this segment's overlap tail.
@@ -4229,23 +4333,24 @@ pub(crate) fn parse_cdict(dict: &[u8]) -> Result<(&[u8], FseEntropyState, [u32; 
 /// Build the working [`FrameCompressor`] for the CDict ATTACH path
 /// (`ZSTD_resetCCtx_byAttachingCDict`): working tables sized from the CDict
 /// cParams adjusted for the source (dict zeroed by `cpm_attachDict`), windowLog
-/// taken from the no-dict source cParams, and the CDict's own match state
-/// (`ms->dictMatchState`) built over `content`. Shared by the one-shot
-/// [`compress_with_cdict`] and the streaming attach path; the caller arranges
-/// the history buffer with `content` as its prefix and sets the window. The
-/// `entropy`/`rep`/`dictID` (`prevCBlock = cdict.cBlockState`) are set by the
-/// caller.
+/// taken from the CCtx's resolved cParams (`working_window_log`), and the CDict's
+/// own match state (`ms->dictMatchState`) built over `content`. Shared by the
+/// one-shot [`compress_with_cdict`], the streaming attach path, and the ZSTDMT
+/// job-0 attach (which passes the dict-aware *frame* windowLog rather than the
+/// no-dict one). The caller arranges the history buffer with `content` as its
+/// prefix and sets the window; `entropy`/`rep`/`dictID`
+/// (`prevCBlock = cdict.cBlockState`) are set by the caller.
 pub(crate) fn attach_cdict_compressor(
     content: &[u8],
     cdict_cparams: CParams,
-    level: i32,
     pledged: Option<u64>,
     checksum: bool,
+    working_window_log: u32,
 ) -> FrameCompressor {
     let content_len = content.len();
     let src_size = pledged.unwrap_or(CONTENTSIZE_UNKNOWN);
     let mut working = adjust_cparams_internal(cdict_cparams, src_size, 0, CParamMode::NoAttachDict);
-    working.window_log = get_cparams(level, src_size, 0).window_log;
+    working.window_log = working_window_log;
     let mut fc = FrameCompressor::from_cparams(working, pledged, checksum);
 
     let mls = cdict_cparams.min_match.clamp(4, 7);
@@ -4373,7 +4478,17 @@ pub(crate) fn streaming_cdict_init(
         ));
     }
 
-    let mut fc = attach_cdict_compressor(content, cdict_cparams, level, pledged, checksum);
+    // Standalone (CDict not loaded on the CCtx): the working windowLog is the
+    // no-dict source cParams' (the CCtx has no dictionary of its own).
+    let working_window_log =
+        get_cparams(level, pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0).window_log;
+    let mut fc = attach_cdict_compressor(
+        content,
+        cdict_cparams,
+        pledged,
+        checksum,
+        working_window_log,
+    );
     fc.window = Window::streaming_attached_dict(content_len);
     fc.entropy = entropy;
     fc.rep = rep;
@@ -4448,7 +4563,9 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         // `ZSTD_resetCCtx_byAttachingCDict` (the dms over `content`); arrange the
         // window over the concatenated `content ++ src` buffer in the post-reset
         // attach state (src begins at `cdictEnd`, no extDict).
-        let mut fc = attach_cdict_compressor(content, cdict_cparams, level, pledged, false);
+        let working_window_log = get_cparams(level, src_size, 0).window_log;
+        let mut fc =
+            attach_cdict_compressor(content, cdict_cparams, pledged, false, working_window_log);
         fc.window = Window::preloaded_attached_dict(content_len, src_len);
         fc.window_preloaded = true;
         fc

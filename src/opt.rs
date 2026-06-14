@@ -137,6 +137,9 @@ pub(crate) struct OptCtx {
     dict_limit: usize,
     low_limit: usize,
     dict_bias: usize,
+    /// `ms->loadedDictEnd` (see [`crate::compress::Window`]): nonzero keeps the
+    /// whole loaded dictionary referenceable in [`window_low`](Self::window_low).
+    loaded_dict_end: u32,
 
     opt_level: i32,
     is_ultra2: bool,
@@ -229,6 +232,7 @@ impl OptCtx {
             dict_limit: WINDOW_START_INDEX,
             low_limit: WINDOW_START_INDEX,
             dict_bias: WINDOW_START_INDEX,
+            loaded_dict_end: 0,
             opt_level: if cparams.strategy == Strategy::Btopt {
                 0
             } else {
@@ -259,9 +263,13 @@ impl OptCtx {
         }
     }
 
-    /// `ZSTD_getLowestMatchIndex(ms, curr, windowLog)`.
+    /// `ZSTD_getLowestMatchIndex(ms, curr, windowLog)`. A loaded dictionary
+    /// (`loadedDictEnd != 0`) stays referenceable down to `lowLimit`.
     fn window_low(&self, curr: u32) -> u32 {
         let lowest_valid = self.low_limit as u32;
+        if self.loaded_dict_end != 0 {
+            return lowest_valid;
+        }
         let max_distance = 1u32 << self.window_log;
         if curr - lowest_valid > max_distance {
             curr - max_distance
@@ -1129,6 +1137,7 @@ pub(crate) fn compress_block_opt(
     ctx.dict_limit = win.dict_limit as usize;
     ctx.low_limit = win.low_limit as usize;
     ctx.dict_bias = win.dict_bias as usize;
+    ctx.loaded_dict_end = win.loaded_dict_end;
 
     let src_size = block_end - block_start;
     let curr = block_start + ctx.base_bias;
@@ -1166,6 +1175,7 @@ pub(crate) fn compress_block_opt(
         ctx.base_bias = win.seg_bias as usize;
         ctx.dict_limit = win.dict_limit as usize;
         ctx.low_limit = win.low_limit as usize;
+        ctx.loaded_dict_end = win.loaded_dict_end;
         ctx.next_to_update = ctx.dict_limit;
     }
     compress_block_opt_generic(

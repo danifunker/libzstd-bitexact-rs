@@ -441,8 +441,8 @@ fn run_mt_dict(dict: &[u8]) {
         let body = word_salad(0xB0D7 ^ level as u64, 1300 * 1024);
         let h = body.len() / 2;
         // Unknown-size streaming (the attach path). A first-call `finish` would
-        // auto-pledge a known size above the cutoff → the copy path, which is a
-        // clean error (covered separately).
+        // auto-pledge a known size above the cutoff → the copy path, covered by
+        // `mt_stream_{raw,trained}_dict_copy_is_bit_exact`.
         let cases: &[(Vec<&[u8]>, &[u8])] = &[
             (vec![&body[..]], &[]),
             (vec![&body[..h]], &body[h..]),
@@ -498,18 +498,72 @@ fn mt_stream_trained_dict_is_bit_exact() {
     run_mt_dict(&trained_dict());
 }
 
-/// MT + dictionary above the attach cutoff (the copy path — e.g. a first-call
-/// `finish` that auto-pledges a known size > the cutoff) is not supported yet;
-/// it must error cleanly, never diverge.
+/// MT + dictionary above the attach cutoff is the **copy** path
+/// (`ZSTD_resetCCtx_byCopyingCDict`): a first-call `finish` auto-pledges a known
+/// size > the strategy cutoff, so C resolves the frame cParams in `cpm_noAttachDict`
+/// mode (dict-aware) and copies the de-tagged CDict tables into job 0's context
+/// (the dict a contiguous extDict prefix); later jobs are plain overlap jobs over
+/// those dict-aware frame cParams. Multi-job (jobSize 512 KiB). Byte-exact vs C and
+/// round-trips through our decoder with the dictionary.
+fn run_mt_dict_copy(dict: &[u8]) {
+    let dict_obj = Dictionary::new(dict).expect("dict parse");
+    for &level in &[1i32, 3, 6, 9, 12, 17] {
+        for &n in &[700 * 1024usize, 1300 * 1024] {
+            let body = word_salad(0xC0B7 ^ level as u64 ^ n as u64, n);
+            // First-call `finish` ⇒ known size above the cutoff ⇒ the copy path.
+            let theirs = oracle_dict(level, 2, 512 * 1024, dict, &[], &body);
+            let enc = StreamEncoder::with_dictionary(level, dict).with_workers(2, 512 * 1024, 0);
+            let mut mine = Vec::new();
+            enc.finish(&body, &mut mine).unwrap();
+            if mine != theirs {
+                let first = mine
+                    .iter()
+                    .zip(theirs.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(mine.len().min(theirs.len()));
+                panic!(
+                    "MT dict copy mismatch: level={level} n={n} \
+                     ours={} theirs={} first_diff_at={first}",
+                    mine.len(),
+                    theirs.len(),
+                );
+            }
+            let decoded = DecodeOptions::new()
+                .dictionary(&dict_obj)
+                .decompress(&mine)
+                .expect("decode with dict");
+            assert_eq!(
+                decoded, body,
+                "MT dict copy round-trip: level={level} n={n}"
+            );
+        }
+    }
+}
+
 #[test]
-fn mt_stream_dict_copy_errors_cleanly() {
-    let dict = word_salad(0xD1C7, 16 * 1024);
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-MiB across strategies); run in release"
+)]
+fn mt_stream_raw_dict_copy_is_bit_exact() {
+    run_mt_dict_copy(&word_salad(0xD1C7, 16 * 1024));
+}
+
+/// A **trained** (ZDICT) dictionary on the MT copy path is deferred (a separate
+/// pre-existing seeded-entropy/post-split divergence in `compress_with_cdict`'s
+/// copy branch at the higher strategies); it must error cleanly, never diverge.
+#[test]
+fn mt_stream_trained_dict_copy_errors_cleanly() {
+    let dict = trained_dict();
     let body = word_salad(0x1234, 1300 * 1024);
     let mut out = Vec::new();
-    let r = StreamEncoder::with_dictionary(6, &dict)
+    let r = StreamEncoder::with_dictionary(12, &dict)
         .with_workers(2, 512 * 1024, 0)
         .finish(&body, &mut out);
-    assert!(r.is_err(), "MT + dict copy path must error cleanly");
+    assert!(
+        r.is_err(),
+        "MT + trained-dict copy path must error cleanly (deferred)"
+    );
 }
 
 /// Drive C with a pledged content size set up front.

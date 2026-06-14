@@ -312,7 +312,11 @@ fn hc_find_best_match(
     let curr = ip as u32;
     let max_distance = 1u32 << ctx.window_log;
     let lowest_valid = win.low_limit;
-    let within_max_distance = if curr - lowest_valid > max_distance {
+    // `ZSTD_getLowestMatchIndex`'s `isDictionary` branch: a loaded dictionary
+    // (`loadedDictEnd != 0`) stays referenceable down to `lowLimit`.
+    let within_max_distance = if win.loaded_dict_end != 0 {
+        lowest_valid
+    } else if curr - lowest_valid > max_distance {
         curr - max_distance
     } else {
         lowest_valid
@@ -557,7 +561,11 @@ fn row_find_best_match(
     let curr = ip as u32;
     let max_distance = 1u32 << ctx.window_log;
     let lowest_valid = win.low_limit;
-    let within_max_distance = if curr - lowest_valid > max_distance {
+    // `ZSTD_getLowestMatchIndex`'s `isDictionary` branch: a loaded dictionary
+    // (`loadedDictEnd != 0`) stays referenceable down to `lowLimit`.
+    let within_max_distance = if win.loaded_dict_end != 0 {
+        lowest_valid
+    } else if curr - lowest_valid > max_distance {
         curr - max_distance
     } else {
         lowest_valid
@@ -897,7 +905,10 @@ fn insert_dubt1(
     let prefix_start_pos = dict_limit - seg_bias;
     let max_distance = 1u32 << ctx.window_log;
     let window_valid = win.low_limit;
-    let window_low = if curr - window_valid > max_distance {
+    // `ZSTD_getLowestMatchIndex`'s `isDictionary` branch (see `hc_find_best_match`).
+    let window_low = if win.loaded_dict_end != 0 {
+        window_valid
+    } else if curr - window_valid > max_distance {
         curr - max_distance
     } else {
         window_valid
@@ -1017,7 +1028,10 @@ fn dubt_find_best_match(
     let curr = ip as u32;
     let max_distance = 1u32 << ctx.window_log;
     let lowest_valid = win.low_limit;
-    let window_low = if curr - lowest_valid > max_distance {
+    // `ZSTD_getLowestMatchIndex`'s `isDictionary` branch (see `hc_find_best_match`).
+    let window_low = if win.loaded_dict_end != 0 {
+        lowest_valid
+    } else if curr - lowest_valid > max_distance {
         curr - max_distance
     } else {
         lowest_valid
@@ -2014,9 +2028,12 @@ pub(crate) fn compress_block_lazy_extdict(
             block_end
         }
     };
-    // `ZSTD_getLowestMatchIndex(ms, curr, windowLog)`.
+    // `ZSTD_getLowestMatchIndex(ms, curr, windowLog)` — a loaded dictionary
+    // (`loadedDictEnd != 0`) stays referenceable down to `lowLimit`.
     let window_low_at = |curr: u32| {
-        if curr - win.low_limit > max_distance {
+        if win.loaded_dict_end != 0 {
+            win.low_limit
+        } else if curr - win.low_limit > max_distance {
             curr - max_distance
         } else {
             win.low_limit
@@ -2295,7 +2312,9 @@ fn extdict_store_and_repcodes(
     // Check immediate repcode.
     while (*ip as i64) <= i_limit {
         let rep_current = *ip as u32;
-        let window_low = if rep_current - win.low_limit > max_distance {
+        let window_low = if win.loaded_dict_end != 0 {
+            win.low_limit
+        } else if rep_current - win.low_limit > max_distance {
             rep_current - max_distance
         } else {
             win.low_limit

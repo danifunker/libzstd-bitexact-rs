@@ -282,3 +282,55 @@ fn big_cdict_raw_exercises_row_finder() {
     let cov = check_dict(&big_raw_dict_content());
     assert!(cov.row > 0, "24 KB dict should hit the row backend");
 }
+
+fn ws(seed: u64, len: usize) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut d = Vec::with_capacity(len + 16);
+    while d.len() < len {
+        d.extend_from_slice(WORDS[rng.below(WORDS.len())]);
+        d.push(b' ');
+    }
+    d.truncate(len);
+    d
+}
+
+/// Regression for the `loadedDictEnd` / `checkDictValidity` port: a CDict **copy**
+/// over an input that fills (or exceeds) the window keeps the whole dictionary
+/// referenceable down to `lowLimit` (`ZSTD_getLowestMatchIndex`'s `isDictionary`
+/// branch), and drops it only once its last byte leaves the window
+/// (`ZSTD_checkDictValidity` / `ZSTD_window_enforceMaxDist`). The other copy
+/// tests here use < 60 KB single-block inputs that never fill the window, so this
+/// pins the window-filling behavior. Byte-exact vs `ZSTD_compress_usingCDict`.
+///
+/// At a fast level the resized window is `1 << 19`; `n = 524288` reaches exactly
+/// the window (the dict stays valid — needs the `isDictionary` floor), and
+/// `n = 716800` exceeds it (the dict is invalidated mid-frame). Without the port
+/// these diverge megabytes-style at the first long backward match into the dict.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-hundred-KB); run in release"
+)]
+fn cdict_copy_window_filling_is_bit_exact() {
+    // The specific dict+body below makes a long backward match reach into the
+    // dictionary just past `maxDist`, which is exactly what the port fixes.
+    let dict = ws(0xD1C7, 16 * 1024);
+    let dict_obj = Dictionary::new(&dict).expect("dict parse");
+    for &level in &[1i32, 2, 3] {
+        let body = ws(0xC0B7 ^ level as u64 ^ 716800, 716800);
+        for &n in &[400_000usize, 524_288, 716_800] {
+            let src = &body[..n];
+            let theirs = oracle(src, &dict, level);
+            let mine = compress_with_cdict(src, &dict, level).unwrap();
+            assert_eq!(
+                mine, theirs,
+                "cdict copy window-filling mismatch: level={level} n={n}"
+            );
+            let decoded = DecodeOptions::new()
+                .dictionary(&dict_obj)
+                .decompress(&mine)
+                .expect("decode with dict");
+            assert_eq!(decoded, src, "round-trip: level={level} n={n}");
+        }
+    }
+}

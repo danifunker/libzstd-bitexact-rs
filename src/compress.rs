@@ -480,6 +480,16 @@ pub(crate) struct Window {
     /// must start to be contiguous, and the index it would get.
     next_src_pos: usize,
     next_src_idx: u32,
+    /// `ms->loadedDictEnd`: the index at the end of a loaded dictionary, in the
+    /// context's referential (so directly comparable to a block-end index).
+    /// Nonzero only while a dictionary is loaded *and still valid*: when it is,
+    /// the **entire** dictionary stays a valid match target as long as its last
+    /// byte is within the window (`ZSTD_getLowestMatchIndex`'s `isDictionary`
+    /// branch), and `ZSTD_window_enforceMaxDist` / `ZSTD_checkDictValidity` clear
+    /// it once the dict falls out of distance. Zero for no dictionary, for the
+    /// CDict *attach* path (the dict lives in a separate match state), and for a
+    /// streaming-wrap extDict (which is aged history, not a dictionary).
+    pub(crate) loaded_dict_end: u32,
 }
 
 impl Window {
@@ -494,6 +504,7 @@ impl Window {
             dict_limit: WINDOW_START_INDEX as u32,
             next_src_pos: 0,
             next_src_idx: WINDOW_START_INDEX as u32,
+            loaded_dict_end: 0,
         }
     }
 
@@ -515,6 +526,9 @@ impl Window {
             dict_limit: start + dict_len as u32,
             next_src_pos: dict_len + src_len,
             next_src_idx: start + (dict_len + src_len) as u32,
+            // The dict is a loaded dictionary (extDict prefix): keep it fully
+            // valid while its last byte is in window (`loadedDictEnd == dictLimit`).
+            loaded_dict_end: start + dict_len as u32,
         }
     }
 
@@ -536,6 +550,7 @@ impl Window {
             dict_limit: start,
             next_src_pos: total_len,
             next_src_idx: start + total_len as u32,
+            loaded_dict_end: 0,
         }
     }
 
@@ -555,6 +570,9 @@ impl Window {
             dict_limit: src_start,
             next_src_pos: content_len + src_len,
             next_src_idx: start + (content_len + src_len) as u32,
+            // Attach: the dict lives in a separate match state, not as an extDict
+            // of this window, so there is no in-window loadedDictEnd to track.
+            loaded_dict_end: 0,
         }
     }
 
@@ -576,6 +594,31 @@ impl Window {
             dict_limit: src_start,
             next_src_pos: content_len,
             next_src_idx: src_start,
+            // Attach: dict lives in a separate match state (see above).
+            loaded_dict_end: 0,
+        }
+    }
+
+    /// Like [`preloaded_ext_dict`](Self::preloaded_ext_dict) but for *streaming*:
+    /// the CDict **copy** path reaches here. The de-tagged CDict tables were copied
+    /// into the working context, so the dict is an ordinary **extDict** prefix
+    /// (`lowLimit < dictLimit`) rather than living in a separate attached match
+    /// state. The source length is not known up front, so `nextSrc` points at the
+    /// source start (`content_len`) and `window_preloaded` is left off; the first
+    /// `compress_continue` registers the segment contiguously — `start ==
+    /// next_src_pos`, so `ZSTD_window_update` does *not* flip (the dict is already
+    /// the extDict), reproducing exactly what `preloaded_ext_dict` bakes in.
+    pub(crate) fn streaming_ext_dict(content_len: usize) -> Self {
+        let start = WINDOW_START_INDEX as u32;
+        Window {
+            seg_bias: start,
+            dict_bias: start,
+            low_limit: start,
+            dict_limit: start + content_len as u32,
+            next_src_pos: content_len,
+            next_src_idx: start + content_len as u32,
+            // Loaded dictionary as an extDict prefix (`loadedDictEnd == dictLimit`).
+            loaded_dict_end: start + content_len as u32,
         }
     }
 
@@ -628,13 +671,21 @@ impl Window {
         contiguous
     }
 
-    /// `ZSTD_window_enforceMaxDist` (no dictionary): called before each
-    /// block; slides `lowLimit` to `idx - maxDist` and drags `dictLimit`
-    /// along once the extDict falls out of the window. (The C parameter is
-    /// named `blockEnd`, but `ZSTD_compress_frameChunk` anchors it at the
-    /// block *start* `ip`.)
+    /// `ZSTD_window_enforceMaxDist`: called before each block; slides `lowLimit`
+    /// to `idx - maxDist` and drags `dictLimit` along once the extDict falls out
+    /// of the window. (The C parameter is named `blockEnd`, but
+    /// `ZSTD_compress_frameChunk` anchors it at the block *start* `ip`.)
+    ///
+    /// With a loaded dictionary (`loaded_dict_end != 0`) the threshold is pushed
+    /// out by `loadedDictEnd` — a dictionary stays fully referenceable until its
+    /// last byte leaves the window — and once it does fall out the dict is
+    /// cleared (`loadedDictEnd = 0`; the matchers then revert to the windowed
+    /// lowest index). With no dictionary the test is just the overflow guard on
+    /// `idx - maxDist`.
     pub(crate) fn enforce_max_dist(&mut self, idx: u32, max_dist: u32) {
-        if idx > max_dist {
+        // `maxDist + loadedDictEnd` is a U32 sum in C; wrap to match (and to keep
+        // the debug overflow checks quiet for a huge dict + window).
+        if idx > max_dist.wrapping_add(self.loaded_dict_end) {
             let new_low_limit = idx - max_dist;
             if self.low_limit < new_low_limit {
                 self.low_limit = new_low_limit;
@@ -642,6 +693,24 @@ impl Window {
             if self.dict_limit < self.low_limit {
                 self.dict_limit = self.low_limit;
             }
+            self.loaded_dict_end = 0;
+        }
+    }
+
+    /// `ZSTD_checkDictValidity`: run before [`enforce_max_dist`](Self::enforce_max_dist)
+    /// per block, anchored at the block *end* (`ip + blockSize`). It only
+    /// invalidates a loaded dictionary — without touching `lowLimit` — once the
+    /// window size is reached anywhere within the next block, or once the dict is
+    /// no longer contiguous with the current segment (`loadedDictEnd !=
+    /// dictLimit`, e.g. after a streaming wrap). A no-op when no dictionary is
+    /// loaded. (Dropping an *attached* `dictMatchState` is the caller's concern;
+    /// the attach path never reaches a window-filling size here.)
+    pub(crate) fn check_dict_validity(&mut self, block_end_idx: u32, max_dist: u32) {
+        if self.loaded_dict_end != 0
+            && (block_end_idx > self.loaded_dict_end.wrapping_add(max_dist)
+                || self.loaded_dict_end != self.dict_limit)
+        {
+            self.loaded_dict_end = 0;
         }
     }
 
@@ -1523,10 +1592,14 @@ fn compress_block_fast_extdict(
     let end_index = iend;
 
     // ZSTD_getLowestMatchIndex(ms, endIndex, windowLog): lowest valid index
-    // in either segment.
+    // in either segment. With a loaded dictionary (`loadedDictEnd != 0`) the
+    // whole dict stays referenceable down to `lowLimit` regardless of maxDist;
+    // the windowed floor applies only without one.
     let max_distance = 1usize << ctx.window_log;
     let lowest_valid = win.low_limit as usize;
-    let dict_start_index = if end_index - lowest_valid > max_distance {
+    let dict_start_index = if win.loaded_dict_end != 0 {
+        lowest_valid
+    } else if end_index - lowest_valid > max_distance {
         end_index - max_distance
     } else {
         lowest_valid
@@ -2711,10 +2784,14 @@ fn compress_block_dfast_extdict(
     let iend = block_end + seg_bias;
     let end_index = iend;
 
-    // ZSTD_getLowestMatchIndex(ms, endIndex, windowLog).
+    // ZSTD_getLowestMatchIndex(ms, endIndex, windowLog). A loaded dictionary
+    // (`loadedDictEnd != 0`) stays referenceable down to `lowLimit`; the windowed
+    // floor applies only without one.
     let max_distance = 1usize << ctx.window_log;
     let lowest_valid = win.low_limit as usize;
-    let dict_start_index = if end_index - lowest_valid > max_distance {
+    let dict_start_index = if win.loaded_dict_end != 0 {
+        lowest_valid
+    } else if end_index - lowest_valid > max_distance {
         end_index - max_distance
     } else {
         lowest_valid
@@ -3306,11 +3383,14 @@ impl FrameCompressor {
                 }
             }
 
-            // `ZSTD_window_enforceMaxDist` runs before every block, anchored
-            // at the *block start* (`ip`, not `ip + blockSize` — that one
-            // only feeds `ZSTD_checkDictValidity`); the dict mode below
-            // (extDict vs noDict) is decided on the result. The matchers
-            // tighten their own validity bound from the block end.
+            // `ZSTD_checkDictValidity` runs first, anchored at the block *end*
+            // (`ip + blockSize`): it clears a loaded dictionary once the window
+            // size is reached within the next block. Then `ZSTD_window_enforceMaxDist`,
+            // anchored at the block *start* (`ip`), slides `lowLimit`; the dict
+            // mode below (extDict vs noDict) is decided on the result. The
+            // matchers tighten their own validity bound from the block end.
+            let block_end_idx = (pos + block_size) as u32 + self.window.seg_bias;
+            self.window.check_dict_validity(block_end_idx, max_dist);
             let block_start_idx = pos as u32 + self.window.seg_bias;
             self.window.enforce_max_dist(block_start_idx, max_dist);
 
@@ -4085,12 +4165,35 @@ impl MtStreamState {
         frame_pledged: Option<u64>,
         dict: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        // With a loaded dictionary, C resolves the frame cParams in
-        // `ZSTD_cpm_attachDict` mode (`ZSTD_getCParamMode`), which **zeroes the
-        // dict size** (both `getCParamRowSize` and `adjustCParams_internal`). So
-        // the frame / section / overlap cParams — and every job's base cParams —
-        // are the plain no-dict ones; only job 0 additionally attaches the CDict.
-        let cparams = get_cparams(level, frame_pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0);
+        // With a loaded dictionary, C resolves the frame cParams in the mode
+        // `ZSTD_getCParamMode` picks: `ZSTD_cpm_attachDict` when the CDict will be
+        // **attached** (an unknown or small frame, `ZSTD_shouldAttachDict`), which
+        // **zeroes the dict size** so the frame / section / overlap cParams — and
+        // every job's base cParams — are the plain no-dict ones; otherwise
+        // `ZSTD_cpm_noAttachDict` (the **copy** path: a known frame above the
+        // strategy cutoff), which keeps the dict size, so the frame cParams account
+        // for `srcSize + dictSize`. Job 0 attaches or copies the CDict accordingly.
+        let attach = match dict {
+            Some(d) => {
+                let cdict_strategy = get_cparams_create_cdict(level, d.len() as u64).strategy;
+                let cutoff = cdict_attach_cutoff(cdict_strategy);
+                match frame_pledged {
+                    Some(p) => p as usize <= cutoff,
+                    None => true, // unknown size attaches
+                }
+            }
+            None => true, // no dictionary: dict size is zero regardless
+        };
+        // Copy keeps the dict size (`cpm_noAttachDict`); attach / no-dict zero it.
+        let frame_dict_size = match dict {
+            Some(d) if !attach => d.len() as u64,
+            _ => 0,
+        };
+        let cparams = get_cparams(
+            level,
+            frame_pledged.unwrap_or(CONTENTSIZE_UNKNOWN),
+            frame_dict_size,
+        );
         if crate::ldm::LdmParams::auto(&cparams).is_some() {
             return Err(Error::Encode(
                 "long-distance matching with multithreading is not supported yet",
@@ -4114,6 +4217,7 @@ impl MtStreamState {
                 cparams.window_log,
                 frame_pledged,
                 checksum,
+                attach,
             )?),
         };
 
@@ -4133,19 +4237,24 @@ impl MtStreamState {
         })
     }
 
-    /// Prepare job 0's CDict-attach compressor (`jobs[0].cdict`). C builds the
+    /// Prepare job 0's CDict compressor (`jobs[0].cdict`). C builds the
     /// dictionary's CDict with the **createCDict** cParams (`ZSTD_initLocalDict`
-    /// → `createCDict_advanced2`), and job 0 attaches it (unknown / small frame
-    /// size → attach) with the working windowLog taken from the frame cParams
-    /// (the no-dict windowLog). This is exactly [`streaming_cdict_init`]'s
-    /// compressor — only the section/overlap framing around it is MT-specific.
-    /// Copy (large known frame) and tiny dicts are not supported yet.
+    /// → `createCDict_advanced2`); job 0 then either **attaches** it (`attach`,
+    /// `ZSTD_resetCCtx_byAttachingCDict`: an unknown / small frame — exactly
+    /// [`streaming_cdict_init`]'s compressor) or **copies** the de-tagged CDict
+    /// tables into the working context (`ZSTD_resetCCtx_byCopyingCDict`: a known
+    /// frame above the strategy cutoff — exactly [`compress_with_cdict`]'s copy
+    /// branch, with the dict as a contiguous extDict prefix). In both cases the
+    /// working windowLog is the frame cParams' windowLog (no-dict for attach,
+    /// dict-aware for copy); only the section/overlap framing around it is
+    /// MT-specific. Tiny dicts are not supported yet.
     fn build_dict_job0(
         dict: &[u8],
         level: i32,
         frame_window_log: u32,
         frame_pledged: Option<u64>,
         checksum: bool,
+        attach: bool,
     ) -> Result<MtDictJob0, Error> {
         let (content, entropy, rep, dict_id) = parse_cdict(dict)?;
         if content.len() <= HASH_READ_SIZE {
@@ -4153,29 +4262,84 @@ impl MtStreamState {
                 "multithreaded streaming with a <= 8-byte dictionary is not supported yet",
             ));
         }
-        let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
-        // `ZSTD_shouldAttachDict`: an unknown frame size attaches; a known size
-        // above the strategy cutoff would copy the dict (not ported for MT).
-        if frame_pledged.is_some_and(|p| p as usize > cdict_attach_cutoff(cdict_cparams.strategy)) {
-            return Err(Error::Encode(
-                "multithreaded streaming with a CDict above the attach cutoff \
-                 (copy path) is not supported yet",
-            ));
-        }
         let content_len = content.len();
-        // Job 0 attaches the CDict (createCDict cParams for its tables); the
-        // working windowLog is the frame's (no-dict) windowLog.
-        let mut fc0 = attach_cdict_compressor(
-            content,
-            cdict_cparams,
-            frame_pledged,
-            checksum,
-            frame_window_log,
-        );
+        let cdict_cparams = get_cparams_create_cdict(level, dict.len() as u64);
+        let mut fc0 = if attach {
+            // Job 0 attaches the CDict (createCDict cParams for its tables); the
+            // working windowLog is the frame's (no-dict) windowLog.
+            let mut fc0 = attach_cdict_compressor(
+                content,
+                cdict_cparams,
+                frame_pledged,
+                checksum,
+                frame_window_log,
+            );
+            fc0.window = Window::streaming_attached_dict(content_len);
+            fc0
+        } else {
+            // `ZSTD_resetCCtx_byCopyingCDict`: the working tables become the
+            // de-tagged CDict tables (= a Path-A `load_dictionary` / `dtlm_full`
+            // fill with the CDict's own cParams), the dict a contiguous extDict
+            // prefix, and the windowLog overridden to the frame's (dict-aware)
+            // one. Mirrors the copy branch of [`compress_with_cdict`].
+            //
+            // A **trained** (ZDICT) dictionary on the copy path is deferred: the
+            // standalone `compress_with_cdict` copy of a multi-block input with a
+            // trained dict diverges from C at the higher strategies (a separate,
+            // pre-existing seeded-entropy / post-split issue, unrelated to the
+            // `loadedDictEnd` window-filling fix), so reject it cleanly here rather
+            // than reproduce that divergence. Raw-content dicts are fully supported.
+            if dict_id != 0 {
+                return Err(Error::Encode(
+                    "multithreaded streaming with a trained (ZDICT) dictionary on the \
+                     copy path is not supported yet",
+                ));
+            }
+            let mut working = cdict_cparams;
+            working.window_log = frame_window_log;
+            let mut fc0 = FrameCompressor::from_cparams(working, frame_pledged, checksum);
+            match cdict_cparams.strategy {
+                Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
+                    let cdict_uses_row = crate::lazy::use_row_match_finder(&cdict_cparams);
+                    let mut ctx =
+                        crate::lazy::LazyCtx::with_row_match_finder(&working, cdict_uses_row);
+                    ctx.use_cdict_hash_salt();
+                    ctx.load_dictionary(content, content_len);
+                    fc0.matcher = Matcher::Lazy(ctx);
+                }
+                Strategy::Btopt | Strategy::Btultra | Strategy::Btultra2 => {
+                    if let Matcher::Opt(ctx) = &mut fc0.matcher {
+                        ctx.load_dictionary(content, content_len);
+                    }
+                }
+                _ => match &mut fc0.matcher {
+                    Matcher::Fast(ctx) => {
+                        fill_fast_hash_table_for_cctx_full(ctx, content, content_len)
+                    }
+                    Matcher::Dfast(ctx) => {
+                        fill_dfast_hash_tables_for_cctx_full(ctx, content, content_len)
+                    }
+                    _ => {}
+                },
+            }
+            // LDM seeded from a copied dict isn't ported (as in `compress_with_cdict`);
+            // the frame-level gate in `new` already covers the realistic cases, but
+            // the CDict's createCDict strategy can differ from the frame strategy, so
+            // guard here too rather than diverge.
+            if fc0.ldm.is_some() {
+                return Err(Error::Encode(
+                    "long-distance matching with a CDict is not supported yet",
+                ));
+            }
+            fc0.window = Window::streaming_ext_dict(content_len);
+            fc0
+        };
+        // `prevCBlock = cdict.cBlockState` on both paths.
         fc0.entropy = entropy;
         fc0.rep = rep;
         fc0.dict_id = dict_id;
-        fc0.window = Window::streaming_attached_dict(content_len);
+        // Lazy/opt resume table insertion at the src start (attach: src begins at
+        // `cdictEnd`; copy: at the dict/src seam — both == `dictLimit`).
         match &mut fc0.matcher {
             Matcher::Lazy(ctx) => ctx.next_to_update = fc0.window.dict_limit as usize,
             Matcher::Opt(ctx) => ctx.next_to_update = fc0.window.dict_limit as usize,

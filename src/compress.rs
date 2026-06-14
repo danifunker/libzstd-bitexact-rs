@@ -3117,6 +3117,24 @@ enum Stage {
     Ending,
 }
 
+/// A ZSTDMT job's pre-generated LDM sequences (the serial state's per-segment
+/// `rawSeqStore`) plus the persistent cursor consumed across the job's blocks
+/// (`zc->externSeqStore`, applied via `ZSTD_referenceExternalSequences`).
+struct MtExtSeqs {
+    seqs: Vec<crate::ldm::RawSeq>,
+    cursor: crate::opt::LdmCursor,
+}
+
+/// `ZSTD_ldm_blockCompress`'s `ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore,
+/// srcSize)`: advance the externSeqStore cursor past one block (run after every
+/// block of a ZSTDMT LDM job — including tiny/raw blocks, which C skips the same
+/// way in `ZSTD_buildSeqStore`).
+fn advance_ext_seqs(ext: &mut Option<MtExtSeqs>, block_size: usize) {
+    if let Some(ext) = ext {
+        ext.cursor.skip_bytes(&ext.seqs, block_size);
+    }
+}
+
 /// The frame-compression half of `ZSTD_CCtx`: every piece of state that
 /// persists across `ZSTD_compressContinue` calls. The one-shot [`compress`]
 /// feeds a single chunk; the streaming encoder feeds successive chunks of its
@@ -3148,6 +3166,11 @@ pub(crate) struct FrameCompressor {
     /// long-distance matching on: `strategy >= btopt && windowLog >= 27`,
     /// i.e. level 22 at unknown or > 64 MiB content sizes.
     ldm: Option<crate::ldm::LdmState>,
+    /// A ZSTDMT job's pre-generated LDM sequences + persistent cursor (the serial
+    /// state's per-segment `rawSeqStore`, applied as the job's `externSeqStore`).
+    /// Present only on a ZSTDMT LDM job; mutually exclusive with `ldm` (the job
+    /// itself has LDM disabled — the candidates come from here).
+    ext_seqs: Option<MtExtSeqs>,
     /// Set by `compress_with_dict`: the window has been arranged directly in
     /// the post-flip extDict state, so the first `compress_continue` must NOT
     /// run `ZSTD_window_update` (which would recompute the wrong segment
@@ -3259,6 +3282,7 @@ impl FrameCompressor {
             disable_literal_compression,
             window: Window::new(),
             ldm: crate::ldm::LdmParams::auto(&cparams).map(crate::ldm::LdmState::new),
+            ext_seqs: None,
             window_preloaded: false,
             dict_id: 0,
             dict_match_state: None,
@@ -3549,10 +3573,14 @@ impl FrameCompressor {
                             }),
                             _ => None,
                         };
-                        // `ZSTD_buildSeqStore`: with LDM enabled, generate
-                        // the block's raw sequences first; the opt parser
-                        // takes them as extra candidates
-                        // (`ZSTD_ldm_blockCompress`, btopt+ branch).
+                        // `ZSTD_buildSeqStore`: with LDM enabled, the opt parser
+                        // takes the block's raw sequences as extra candidates
+                        // (`ZSTD_ldm_blockCompress`, btopt+ branch). Single-threaded
+                        // generates the *block's* sequences here (`self.ldm`); a
+                        // ZSTDMT job instead consumes its *segment-wide*
+                        // pre-generated `rawSeqStore` (`self.ext_seqs`, the serial
+                        // state's externSeqStore) with a cursor that persists across
+                        // the job's blocks.
                         let mut ldm_seqs: Vec<crate::ldm::RawSeq> = Vec::new();
                         if let Some(ldm) = &mut self.ldm {
                             let capacity =
@@ -3566,6 +3594,16 @@ impl FrameCompressor {
                                 pos + block_size,
                             )?;
                         }
+                        let (ldm_input, ldm_cursor): (
+                            Option<&[crate::ldm::RawSeq]>,
+                            crate::opt::LdmCursor,
+                        ) = if self.ldm.is_some() {
+                            (Some(&ldm_seqs), crate::opt::LdmCursor::default())
+                        } else if let Some(ext) = &self.ext_seqs {
+                            (Some(&ext.seqs), ext.cursor)
+                        } else {
+                            (None, crate::opt::LdmCursor::default())
+                        };
                         crate::opt::compress_block_opt(
                             ctx,
                             &mut store,
@@ -3575,11 +3613,8 @@ impl FrameCompressor {
                             pos + block_size,
                             &mut self.window,
                             ext_dict,
-                            if self.ldm.is_some() {
-                                Some(&ldm_seqs)
-                            } else {
-                                None
-                            },
+                            ldm_input,
+                            ldm_cursor,
                             Some(&self.entropy),
                             opt_dms.as_ref(),
                         )
@@ -3604,6 +3639,7 @@ impl FrameCompressor {
                         self.is_first_block,
                     )?;
                     savings += block_size as i64 - c_size as i64;
+                    advance_ext_seqs(&mut self.ext_seqs, block_size);
                     pos += block_size;
                     self.is_first_block = false;
                     continue;
@@ -3654,6 +3690,7 @@ impl FrameCompressor {
             };
 
             savings += block_size as i64 - c_size as i64;
+            advance_ext_seqs(&mut self.ext_seqs, block_size);
             pos += block_size;
             self.is_first_block = false;
         }
@@ -3870,11 +3907,25 @@ const ZSTDMT_JOBSIZE_MAX: u64 = 1024 * 1024 * 1024;
 /// `ZSTDMT_JOBLOG_MAX` on a 64-bit target (`zstdmt_compress.h:35`).
 const ZSTDMT_JOBLOG_MAX: u32 = 30;
 
+/// `ZSTDMT_computeTargetJobLog` (`zstdmt_compress.c:1184`): the log of the
+/// computed per-job input size. With LDM the windowLog is oversized, so it sizes
+/// jobs from `cycleLog` instead (`MAX(21, cycleLog(chainLog, strat) + 3)`).
+fn mt_target_job_log(cp: &CParams, ldm: bool) -> u32 {
+    let job_log = if ldm {
+        21.max(cycle_log(cp.chain_log, cp.strategy) + 3)
+    } else {
+        20.max(cp.window_log + 2)
+    };
+    job_log.min(ZSTDMT_JOBLOG_MAX)
+}
+
 /// `ZSTDMT_computeOverlapSize` (`zstdmt_compress.c:1226`): how many bytes of the
 /// previous job's tail each job loads as a raw-content prefix
-/// (`mtctx->targetPrefixSize`). The non-LDM branch only (LDM-with-MT is gated
-/// out before this is reached).
-fn mt_overlap_size(cp: &CParams, overlap_log: i32) -> usize {
+/// (`mtctx->targetPrefixSize`). With LDM the overlap is a fraction of the
+/// (cycleLog-based) job size rather than the oversized window — and at the
+/// btultra2 default it is the **whole window**, so cross-job LDM offsets stay
+/// inside `prefix ++ segment`.
+fn mt_overlap_size(cp: &CParams, overlap_log: i32, ldm: bool) -> usize {
     // `ZSTDMT_overlapLog_default` (`:1198`) then `ZSTDMT_overlapLog` (`:1219`).
     let default_overlap_log = match cp.strategy {
         Strategy::Btultra2 => 9,
@@ -3888,7 +3939,10 @@ fn mt_overlap_size(cp: &CParams, overlap_log: i32) -> usize {
         overlap_log
     };
     let overlap_rlog = 9 - eff;
-    let ov_log = if overlap_rlog >= 8 {
+    let ov_log = if ldm {
+        // The LDM branch overwrites ovLog (`:1236`).
+        (cp.window_log as i32).min(mt_target_job_log(cp, true) as i32 - 2) - overlap_rlog
+    } else if overlap_rlog >= 8 {
         0
     } else {
         cp.window_log as i32 - overlap_rlog
@@ -3898,15 +3952,14 @@ fn mt_overlap_size(cp: &CParams, overlap_log: i32) -> usize {
 
 /// `ZSTDMT_computeTargetJobLog` + the clamps in `ZSTDMT_initCStream_internal`
 /// (`zstdmt_compress.c:1184` / `:1266-1309`): the per-job input size
-/// (`mtctx->targetSectionSize`). Non-LDM branch only.
-fn mt_target_section_size(cp: &CParams, job_size: u64, overlap_size: usize) -> usize {
+/// (`mtctx->targetSectionSize`).
+fn mt_target_section_size(cp: &CParams, job_size: u64, overlap_size: usize, ldm: bool) -> usize {
     let mut tss = if job_size != 0 {
         // Explicit `ZSTD_c_jobSize`: clamped to `[MIN, MAX]` (not rounded to a
         // power of two, unlike the computed path).
         job_size.clamp(ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX) as usize
     } else {
-        let target_job_log = (cp.window_log + 2).clamp(20, ZSTDMT_JOBLOG_MAX);
-        1usize << target_job_log
+        1usize << mt_target_job_log(cp, ldm)
     };
     // "job size must be >= overlap size" (`:1309`).
     if tss < overlap_size {
@@ -3936,8 +3989,17 @@ fn compress_mt_job(
     write_header: bool,
     is_last: bool,
     checksum: bool,
+    ext_seqs: Option<Vec<crate::ldm::RawSeq>>,
 ) -> Result<(), Error> {
     let mut fc = FrameCompressor::from_cparams(cparams, pledged, checksum);
+    // C disables LDM on the job itself (`jobParams.ldmParams.enableLdm =
+    // ps_disable`, zstdmt:718); LDM candidates arrive as the pre-generated
+    // `externSeqStore` (the serial state's per-segment `rawSeqStore`).
+    fc.ldm = None;
+    fc.ext_seqs = ext_seqs.map(|seqs| MtExtSeqs {
+        seqs,
+        cursor: crate::opt::LdmCursor::default(),
+    });
     if prefix_len > 0 {
         prime_contiguous_prefix(&mut fc, buf, prefix_len);
     }
@@ -3972,12 +4034,12 @@ fn compress_mt_job(
 /// 4-byte digest is appended once after the last job (a single job appends it
 /// itself).
 ///
-/// Current scope: no dictionary. Two rare configurations return a clean
-/// [`Error::Encode`] rather than diverging: long-distance matching with
-/// multithreading (`windowLog >= 27` at btopt+, only reached by very large
-/// inputs), and an explicit `overlap_log` whose overlap exceeds the indexable
-/// dictionary size (`maxDictSize`) — the default `overlap_log` never does.
-/// Dictionaries and cross-job LDM are later increments.
+/// Long-distance matching is handled: one continuous `LdmState` (C's
+/// `ZSTDMT_serialState`) over the whole input generates each job's sequences per
+/// segment, which the job consumes as its externSeqStore. The only configuration
+/// that returns a clean [`Error::Encode`] rather than diverging is an explicit
+/// `overlap_log` whose overlap exceeds the indexable dictionary size
+/// (`maxDictSize`) — the default `overlap_log` never does. No dictionary yet.
 pub fn compress_mt(
     src: &[u8],
     level: i32,
@@ -4002,17 +4064,16 @@ pub fn compress_mt(
     // input): the whole-frame `pledgedSrcSize` is the known input size.
     let cparams = get_cparams(level, src_len as u64, 0);
 
-    // C's MT path seeds/​shares LDM state across jobs via the serial state; that
-    // is not ported, so reject the configs where `ZSTD_resolveEnableLdm` turns
-    // it on (btopt+ with `windowLog >= 27`). Unreachable at typical sizes.
-    if crate::ldm::LdmParams::auto(&cparams).is_some() {
-        return Err(Error::Encode(
-            "long-distance matching with multithreading is not supported yet",
-        ));
-    }
+    // C's MT path shares one LDM state across all jobs (`ZSTDMT_serialState`):
+    // `ZSTD_resolveEnableLdm` turns it on for btopt+ with `windowLog >= 27`
+    // (level 22 above ~64 MiB). The job decomposition + overlap use the LDM-aware
+    // branches, and one continuous `LdmState` generates each job's `rawSeqStore`
+    // per segment (in the loop below), consumed by the job as its externSeqStore.
+    let ldm_params = crate::ldm::LdmParams::auto(&cparams);
+    let ldm_enabled = ldm_params.is_some();
 
-    let overlap_size = mt_overlap_size(&cparams, overlap_log);
-    let section_size = mt_target_section_size(&cparams, job_size, overlap_size);
+    let overlap_size = mt_overlap_size(&cparams, overlap_log, ldm_enabled);
+    let section_size = mt_target_section_size(&cparams, job_size, overlap_size, ldm_enabled);
 
     // `ZSTD_loadDictionaryContent` only indexes the *suffix* of a prefix larger
     // than `maxDictSize` (zstd_compress.c:4962); that truncation isn't ported.
@@ -4037,6 +4098,9 @@ pub fn compress_mt(
     // Multi-job: split into `section_size` segments; each non-first job sees the
     // last `overlap_size` bytes of the previous (full) segment as a raw prefix.
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
+    // One continuous LDM state over the whole input (`ZSTDMT_serialState`),
+    // reset once; advanced + queried per segment, in job order.
+    let mut ldm_state = ldm_params.map(crate::ldm::LdmState::new);
     let mut seg_start = 0usize;
     let mut first = true;
     let mut job_count = 0usize;
@@ -4064,6 +4128,19 @@ pub fn compress_mt(
         } else {
             seg_len as u64
         });
+        // The serial LDM state advances over this segment (the new content only,
+        // not the carried prefix) and writes the job's `rawSeqStore`
+        // (`ZSTDMT_serialState_genSequences`); the job consumes it as its
+        // externSeqStore. The shared window/table persist for the next segment.
+        let ext_seqs = if let Some(ldm) = &mut ldm_state {
+            ldm.window.update(seg_start, seg_end);
+            let cap = section_size / ldm.params.min_match_length as usize;
+            let mut seqs = Vec::new();
+            crate::ldm::generate_sequences(ldm, &mut seqs, cap, src, seg_start, seg_end)?;
+            Some(seqs)
+        } else {
+            None
+        };
         // C keeps the checksum flag on for job 0 only (header bit; a single job
         // appends the digest itself), and clears it on later jobs.
         compress_mt_job(
@@ -4075,6 +4152,7 @@ pub fn compress_mt(
             first,
             is_last,
             checksum && first,
+            ext_seqs,
         )?;
         job_count += 1;
 
@@ -4194,13 +4272,17 @@ impl MtStreamState {
             frame_pledged.unwrap_or(CONTENTSIZE_UNKNOWN),
             frame_dict_size,
         );
+        // Streaming cross-job LDM is a later increment (the serial LDM state needs
+        // a full-window round buffer here, not the bounded overlap+section); the
+        // one-shot `compress_mt` path supports it. Gate it cleanly for now.
         if crate::ldm::LdmParams::auto(&cparams).is_some() {
             return Err(Error::Encode(
-                "long-distance matching with multithreading is not supported yet",
+                "long-distance matching with multithreaded streaming is not supported yet",
             ));
         }
-        let overlap_size = mt_overlap_size(&cparams, overlap_log);
-        let section_size = mt_target_section_size(&cparams, job_size, overlap_size);
+        // LDM is gated out above, so the non-LDM sizing branches apply here.
+        let overlap_size = mt_overlap_size(&cparams, overlap_log, false);
+        let section_size = mt_target_section_size(&cparams, job_size, overlap_size, false);
         let max_dict_size = 1u64 << ((cparams.hash_log + 3).max(cparams.chain_log + 1)).min(31);
         if overlap_size as u64 > max_dict_size {
             return Err(Error::Encode(
@@ -4459,6 +4541,8 @@ impl MtStreamState {
                 // C keeps the checksum flag on for job 0 only (header bit; a single
                 // job appends its own digest), clearing it on later jobs.
                 self.checksum && self.first,
+                // Streaming cross-job LDM is gated out in `new`, so no externSeqStore.
+                None,
             )?;
         }
         self.job_count += 1;

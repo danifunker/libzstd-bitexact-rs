@@ -214,6 +214,38 @@ fn mt_default_jobsize_is_bit_exact() {
     }
 }
 
+/// Cross-job LDM: one `ZSTDMT_serialState` LDM state shared across all jobs. LDM
+/// auto-enables at level 22 once windowLog reaches 27, which a one-shot input only
+/// does above 64 MiB. A 768 KiB block repeated past the 1 MiB overlap makes the
+/// LDM find long matches reaching back **across job boundaries** (into the prefix
+/// = the previous segment): the serial state generates each job's `rawSeqStore`
+/// per segment, and the opt parser consumes it via a cursor persisting across the
+/// job's blocks. `overlapLog 2` (overlap = 1 MiB > the 768 KiB match distance)
+/// keeps every LDM offset inside `prefix ++ segment`, where C can represent it.
+/// Very heavy (>64 MiB at level 22): release only.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cross-job LDM needs a >64 MiB level-22 input; run in release"
+)]
+fn mt_cross_job_ldm_is_bit_exact() {
+    let target = 65 * 1024 * 1024; // > 64 MiB so windowLog resizes up to 27 (LDM on)
+    // (repeat-block size, overlapLog -> overlap, jobSize): the block repeats below
+    // the overlap, so LDM matches reach back across jobs but stay in `prefix++seg`.
+    let cases: &[(usize, u32, u32)] = &[
+        (768 * 1024, 2, 4 * 1024 * 1024), // 1 MiB overlap, 4 MiB jobs (~16 jobs)
+        (384 * 1024, 1, 2 * 1024 * 1024), // 512 KiB overlap, 2 MiB jobs (~32 jobs)
+    ];
+    for &(block_len, overlap_log, job_size) in cases {
+        let block = word_salad(0x1D34_A210 ^ block_len as u64, block_len);
+        let mut src = Vec::with_capacity(target + block.len());
+        while src.len() < target {
+            src.extend_from_slice(&block);
+        }
+        check(&src, 22, 2, job_size, overlap_log, false);
+    }
+}
+
 /// An explicit `overlapLog` whose overlap exceeds `maxDictSize` (e.g. 9 at a
 /// fast level, where the hash/chain tables are small) isn't supported: C would
 /// index only the prefix suffix, which we don't port — so it must error

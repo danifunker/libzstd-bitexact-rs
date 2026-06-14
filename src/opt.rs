@@ -1115,6 +1115,42 @@ fn opt_ldm_process_match_candidate(
     opt_ldm_maybe_add_match(ctx, nb_matches, opt_ldm, curr_pos_in_block, min_match);
 }
 
+/// A persistent cursor into a pre-generated `rawSeqStore` (`{pos, posInSequence}`),
+/// carried across the blocks of one ZSTDMT job — C's `zc->externSeqStore`. The
+/// serial LDM state generates one `Vec<RawSeq>` per job **segment**; each block's
+/// opt parse reads the cursor *read-only* (a by-value copy, so the btultra2 double
+/// pass starts both passes from the same position), and after the block the driver
+/// advances the cursor by the whole block size via [`skip_bytes`](Self::skip_bytes)
+/// (`ZSTD_ldm_blockCompress` calls `ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore,
+/// srcSize)`). Single-threaded LDM instead generates block-local sequences and
+/// uses a fresh `(0, 0)` per block, so it always passes [`LdmCursor::default`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LdmCursor {
+    pos: usize,
+    pos_in_sequence: usize,
+}
+
+impl LdmCursor {
+    /// `ZSTD_ldm_skipRawSeqStoreBytes` (zstd_ldm.c:664): advance past `nb_bytes`
+    /// of the segment (called per block with the block size).
+    pub(crate) fn skip_bytes(&mut self, seqs: &[crate::ldm::RawSeq], nb_bytes: usize) {
+        let mut curr_pos = (self.pos_in_sequence + nb_bytes) as u32;
+        while curr_pos > 0 && self.pos < seqs.len() {
+            let seq = seqs[self.pos];
+            if curr_pos >= seq.lit_length + seq.match_length {
+                curr_pos -= seq.lit_length + seq.match_length;
+                self.pos += 1;
+            } else {
+                self.pos_in_sequence = curr_pos as usize;
+                break;
+            }
+        }
+        if curr_pos == 0 || self.pos == seqs.len() {
+            self.pos_in_sequence = 0;
+        }
+    }
+}
+
 // --- The optimal parser ---------------------------------------------------------
 
 /// `ZSTD_compressBlock_btultra2`'s first-block stats-seeding double pass.
@@ -1129,6 +1165,7 @@ pub(crate) fn compress_block_opt(
     win: &mut Window,
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
+    ldm_cursor: LdmCursor,
     symbol_costs: Option<&FseEntropyState>,
     dms: Option<&OptDms>,
 ) -> usize {
@@ -1168,6 +1205,7 @@ pub(crate) fn compress_block_opt(
             block_end,
             false,
             ldm_seqs,
+            ldm_cursor,
             symbol_costs,
             dms,
         );
@@ -1187,6 +1225,7 @@ pub(crate) fn compress_block_opt(
         block_end,
         ext_dict,
         ldm_seqs,
+        ldm_cursor,
         symbol_costs,
         dms,
     )
@@ -1205,6 +1244,7 @@ fn compress_block_opt_generic(
     block_end: usize,
     ext_dict: bool,
     ldm_seqs: Option<&[crate::ldm::RawSeq]>,
+    ldm_cursor: LdmCursor,
     symbol_costs: Option<&FseEntropyState>,
     dms: Option<&OptDms>,
 ) -> usize {
@@ -1228,8 +1268,8 @@ fn compress_block_opt_generic(
     // at block position 0 with the whole block remaining.
     let mut opt_ldm = OptLdm {
         seqs: ldm_seqs.unwrap_or(&[]),
-        pos: 0,
-        pos_in_sequence: 0,
+        pos: ldm_cursor.pos,
+        pos_in_sequence: ldm_cursor.pos_in_sequence,
         start_pos_in_block: 0,
         end_pos_in_block: 0,
         offset: 0,

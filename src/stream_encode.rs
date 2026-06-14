@@ -238,18 +238,22 @@ impl StreamEncoder {
                     "multithreaded streaming with a dictionary is not supported yet",
                 ));
             }
-            if self.requested_pledged.is_some() {
-                return Err(Error::Encode(
-                    "multithreaded streaming with a pledged size is not supported yet",
-                ));
+            // Engage MT for an unknown size, or a pledged size above the MT floor;
+            // a pledge at or below it falls through to the single-threaded path.
+            let engages = match self.requested_pledged {
+                Some(p) => p > ZSTDMT_JOBSIZE_MIN,
+                None => true,
+            };
+            if engages {
+                self.mt_state = Some(MtStreamState::new(
+                    self.level,
+                    self.job_size,
+                    self.overlap_log,
+                    self.checksum,
+                    self.requested_pledged,
+                )?);
+                return Ok(());
             }
-            self.mt_state = Some(MtStreamState::new(
-                self.level,
-                self.job_size,
-                self.overlap_log,
-                self.checksum,
-            )?);
-            return Ok(());
         }
         let pledged = if end_op == EndOp::End {
             // "auto-determine pledgedSrcSize" — overrides any prior pledge.
@@ -292,19 +296,17 @@ impl StreamEncoder {
     }
 
     /// Drive the multithreaded streaming path: buffer `input` into jobs
-    /// ([`MtStreamState`]). `flush` is not supported yet (it would force a
-    /// partial-section job, changing the decomposition).
+    /// ([`MtStreamState`]). A `flush` emits the buffered partial section as a
+    /// (non-last) job, leaving the frame open.
     fn mt_drive(&mut self, input: &[u8], op: EndOp, out: &mut Vec<u8>) -> Result<(), Error> {
         match op {
             EndOp::Continue => self.mt_state.as_mut().unwrap().push(input, out),
+            EndOp::Flush => self.mt_state.as_mut().unwrap().flush(out),
             EndOp::End => {
                 self.mt_state.as_mut().unwrap().end(input, out)?;
                 self.frame_ended = true;
                 Ok(())
             }
-            EndOp::Flush => Err(Error::Encode(
-                "multithreaded streaming flush is not supported yet",
-            )),
         }
     }
 
@@ -319,10 +321,12 @@ impl StreamEncoder {
             // A first-call `finish` auto-pledges the content size. With workers and
             // a size above the MT floor, C delegates to `ZSTD_compress2` — the
             // one-shot MT frame (known size), not unknown-size streaming.
+            // A first-call `finish` auto-pledges to this call's input size
+            // (overriding any prior pledge), so above the MT floor it is the
+            // one-shot MT frame for that size regardless of `requested_pledged`.
             if op == EndOp::End
                 && self.nb_workers > 0
                 && self.dict.is_none()
-                && self.requested_pledged.is_none()
                 && input.len() as u64 > ZSTDMT_JOBSIZE_MIN
             {
                 out.extend_from_slice(&compress_mt(

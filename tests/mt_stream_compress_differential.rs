@@ -350,19 +350,266 @@ fn mt_stream_checksum_is_bit_exact() {
     check_ck(3, 4, 512 * 1024, 0, true, &[], &big);
 }
 
-/// `flush`, a pledged size, and dictionaries with workers are not supported yet
-/// — they must error cleanly, never diverge.
+/// Dictionaries with workers are not supported yet — must error cleanly.
 #[test]
 fn mt_stream_unsupported_errors_cleanly() {
+    let dict = word_salad(0x99, 4096);
     let body = word_salad(0x44, 700 * 1024);
     let mut out = Vec::new();
-    let mut enc = StreamEncoder::new(3).with_workers(2, 512 * 1024, 0);
-    enc.compress(&body, &mut out).unwrap();
-    assert!(enc.flush(&mut out).is_err(), "MT flush must error cleanly");
-
-    let mut out2 = Vec::new();
-    let r = StreamEncoder::with_pledged_src_size(3, body.len() as u64)
+    let r = StreamEncoder::with_dictionary(3, &dict)
         .with_workers(2, 512 * 1024, 0)
-        .compress(&body, &mut out2);
-    assert!(r.is_err(), "MT + pledged size must error cleanly");
+        .compress(&body, &mut out);
+    assert!(r.is_err(), "MT + dictionary must error cleanly");
+}
+
+/// Drive C with a pledged content size set up front.
+fn oracle_pledged(
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    pledged: u64,
+    chunks: &[&[u8]],
+    finish: &[u8],
+) -> Vec<u8> {
+    use zstd_sys::ZSTD_EndDirective as Dir;
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    cctx.set_parameter(CParameter::NbWorkers(workers)).unwrap();
+    cctx.set_parameter(CParameter::JobSize(job_size)).unwrap();
+    cctx.set_pledged_src_size(Some(pledged)).unwrap();
+
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; 1024 * 1024];
+    let mut step = |cctx: &mut CCtx, out: &mut Vec<u8>, inb: &mut InBuffer, dir: Dir| -> usize {
+        let mut outb = OutBuffer::around(&mut scratch[..]);
+        let hint = cctx
+            .compress_stream2(&mut outb, inb, dir)
+            .map_err(map_code)
+            .unwrap();
+        let produced = outb.pos();
+        out.extend_from_slice(&scratch[..produced]);
+        hint
+    };
+    for &data in chunks {
+        let mut inb = InBuffer::around(data);
+        loop {
+            step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_continue);
+            if inb.pos >= data.len() {
+                break;
+            }
+        }
+    }
+    let mut inb = InBuffer::around(finish);
+    loop {
+        let hint = step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_end);
+        if hint == 0 && inb.pos == finish.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// A pledged (known) content size with multithreaded streaming: job 0 writes an
+/// FCS header and the cParams resize to the known size. Covers the multi-job,
+/// exact-multiple (empty-block), single-job (≤ MT floor → single-threaded), and
+/// first-call (one-shot MT) cases.
+#[test]
+fn mt_stream_pledged_size_is_bit_exact() {
+    for &level in &[1i32, 3, 6, 9, 17] {
+        let body = word_salad(0x9E ^ level as u64, 1400 * 1024);
+        let n = body.len() as u64;
+        let h = body.len() / 2;
+        let cases: &[(Vec<&[u8]>, &[u8])] = &[
+            (vec![&body[..]], &[]),
+            (vec![&body[..h]], &body[h..]),
+            (vec![&body[..h], &body[h..]], &[]),
+        ];
+        for (chunks, finish) in cases {
+            let theirs = oracle_pledged(level, 2, 512 * 1024, n, chunks, finish);
+            let mut enc =
+                StreamEncoder::with_pledged_src_size(level, n).with_workers(2, 512 * 1024, 0);
+            let mut mine = Vec::new();
+            for &c in chunks {
+                enc.compress(c, &mut mine).unwrap();
+            }
+            enc.finish(finish, &mut mine).unwrap();
+            assert_eq!(
+                mine,
+                theirs,
+                "pledged byte mismatch: level={level} ours={} theirs={}",
+                mine.len(),
+                theirs.len()
+            );
+            assert_eq!(
+                zstd::decode_all(&mine[..]).unwrap(),
+                body,
+                "pledged round-trip"
+            );
+        }
+
+        // Exact multiple via compress + finish(empty) -> trailing empty block,
+        // with the size pledged.
+        let exact = word_salad(0x9F ^ level as u64, 1024 * 1024);
+        let theirs = oracle_pledged(level, 2, 512 * 1024, exact.len() as u64, &[&exact[..]], &[]);
+        let mut enc = StreamEncoder::with_pledged_src_size(level, exact.len() as u64).with_workers(
+            2,
+            512 * 1024,
+            0,
+        );
+        let mut mine = Vec::new();
+        enc.compress(&exact, &mut mine).unwrap();
+        enc.finish(&[], &mut mine).unwrap();
+        assert_eq!(
+            mine, theirs,
+            "pledged exact-multiple mismatch: level={level}"
+        );
+        assert_eq!(
+            zstd::decode_all(&mine[..]).unwrap(),
+            exact,
+            "pledged exact round-trip: level={level}"
+        );
+    }
+
+    // Pledged size <= MT floor -> MT disabled -> single-threaded frame.
+    let small = word_salad(0x5, 300 * 1024);
+    let theirs = oracle_pledged(
+        3,
+        2,
+        512 * 1024,
+        small.len() as u64,
+        &[&small[..200 * 1024]],
+        &small[200 * 1024..],
+    );
+    let mut enc =
+        StreamEncoder::with_pledged_src_size(3, small.len() as u64).with_workers(2, 512 * 1024, 0);
+    let mut mine = Vec::new();
+    enc.compress(&small[..200 * 1024], &mut mine).unwrap();
+    enc.finish(&small[200 * 1024..], &mut mine).unwrap();
+    assert_eq!(mine, theirs, "small pledged (single-threaded) mismatch");
+}
+
+/// One mid-stream operation: a `compress` push or a `flush`.
+#[derive(Clone, Copy)]
+enum MidOp<'a> {
+    Push(&'a [u8]),
+    Flush,
+}
+
+/// Drive C with an explicit op sequence (mid ops, then a final `finish`).
+fn oracle_ops(level: i32, workers: u32, job_size: u32, mid: &[MidOp], finish: &[u8]) -> Vec<u8> {
+    use zstd_sys::ZSTD_EndDirective as Dir;
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    cctx.set_parameter(CParameter::NbWorkers(workers)).unwrap();
+    cctx.set_parameter(CParameter::JobSize(job_size)).unwrap();
+
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; 1024 * 1024];
+    let mut step = |cctx: &mut CCtx, out: &mut Vec<u8>, inb: &mut InBuffer, dir: Dir| -> usize {
+        let mut outb = OutBuffer::around(&mut scratch[..]);
+        let hint = cctx
+            .compress_stream2(&mut outb, inb, dir)
+            .map_err(map_code)
+            .unwrap();
+        let produced = outb.pos();
+        out.extend_from_slice(&scratch[..produced]);
+        hint
+    };
+    for op in mid {
+        match *op {
+            MidOp::Push(data) => {
+                let mut inb = InBuffer::around(data);
+                loop {
+                    step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_continue);
+                    if inb.pos >= data.len() {
+                        break;
+                    }
+                }
+            }
+            MidOp::Flush => {
+                let mut inb = InBuffer::around(&[]);
+                loop {
+                    if step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_flush) == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let mut inb = InBuffer::around(finish);
+    loop {
+        let hint = step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_end);
+        if hint == 0 && inb.pos == finish.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Drive our encoder with the same op sequence.
+fn ours_ops(level: i32, workers: u32, job_size: u64, mid: &[MidOp], finish: &[u8]) -> Vec<u8> {
+    let mut enc = StreamEncoder::new(level).with_workers(workers, job_size, 0);
+    let mut out = Vec::new();
+    for op in mid {
+        match *op {
+            MidOp::Push(data) => enc.compress(data, &mut out).unwrap(),
+            MidOp::Flush => enc.flush(&mut out).unwrap(),
+        }
+    }
+    enc.finish(finish, &mut out).unwrap();
+    out
+}
+
+/// Mid-stream `flush` forces a partial-section job; the frame stays open and the
+/// flushed segment's overlap still primes the next job. Across strategies.
+#[test]
+fn mt_stream_flush_is_bit_exact() {
+    for &level in &[1i32, 3, 6, 9, 12, 17] {
+        let body = word_salad(0xF10 ^ level as u64, 1400 * 1024);
+        let p = |a: usize, b: usize| MidOp::Push(&body[a..b]);
+        let schedules: &[(&[MidOp], &[u8])] = &[
+            // flush mid-section (partial job), then more, then finish.
+            (
+                &[p(0, 200 * 1024), MidOp::Flush, p(200 * 1024, 900 * 1024)],
+                &body[900 * 1024..],
+            ),
+            // flush right at a section boundary (no-op-ish: buffer already empty
+            // after the full section emitted), then continue.
+            (
+                &[p(0, 512 * 1024), MidOp::Flush, p(512 * 1024, 1000 * 1024)],
+                &body[1000 * 1024..],
+            ),
+            // multiple flushes.
+            (
+                &[
+                    p(0, 100 * 1024),
+                    MidOp::Flush,
+                    MidOp::Flush,
+                    p(100 * 1024, 300 * 1024),
+                    MidOp::Flush,
+                ],
+                &body[300 * 1024..],
+            ),
+            // flush with nothing buffered (immediate), then push + finish.
+            (&[MidOp::Flush, p(0, 700 * 1024)], &body[700 * 1024..]),
+        ];
+        for (mid, finish) in schedules {
+            let theirs = oracle_ops(level, 2, 512 * 1024, mid, finish);
+            let mine = ours_ops(level, 2, 512 * 1024, mid, finish);
+            assert_eq!(
+                mine,
+                theirs,
+                "flush byte mismatch: level={level} ours={} theirs={}",
+                mine.len(),
+                theirs.len(),
+            );
+            assert_eq!(
+                zstd::decode_all(&mine[..]).expect("decode"),
+                body,
+                "flush round-trip mismatch: level={level}"
+            );
+        }
+    }
 }

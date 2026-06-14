@@ -4053,21 +4053,25 @@ pub(crate) struct MtStreamState {
     /// Number of jobs emitted (incl. the trailing empty block); a single-job
     /// frame appends its own checksum so the external append is multi-job only.
     job_count: usize,
+    /// The frame's `pledgedSrcSize`: `Some` for a known content size (job 0
+    /// writes an FCS header and cParams resize to it), `None` for unknown.
+    frame_pledged: Option<u64>,
 }
 
 impl MtStreamState {
-    /// Set up unknown-size MT streaming, or a clean [`Error::Encode`] for the
-    /// configurations not yet supported (the same LDM / `maxDictSize` gates as
-    /// the one-shot [`compress_mt`]).
+    /// Set up MT streaming for a known (`Some`) or unknown (`None`) content size,
+    /// or a clean [`Error::Encode`] for the configurations not yet supported (the
+    /// same LDM / `maxDictSize` gates as the one-shot [`compress_mt`]).
     pub(crate) fn new(
         level: i32,
         job_size: u64,
         overlap_log: i32,
         checksum: bool,
+        frame_pledged: Option<u64>,
     ) -> Result<Self, Error> {
-        // Streaming resolves cParams with an unknown content size (default class,
-        // no window resize) — exactly like single-threaded streaming.
-        let cparams = get_cparams(level, CONTENTSIZE_UNKNOWN, 0);
+        // cParams resolve from the pledged size (a known size resizes the window;
+        // unknown selects the default class) — exactly like single-threaded.
+        let cparams = get_cparams(level, frame_pledged.unwrap_or(CONTENTSIZE_UNKNOWN), 0);
         if crate::ldm::LdmParams::auto(&cparams).is_some() {
             return Err(Error::Encode(
                 "long-distance matching with multithreading is not supported yet",
@@ -4093,6 +4097,7 @@ impl MtStreamState {
             checksum,
             xxh: crate::xxhash::Xxh64::new(0),
             job_count: 0,
+            frame_pledged,
         })
     }
 
@@ -4139,6 +4144,17 @@ impl MtStreamState {
         Ok(())
     }
 
+    /// `ZSTD_compressStream2(.., ZSTD_e_flush)`: emit whatever is buffered as a
+    /// (non-last) job, leaving the frame open. C's loop creates a job for
+    /// `endOp != continue && filled > 0`; a flush with nothing buffered is a
+    /// no-op. The flushed segment's overlap tail still primes the next job.
+    pub(crate) fn flush(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.filled > 0 {
+            self.emit(out, false)?;
+        }
+        Ok(())
+    }
+
     /// Compress the buffered section as one job (or close the frame with an empty
     /// block), then carry its overlap tail forward as the next job's prefix.
     fn emit(&mut self, out: &mut Vec<u8>, is_last: bool) -> Result<(), Error> {
@@ -4157,10 +4173,11 @@ impl MtStreamState {
         }
         let job_filled = self.filled;
         let total = self.prefix_len + job_filled;
-        // Job 0 carries the (unknown) whole-frame size → windowed header; later
-        // jobs pledge their own segment size (clamps that job's window).
+        // Job 0 carries the whole-frame size (a known size → FCS header sized for
+        // the whole frame; `None` → windowed header); later jobs pledge their own
+        // segment size (which clamps that job's window).
         let pledged = if self.first {
-            None
+            self.frame_pledged
         } else {
             Some(job_filled as u64)
         };

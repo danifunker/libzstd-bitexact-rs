@@ -306,8 +306,14 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          the last job (`ZSTDMT_flushProduced`, including after a trailing empty
          block). Gated by `mt_checksum_is_bit_exact` /
          `mt_stream_checksum_is_bit_exact`.
-   - [ ] `ZSTDMT` with a dictionary on job 0, cross-job LDM, and the `flush` /
-         pledged-size streaming paths.
+   - [x] **`ZSTDMT` streaming `flush` + pledged content size — BIT-EXACT.**
+         `flush` emits the buffered partial section as a non-last job (the frame
+         stays open, the overlap still primes the next job). A pledged size
+         resolves cParams from the known size and makes job 0 write an FCS header
+         (engagement: workers + unknown size, or a pledge above 512 KiB; a
+         first-call `finish` delegates to the one-shot MT frame). Gated by
+         `mt_stream_flush_is_bit_exact` / `mt_stream_pledged_size_is_bit_exact`.
+   - [ ] `ZSTDMT` with a dictionary on job 0, and cross-job LDM.
 
 ## M6 — Performance
 

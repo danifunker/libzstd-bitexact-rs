@@ -372,8 +372,21 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          standalone `compress_with_cdict` copy (any dict) and un-gates MT + trained-dict
          copy. Gated by `cdict_copy_multiblock_post_split_is_bit_exact` (multi-block, the
          prior CDict tests were single-block ≤ 60 KiB) + the MT trained-copy tests.
-   - [ ] Remaining `ZSTDMT`: MT + dict + LDM together (the serial state's dict-fill is
-         unported) — a clean error.
+   - [x] **MT + dict + LDM together — BIT-EXACT.** A dictionary loaded via
+         `ZSTD_CCtx_loadDictionary` becomes a prebuilt CDict (`mtctx->cdict`), so
+         `ZSTDMT_initCStream_internal` passes `dict == NULL, dictSize == 0` to
+         `ZSTDMT_serialState_reset` — whose dict-fill (`ZSTD_window_update` +
+         `ZSTD_ldm_fillHashTable`, zstdmt:538) is gated on `dictSize > 0` and skipped.
+         So the serial LDM state is **never seeded with the dict**: it runs over the
+         segments dict-obliviously, exactly as the no-dict LDM case. The dictionary
+         affects job 0 only (the CDict attach/copy), which — like every job — also
+         consumes its segment's external LDM sequences (`genSequences`/`applySequences`
+         run for job 0 too, zstdmt:726/751). Fix: removed the `MtStreamState::new` gate,
+         disabled LDM on the dict job-0 compressor (`build_dict_job0`, C disables it on
+         every job), and hoisted the per-segment LDM generation in `emit` so a dict job 0
+         feeds `fc0.ext_seqs`. (The handoff's feared serial-state dict-fill only applies
+         to a `refPrefix` raw dict, which the API doesn't expose.) Gated by
+         `mt_stream_{raw,trained}_dict_cross_job_ldm_is_bit_exact` (level 22, ~3 jobs).
 
 ## M6 — Performance
 

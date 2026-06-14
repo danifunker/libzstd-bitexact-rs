@@ -890,3 +890,146 @@ fn mt_stream_cross_job_ldm_past_window() {
     // First call `compress` ⇒ unknown-size streaming (windowLog 27, LDM on).
     check(22, 2, 2 * 1024 * 1024, 2, &[&body[..h]], &body[h..]);
 }
+
+/// Like [`oracle_dict`] but also pins `OverlapSizeLog`, so a small overlap keeps the
+/// LDM matches inside `prefix ++ segment` while the input still spans several jobs —
+/// the setup for exercising cross-job LDM together with a job-0 dictionary.
+fn oracle_dict_overlap(
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    overlap_log: u32,
+    dict: &[u8],
+    chunks: &[&[u8]],
+    finish: &[u8],
+) -> Vec<u8> {
+    use zstd_sys::ZSTD_EndDirective as Dir;
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    cctx.set_parameter(CParameter::NbWorkers(workers)).unwrap();
+    cctx.set_parameter(CParameter::JobSize(job_size)).unwrap();
+    cctx.set_parameter(CParameter::OverlapSizeLog(overlap_log))
+        .unwrap();
+    cctx.load_dictionary(dict).unwrap();
+
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; 1024 * 1024];
+    let mut step = |cctx: &mut CCtx, out: &mut Vec<u8>, inb: &mut InBuffer, dir: Dir| -> usize {
+        let mut outb = OutBuffer::around(&mut scratch[..]);
+        let hint = cctx
+            .compress_stream2(&mut outb, inb, dir)
+            .map_err(map_code)
+            .unwrap();
+        let produced = outb.pos();
+        out.extend_from_slice(&scratch[..produced]);
+        hint
+    };
+    for &data in chunks {
+        let mut inb = InBuffer::around(data);
+        loop {
+            step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_continue);
+            if inb.pos >= data.len() {
+                break;
+            }
+        }
+    }
+    let mut inb = InBuffer::around(finish);
+    loop {
+        let hint = step(&mut cctx, &mut out, &mut inb, Dir::ZSTD_e_end);
+        if hint == 0 && inb.pos == finish.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Cross-job LDM **together with a job-0 dictionary** — the last ZSTDMT combination.
+/// A dictionary loaded via `ZSTD_CCtx_loadDictionary` becomes a prebuilt CDict, so the
+/// serial LDM state is reset with `dictSize == 0` (`ZSTDMT_serialState_reset`'s dict
+/// fill is gated on `dictSize > 0` and skipped): the serial state runs over the
+/// segments dict-obliviously, while job 0 attaches the CDict **and** also consumes its
+/// segment's external LDM sequences (`ZSTDMT_serialState_genSequences` /
+/// `applySequences` run for job 0 too, zstdmt:726/751). Unknown-size streaming keeps
+/// windowLog at the level-22 default of 27, so LDM auto-enables for a small (~1.5 MiB)
+/// input; `overlapLog 1` (512 KiB overlap) with 512 KiB jobs keeps every LDM offset
+/// inside `prefix ++ segment` across ~3 jobs, with a 384 KiB repeated block reaching
+/// back over the job boundary. The `word_salad` dict and body share the WORDS
+/// vocabulary, so job 0's dictMatchState genuinely competes with the LDM candidates.
+/// Byte-exact vs C and round-trips through our decoder with the dictionary.
+fn run_mt_dict_cross_job_ldm(dict: &[u8]) {
+    let dict_obj = Dictionary::new(dict).expect("dict parse");
+    let (block_len, overlap_log, job_size) = (384 * 1024usize, 1u32, 512 * 1024u32);
+    let block = word_salad(0x5D34_A210 ^ block_len as u64, block_len);
+    // ~1.5 MiB, deliberately not a section multiple: ~3 jobs plus a partial final job
+    // (rather than a trailing empty block).
+    let mut body = Vec::with_capacity(3 * job_size as usize + block.len());
+    while body.len() < 3 * job_size as usize + 123 {
+        body.extend_from_slice(&block);
+    }
+    let n = body.len();
+    let (q, h) = (n / 4, n / 2);
+    // Each schedule's first call is `compress` (Continue) ⇒ unknown-size streaming
+    // (windowLog 27, LDM on, the attach path) through `MtStreamState`.
+    let scheds: &[(Vec<&[u8]>, &[u8])] = &[
+        (vec![&body[..]], &[]),                      // one push, finish empty
+        (vec![&body[..h]], &body[h..]),              // push + finish carries the tail
+        (vec![&body[..q], &body[q..h]], &body[h..]), // two pushes + finish tail
+    ];
+    for (chunks, finish) in scheds {
+        let theirs = oracle_dict_overlap(22, 2, job_size, overlap_log, dict, chunks, finish);
+        let mut enc = StreamEncoder::with_dictionary(22, dict).with_workers(
+            2,
+            job_size as u64,
+            overlap_log as i32,
+        );
+        let mut mine = Vec::new();
+        for &c in chunks {
+            enc.compress(c, &mut mine).unwrap();
+        }
+        enc.finish(finish, &mut mine).unwrap();
+        if mine != theirs {
+            let first = mine
+                .iter()
+                .zip(theirs.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(mine.len().min(theirs.len()));
+            panic!(
+                "MT dict+LDM mismatch: nchunks={} finish={} ours={} theirs={} first_diff_at={first}",
+                chunks.len(),
+                finish.len(),
+                mine.len(),
+                theirs.len(),
+            );
+        }
+        let mut expect = Vec::new();
+        for &c in chunks {
+            expect.extend_from_slice(c);
+        }
+        expect.extend_from_slice(finish);
+        // The frame references the dictionary (job 0), so decode with it.
+        let decoded = DecodeOptions::new()
+            .dictionary(&dict_obj)
+            .decompress(&mine)
+            .expect("decode with dict");
+        assert_eq!(decoded, expect, "MT dict+LDM round-trip");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cross-job LDM at level 22 is slow; run in release"
+)]
+fn mt_stream_raw_dict_cross_job_ldm_is_bit_exact() {
+    run_mt_dict_cross_job_ldm(&word_salad(0xD1C7, 16 * 1024));
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cross-job LDM at level 22 is slow; run in release"
+)]
+fn mt_stream_trained_dict_cross_job_ldm_is_bit_exact() {
+    run_mt_dict_cross_job_ldm(&trained_dict());
+}

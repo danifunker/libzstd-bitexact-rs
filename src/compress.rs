@@ -4206,8 +4206,9 @@ fn compress_maybe_checksum(src: &[u8], level: i32, checksum: bool) -> Result<Vec
 /// Engagement follows C's `ZSTD_CCtx_init_compressStream2`: `nbWorkers == 0` or an
 /// input at or below `ZSTDMT_JOBSIZE_MIN` runs single-threaded with the CDict
 /// ([`compress_with_cdict`], checksum-aware). Raw and trained (ZDICT) dictionaries are
-/// both bit-exact on the attach and copy paths. LDM with a dictionary (level 22 above
-/// 64 MiB) is still a clean [`Error::Encode`].
+/// both bit-exact on the attach and copy paths. LDM composes with the dictionary
+/// (level 22 above 64 MiB): the serial LDM state runs over the segments without the
+/// dict (it reaches the serial reset as `dictSize == 0`), while job 0 copies the CDict.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_mt_with_dict(
     src: &[u8],
@@ -4232,8 +4233,8 @@ pub fn compress_mt_with_dict(
     // MT engaged: drive the streaming job-splitter with the whole input as a single
     // `e_end` — exactly what one-shot `ZSTD_compress2` (= `compressStream2` + `e_end`)
     // does. `MtStreamState` resolves the dict-aware copy-mode frame cParams, the
-    // section/overlap framing, and job 0's CDict copy; the clean `Err`s for a
-    // trained-dict copy and LDM-with-dict surface from `MtStreamState::new`.
+    // section/overlap framing, job 0's CDict copy, and (when LDM auto-enables) the
+    // shared serial LDM state feeding each job's external sequences.
     let mut state = MtStreamState::new(
         level,
         job_size,
@@ -4284,8 +4285,10 @@ pub(crate) struct MtStreamState {
     /// Cross-job long-distance matching: one continuous `LdmState`
     /// (C's `ZSTDMT_serialState.ldmState`) shared across every job, generating
     /// each segment's raw sequences for the job to consume as its externSeqStore.
-    /// `None` when LDM is not enabled. (Mutually exclusive with `dict`: the
-    /// serial-state dict fill isn't ported, so `new` gates MT + dict + LDM.)
+    /// `None` when LDM is not enabled. Composes with `dict`: the serial state is
+    /// never seeded with the dictionary (a CDict-loaded dict reaches the serial
+    /// reset as `dictSize == 0` — see `new`), so it runs over the segments
+    /// dict-obliviously while job 0 separately attaches/copies the CDict.
     ldm_state: Option<crate::ldm::LdmState>,
     /// The accumulated input the serial `LdmState` reads from — C's serial
     /// round buffer. Holds back to `maxDist` (= the window); older bytes are
@@ -4358,17 +4361,21 @@ impl MtStreamState {
         // Cross-job LDM: one continuous `LdmState` (C's `ZSTDMT_serialState`)
         // shared across all jobs generates each segment's sequences for the job to
         // consume as its externSeqStore — exactly as the one-shot `compress_mt`.
-        // The job decomposition + overlap use the LDM-aware sizing branches. A
-        // dictionary additionally seeds the serial LDM hash table (the
-        // `ZSTDMT_serialState_reset` dict fill), which isn't ported, so gate MT +
-        // dict + LDM cleanly.
+        // The job decomposition + overlap use the LDM-aware sizing branches.
+        //
+        // MT + dict + LDM is supported: a dictionary loaded via
+        // `ZSTD_CCtx_loadDictionary` reaches ZSTDMT as a prebuilt CDict
+        // (`mtctx->cdict`), so `ZSTDMT_initCStream_internal` passes `dict == NULL,
+        // dictSize == 0` to `ZSTDMT_serialState_reset` (zstd_compress.c:6410). Its
+        // dict-fill (`ZSTD_window_update` + `ZSTD_ldm_fillHashTable`, zstdmt:538) is
+        // gated on `dictSize > 0`, so the serial LDM state is **not** seeded with the
+        // dict — it runs over the segments exactly as the no-dict LDM case. The
+        // dictionary affects job 0 only (the CDict attach/copy), which also consumes
+        // its segment's external LDM sequences like any other job (zstdmt:726+751).
+        // (Only a `refPrefix` raw dict — which we don't expose — would seed the
+        // serial state; that path isn't ported.)
         let ldm_params = crate::ldm::LdmParams::auto(&cparams);
         let ldm_enabled = ldm_params.is_some();
-        if ldm_enabled && dict.is_some() {
-            return Err(Error::Encode(
-                "long-distance matching with a dictionary is not supported yet",
-            ));
-        }
         let overlap_size = mt_overlap_size(&cparams, overlap_log, ldm_enabled);
         let section_size = mt_target_section_size(&cparams, job_size, overlap_size, ldm_enabled);
         let max_dict_size = 1u64 << ((cparams.hash_log + 3).max(cparams.chain_log + 1)).min(31);
@@ -4489,15 +4496,6 @@ impl MtStreamState {
                     _ => {}
                 },
             }
-            // LDM seeded from a copied dict isn't ported (as in `compress_with_cdict`);
-            // the frame-level gate in `new` already covers the realistic cases, but
-            // the CDict's createCDict strategy can differ from the frame strategy, so
-            // guard here too rather than diverge.
-            if fc0.ldm.is_some() {
-                return Err(Error::Encode(
-                    "long-distance matching with a CDict is not supported yet",
-                ));
-            }
             fc0.window = Window::streaming_ext_dict(content_len);
             fc0
         };
@@ -4510,6 +4508,13 @@ impl MtStreamState {
         // doc on [`FrameCompressor::post_block_splitter`] and the copy branch of
         // [`compress_with_cdict`].
         fc0.post_block_splitter = post_block_splitter;
+        // C disables LDM on every job, including job 0 (`jobParams.ldmParams.enableLdm
+        // = ps_disable`, zstdmt:718): when the frame enables LDM, the createCDict
+        // cParams (≥ btopt at windowLog ≥ 27) would otherwise auto-enable it on `fc0`.
+        // The serial `LdmState` generates job 0's sequences instead; the caller feeds
+        // them to `fc0.ext_seqs` (the externSeqStore) in `emit`. (A no-op when the
+        // frame has no LDM — `fc0.ldm` would already be `None`.)
+        fc0.ldm = None;
         // Lazy/opt resume table insertion at the src start (attach: src begins at
         // `cdictEnd`; copy: at the dict/src seam — both == `dictLimit`).
         match &mut fc0.matcher {
@@ -4594,17 +4599,65 @@ impl MtStreamState {
             return Ok(());
         }
         let job_filled = self.filled;
+        // Cross-job LDM (`ZSTDMT_serialState_genSequences`, run for *every* job in
+        // order — zstdmt:726, including a dict job 0): advance the shared serial
+        // `LdmState` over this segment and produce the job's rawSeqStore, which the
+        // job consumes as its externSeqStore. The LDM reads from `ldm_history` (C's
+        // serial round buffer); `seg_bias` remaps absolute window indices to history
+        // positions, so hash-table offsets stay in whole-input space across jobs and
+        // front-drops. The serial state is never seeded with the dictionary (see
+        // `new`), so a dict job 0 generates over its segment exactly like any job.
+        let ext_seqs = if let Some(ldm) = &mut self.ldm_state {
+            // Drop history older than `maxDist` before this segment: those bytes can
+            // never be matched (`enforceMaxDist` filters offsets below `idx -
+            // maxDist`), so the serial buffer stays bounded. (`ldm_history`/
+            // `ldm_base`/`buf` are disjoint fields from the borrowed `ldm_state`, so
+            // these stay borrow-checker clean.)
+            let max_dist = 1usize << self.cparams.window_log;
+            let keep_from = self.input_pos.saturating_sub(max_dist);
+            if keep_from > self.ldm_base {
+                self.ldm_history.drain(..keep_from - self.ldm_base);
+                self.ldm_base = keep_from;
+            }
+            self.ldm_history
+                .extend_from_slice(&self.buf[self.prefix_len..self.prefix_len + job_filled]);
+            let seg_bias = (self.ldm_base + WINDOW_START_INDEX) as u32;
+            ldm.window.seg_bias = seg_bias;
+            ldm.window.dict_bias = seg_bias;
+            let chunk_start = self.input_pos - self.ldm_base;
+            let chunk_end = chunk_start + job_filled;
+            let cap = self.section_size / ldm.params.min_match_length as usize;
+            let mut seqs = Vec::new();
+            crate::ldm::generate_sequences(
+                ldm,
+                &mut seqs,
+                cap,
+                &self.ldm_history,
+                chunk_start,
+                chunk_end,
+            )?;
+            Some(seqs)
+        } else {
+            None
+        };
         if self.first && self.dict.is_some() {
-            // Job 0 with a dictionary: the CDict-attach path over the
+            // Job 0 with a dictionary: the CDict attach/copy path over the
             // `content ++ segment0` concat buffer. The pre-built `fc0` writes the
             // frame header (with the dictID + its checksum flag) and compresses
-            // job 0; later jobs are plain overlap jobs over `self.cparams`.
+            // job 0; later jobs are plain overlap jobs over `self.cparams`. With LDM
+            // on, `fc0` consumes job 0's external sequences exactly as a regular job
+            // (`ZSTDMT_serialState_applySequences`, zstdmt:751 — applied for job 0
+            // too); `fc0.ldm` was disabled in `build_dict_job0`.
             let d = self.dict.take().expect("dict present");
             let cl = d.content.len();
             let mut data = Vec::with_capacity(cl + job_filled);
             data.extend_from_slice(&d.content);
             data.extend_from_slice(&self.buf[..job_filled]);
             let mut fc0 = d.fc0;
+            fc0.ext_seqs = ext_seqs.map(|seqs| MtExtSeqs {
+                seqs,
+                cursor: crate::opt::LdmCursor::default(),
+            });
             if is_last {
                 fc0.compress_end(out, &data, cl, cl + job_filled)?;
             } else {
@@ -4619,46 +4672,6 @@ impl MtStreamState {
                 self.frame_pledged
             } else {
                 Some(job_filled as u64)
-            };
-            // Cross-job LDM (`ZSTDMT_serialState_genSequences`): advance the shared
-            // serial `LdmState` over this segment and hand the job its rawSeqStore
-            // (consumed as the externSeqStore). The LDM reads from `ldm_history`
-            // (C's serial round buffer); `seg_bias` remaps absolute window indices
-            // to history positions, so hash-table offsets stay in whole-input space
-            // across jobs and front-drops. (LDM and a dictionary are mutually
-            // exclusive — `new` gates the combination.)
-            let ext_seqs = if let Some(ldm) = &mut self.ldm_state {
-                // Drop history older than `maxDist` before this segment: those
-                // bytes can never be matched (`enforceMaxDist` filters offsets
-                // below `idx - maxDist`), so the serial buffer stays bounded.
-                // (`ldm_history`/`ldm_base`/`buf` are disjoint fields from the
-                // borrowed `ldm_state`, so these stay borrow-checker clean.)
-                let max_dist = 1usize << self.cparams.window_log;
-                let keep_from = self.input_pos.saturating_sub(max_dist);
-                if keep_from > self.ldm_base {
-                    self.ldm_history.drain(..keep_from - self.ldm_base);
-                    self.ldm_base = keep_from;
-                }
-                self.ldm_history
-                    .extend_from_slice(&self.buf[self.prefix_len..self.prefix_len + job_filled]);
-                let seg_bias = (self.ldm_base + WINDOW_START_INDEX) as u32;
-                ldm.window.seg_bias = seg_bias;
-                ldm.window.dict_bias = seg_bias;
-                let chunk_start = self.input_pos - self.ldm_base;
-                let chunk_end = chunk_start + job_filled;
-                let cap = self.section_size / ldm.params.min_match_length as usize;
-                let mut seqs = Vec::new();
-                crate::ldm::generate_sequences(
-                    ldm,
-                    &mut seqs,
-                    cap,
-                    &self.ldm_history,
-                    chunk_start,
-                    chunk_end,
-                )?;
-                Some(seqs)
-            } else {
-                None
             };
             compress_mt_job(
                 out,

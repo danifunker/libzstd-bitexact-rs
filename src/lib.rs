@@ -50,7 +50,9 @@ mod stream;
 mod stream_encode;
 mod xxhash;
 
-pub use compress::{compress, compress_mt, compress_with_cdict, compress_with_dict};
+pub use compress::{
+    compress, compress_mt, compress_mt_with_dict, compress_with_cdict, compress_with_dict,
+};
 #[doc(hidden)]
 pub use compress::{cparams_create_cdict_for_testing, cparams_for_testing};
 pub use decompress::{DecodeOptions, WINDOW_LOG_MAX, decompress, decompress_with_limit};

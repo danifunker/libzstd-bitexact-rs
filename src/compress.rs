@@ -4184,6 +4184,70 @@ fn compress_maybe_checksum(src: &[u8], level: i32, checksum: bool) -> Result<Vec
     Ok(out)
 }
 
+/// `ZSTD_compress2` with `nbWorkers >= 1` **and a loaded dictionary** — the one-shot
+/// multithreaded dict frame (`ZSTD_compress2` after `ZSTD_CCtx_loadDictionary` with
+/// `NbWorkers` set). Like [`compress_mt`] but the dictionary is applied to **job 0
+/// only** (zstdmt `jobs[0].cdict`); later jobs are plain overlap jobs. A one-shot
+/// frame pledges the known `srcSize`, which — once MT engages (`> 512 KiB`) — always
+/// exceeds every attach cutoff, so job 0 takes the CDict **copy** path
+/// (`ZSTD_resetCCtx_byCopyingCDict`), byte-identical to the streaming copy path.
+///
+/// Engagement follows C's `ZSTD_CCtx_init_compressStream2`: `nbWorkers == 0` or an
+/// input at or below `ZSTDMT_JOBSIZE_MIN` runs single-threaded with the CDict
+/// ([`compress_with_cdict`], checksum-aware). A **trained** (ZDICT) dictionary on the
+/// copy path is a clean [`Error::Encode`] — the same pre-existing `compress_with_cdict`
+/// copy divergence the streaming path defers (`task_51d658f2`); raw dicts are fully
+/// supported. LDM with a dictionary (level 22 above 64 MiB) is also a clean error.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_mt_with_dict(
+    src: &[u8],
+    dict: &[u8],
+    level: i32,
+    nb_workers: u32,
+    job_size: u64,
+    overlap_log: i32,
+    checksum: bool,
+) -> Result<Vec<u8>, Error> {
+    if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
+        return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
+    }
+    // `ZSTD_CCtx_init_compressStream2`: multithreading is not invoked without workers
+    // or for an input at or below the floor — C runs single-threaded with the CDict
+    // (attach for a tiny input, copy otherwise; both honour the checksum flag).
+    if nb_workers == 0 || src.len() as u64 <= ZSTDMT_JOBSIZE_MIN {
+        // A trained (ZDICT) dict on the COPY side of the cutoff is the deferred
+        // `compress_with_cdict` divergence (`task_51d658f2`); the engaged path gates
+        // it (`build_dict_job0`), so gate it here too rather than let the fallback
+        // emit a divergent frame. Trained ATTACH and any raw dict are fully supported.
+        let is_trained = dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY;
+        let attaches = src.len()
+            <= cdict_attach_cutoff(get_cparams_create_cdict(level, dict.len() as u64).strategy);
+        if is_trained && !attaches {
+            return Err(Error::Encode(
+                "multithreaded compression with a trained (ZDICT) dictionary on the copy \
+                 path is not supported yet",
+            ));
+        }
+        return compress_with_cdict_checksum(src, dict, level, checksum);
+    }
+    // MT engaged: drive the streaming job-splitter with the whole input as a single
+    // `e_end` — exactly what one-shot `ZSTD_compress2` (= `compressStream2` + `e_end`)
+    // does. `MtStreamState` resolves the dict-aware copy-mode frame cParams, the
+    // section/overlap framing, and job 0's CDict copy; the clean `Err`s for a
+    // trained-dict copy and LDM-with-dict surface from `MtStreamState::new`.
+    let mut state = MtStreamState::new(
+        level,
+        job_size,
+        overlap_log,
+        checksum,
+        Some(src.len() as u64),
+        Some(dict),
+    )?;
+    let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
+    state.end(src, &mut out)?;
+    Ok(out)
+}
+
 /// Streaming-mode ZSTDMT (`ZSTD_compressStream2` with `nbWorkers >= 1`,
 /// unknown content size): the input arrives in chunks, is buffered into
 /// `section_size` jobs, and each job after the first sees the previous job's
@@ -4841,6 +4905,18 @@ pub(crate) fn streaming_cdict_init(
 /// large-window case where C would enable long-distance matching with the dict
 /// (`windowLog >= 27` at btopt+) — both return a clean [`Error::Encode`].
 pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, Error> {
+    compress_with_cdict_checksum(src, dict, level, false)
+}
+
+/// [`compress_with_cdict`] with an optional content checksum — the single-threaded
+/// fallback of [`compress_mt_with_dict`] (`nbWorkers == 0` or an input at or below
+/// the MT floor, where C runs `ZSTD_compress2` + the CDict single-threaded).
+fn compress_with_cdict_checksum(
+    src: &[u8],
+    dict: &[u8],
+    level: i32,
+    checksum: bool,
+) -> Result<Vec<u8>, Error> {
     if dict.len() as u64 + src.len() as u64 >= u64::from(u32::MAX) - 2 {
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
     }
@@ -4880,8 +4956,13 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         // window over the concatenated `content ++ src` buffer in the post-reset
         // attach state (src begins at `cdictEnd`, no extDict).
         let working_window_log = get_cparams(level, src_size, 0).window_log;
-        let mut fc =
-            attach_cdict_compressor(content, cdict_cparams, pledged, false, working_window_log);
+        let mut fc = attach_cdict_compressor(
+            content,
+            cdict_cparams,
+            pledged,
+            checksum,
+            working_window_log,
+        );
         fc.window = Window::preloaded_attached_dict(content_len, src_len);
         fc.window_preloaded = true;
         fc
@@ -4891,7 +4972,7 @@ pub fn compress_with_cdict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8
         // own cParams and windowLog overridden to the working context's.
         let mut working = cdict_cparams;
         working.window_log = get_cparams(level, src_size, dict.len() as u64).window_log;
-        let mut fc = FrameCompressor::from_cparams(working, pledged, false);
+        let mut fc = FrameCompressor::from_cparams(working, pledged, checksum);
         match cdict_cparams.strategy {
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::Btlazy2 => {
                 // Lazy/btlazy2 tables aren't tagged (`ZSTD_CDictIndicesAreTagged`

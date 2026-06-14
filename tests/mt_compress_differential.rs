@@ -7,7 +7,7 @@
 //! span the single-job/​multi-job boundary, exact-multiple (trailing empty
 //! block) sizes, explicit `jobSize`/​`overlapLog` overrides, and every strategy.
 
-use libzstd_bitexact::compress_mt;
+use libzstd_bitexact::{DecodeOptions, Dictionary, compress_mt, compress_mt_with_dict};
 use zstd::zstd_safe::{self, CCtx, CParameter};
 
 struct Rng(u64);
@@ -276,4 +276,180 @@ fn mt_checksum_is_bit_exact() {
             check(&src, level, 2, 512 * 1024, 0, true);
         }
     }
+}
+
+/// A real ZDICT-trained dictionary (magic `0xEC30A437`): seeds job 0's entropy
+/// tables, repeat offsets, and the frame's `Dictionary_ID`.
+fn trained_dict() -> Vec<u8> {
+    let mut rng = Rng::new(0x7A1A_ED01);
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for _ in 0..4000 {
+        let start = samples.len();
+        let target = 24 + rng.below(128);
+        while samples.len() - start < target {
+            samples.extend_from_slice(WORDS[rng.below(WORDS.len())]);
+            samples.push(b' ');
+        }
+        sizes.push(samples.len() - start);
+    }
+    let mut dict = vec![0u8; 16 * 1024];
+    let dict_size = unsafe {
+        zstd_sys::ZDICT_trainFromBuffer(
+            dict.as_mut_ptr() as *mut core::ffi::c_void,
+            dict.len(),
+            samples.as_ptr() as *const core::ffi::c_void,
+            sizes.as_ptr(),
+            sizes.len() as core::ffi::c_uint,
+        )
+    };
+    assert!(
+        unsafe { zstd_sys::ZDICT_isError(dict_size) } == 0,
+        "ZDICT_trainFromBuffer failed (code {dict_size})"
+    );
+    dict.truncate(dict_size);
+    dict
+}
+
+/// Oracle: C `ZSTD_compress2` with MT parameters **and a loaded dictionary**
+/// (`ZSTD_CCtx_loadDictionary` → internal CDict).
+fn oracle_dict(
+    src: &[u8],
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    dict: &[u8],
+    checksum: bool,
+) -> Vec<u8> {
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(level))
+        .unwrap();
+    cctx.set_parameter(CParameter::NbWorkers(workers))
+        .expect("nbWorkers (oracle must be built with the `zstdmt` feature)");
+    if job_size != 0 {
+        cctx.set_parameter(CParameter::JobSize(job_size)).unwrap();
+    }
+    if checksum {
+        cctx.set_parameter(CParameter::ChecksumFlag(true)).unwrap();
+    }
+    cctx.load_dictionary(dict).unwrap();
+    let mut dst = Vec::with_capacity(zstd_safe::compress_bound(src.len()));
+    cctx.compress2(&mut dst, src)
+        .expect("oracle compress2 with dict");
+    dst
+}
+
+/// Assert `compress_mt_with_dict` is byte-identical to the oracle and round-trips
+/// (decoded with the dictionary, which the frame references).
+fn check_dict(src: &[u8], dict: &[u8], level: i32, workers: u32, job_size: u32, checksum: bool) {
+    let theirs = oracle_dict(src, level, workers, job_size, dict, checksum);
+    let mine = compress_mt_with_dict(src, dict, level, workers, job_size as u64, 0, checksum)
+        .unwrap_or_else(|e| {
+            panic!(
+                "compress_mt_with_dict errored: level={level} workers={workers} \
+                 jobSize={job_size} checksum={checksum} len={}: {e}",
+                src.len()
+            )
+        });
+    if mine != theirs {
+        let first = mine
+            .iter()
+            .zip(theirs.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(mine.len().min(theirs.len()));
+        panic!(
+            "MT dict byte mismatch: level={level} workers={workers} jobSize={job_size} \
+             checksum={checksum} len={} ours={} theirs={} first_diff_at={first}",
+            src.len(),
+            mine.len(),
+            theirs.len(),
+        );
+    }
+    let dict_obj = Dictionary::new(dict).expect("dict parse");
+    let decoded = DecodeOptions::new()
+        .dictionary(&dict_obj)
+        .decompress(&mine)
+        .expect("decode with dict");
+    assert_eq!(
+        decoded,
+        src,
+        "MT dict round-trip: level={level} len={}",
+        src.len()
+    );
+}
+
+/// One-shot multithreaded compression with a dictionary (`compress_mt_with_dict` =
+/// `ZSTD_compress2` + `NbWorkers` + `loadDictionary`). A one-shot frame pledges the
+/// known srcSize; once MT engages (> 512 KiB) that always exceeds the attach cutoff,
+/// so job 0 takes the CDict **copy** path and later jobs are plain overlap jobs. Also
+/// covers the single-threaded fallback (input at/below the MT floor) and the
+/// content-checksum variant. Raw dictionary. Release only (multi-MiB at high levels).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-MiB across strategies); run in release"
+)]
+fn mt_one_shot_dict_is_bit_exact() {
+    let dict = word_salad(0xD1C7, 16 * 1024);
+    for &level in &[1i32, 3, 6, 9, 12, 17] {
+        // Engaged: job 0 copies the CDict, later jobs are overlap jobs (multi-job).
+        for &len in &[700 * 1024usize, 1300 * 1024] {
+            let src = word_salad(0xDD ^ level as u64 ^ len as u64, len);
+            check_dict(&src, &dict, level, 2, 512 * 1024, false);
+        }
+        // Non-engaged (<= MT floor): single-threaded with the CDict (copy at 300 KiB).
+        let small = word_salad(0x5A ^ level as u64, 300 * 1024);
+        check_dict(&small, &dict, level, 2, 512 * 1024, false);
+    }
+    // Content checksum: multi-job external append + single-job self-append.
+    check_dict(
+        &word_salad(0xCE, 1300 * 1024),
+        &dict,
+        6,
+        2,
+        512 * 1024,
+        true,
+    );
+    check_dict(&word_salad(0xCF, 300 * 1024), &dict, 6, 2, 512 * 1024, true);
+}
+
+/// A trained (ZDICT) dictionary **attaches** below the cutoff: the non-engaged path
+/// (input at/below the MT floor, small enough to attach) is the bit-exact
+/// single-threaded CDict attach, and the trained-copy gate must *not* reject it.
+/// (Trained COPY is deferred; see the next test.) The attach cutoffs are tiny
+/// (8/16/32 KiB), so a 6 KiB input attaches at every strategy.
+#[test]
+fn mt_one_shot_trained_dict_attach_is_bit_exact() {
+    let dict = trained_dict();
+    for &level in &[3i32, 9, 19] {
+        check_dict(
+            &word_salad(0xA7 ^ level as u64, 6 * 1024),
+            &dict,
+            level,
+            2,
+            512 * 1024,
+            false,
+        );
+    }
+}
+
+/// A trained (ZDICT) dictionary on the **copy** path (srcSize above the attach
+/// cutoff) is the deferred `compress_with_cdict` divergence (`task_51d658f2`); it
+/// must error cleanly, never diverge — both when MT engages and on the
+/// single-threaded fallback above the cutoff.
+#[test]
+fn mt_one_shot_trained_dict_copy_errors_cleanly() {
+    let dict = trained_dict();
+    // Engaged (> 512 KiB) -> copy.
+    let big = word_salad(0x1234, 1300 * 1024);
+    assert!(
+        compress_mt_with_dict(&big, &dict, 12, 2, 512 * 1024, 0, false).is_err(),
+        "one-shot MT + trained-dict copy must error cleanly (deferred)"
+    );
+    // Non-engaged but above the cutoff (300 KiB > 128 KiB) -> copy -> also gated.
+    let mid = word_salad(0x5678, 300 * 1024);
+    assert!(
+        compress_mt_with_dict(&mid, &dict, 12, 2, 512 * 1024, 0, false).is_err(),
+        "non-engaged trained-dict copy must error cleanly too"
+    );
 }

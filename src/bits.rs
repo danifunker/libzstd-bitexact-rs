@@ -73,9 +73,27 @@ impl<'a> ForwardBitReader<'a> {
 /// return the available bits in their correct (top) positions with the
 /// missing low bits as zero; on valid streams such reads only ever happen
 /// where the C decoder also stops using the affected value.
+///
+/// `peek` is the hot path of decompression — it runs once per decoded Huffman
+/// literal and per FSE-state transition. To avoid touching memory on every
+/// call (the structure that made our decoder ~3x slower than C), the reader
+/// caches a 64-bit window of `data` in `cache`, the port of
+/// `BIT_DStream_t::bitContainer`: peeks read from this register-resident copy
+/// and it is reloaded only when the read position marches below the window
+/// (≈ once per eight bytes), mirroring `BIT_reloadDStream`. The cache is a
+/// pure read accelerator — `bits_remaining` stays the single source of truth
+/// for position and for the `BIT_DStream_overflow` (negative) and
+/// `BIT_endOfDStream` (zero) states, so the observable semantics are
+/// unchanged.
 pub(crate) struct ReverseBitReader<'a> {
     data: &'a [u8],
     bits_remaining: i64,
+    /// The eight little-endian bytes of `data` at `cache_byte`, i.e. stream
+    /// bits `[8 * cache_byte, 8 * cache_byte + 64)`. Valid only when
+    /// `has_cache`.
+    cache: u64,
+    cache_byte: usize,
+    has_cache: bool,
 }
 
 impl<'a> ReverseBitReader<'a> {
@@ -88,6 +106,9 @@ impl<'a> ReverseBitReader<'a> {
         Ok(Self {
             data,
             bits_remaining: data.len() as i64 * 8 - padding,
+            cache: 0,
+            cache_byte: 0,
+            has_cache: false,
         })
     }
 
@@ -106,24 +127,75 @@ impl<'a> ReverseBitReader<'a> {
     /// The next bits to be read are the highest-numbered remaining bits of
     /// the stream; they form the high bits of the returned value, matching
     /// `BIT_lookBits`.
-    pub(crate) fn peek(&self, n: u32) -> u64 {
+    ///
+    /// `#[inline]` is load-bearing: this runs once per decoded symbol and is
+    /// called from other modules, so without it the `cache`/`bits_remaining`
+    /// fields would be reloaded from memory on every call and the container
+    /// would buy nothing. Inlined, they stay in registers across the loop.
+    #[inline]
+    pub(crate) fn peek(&mut self, n: u32) -> u64 {
         debug_assert!(n <= 56);
         if n == 0 || self.bits_remaining <= 0 {
             return 0;
         }
-        let avail = self.bits_remaining.min(i64::from(n)) as u32;
-        let lowest_bit = (self.bits_remaining - i64::from(avail)) as usize;
-        self.extract(lowest_bit, avail) << (n - avail)
+        if self.bits_remaining < i64::from(n) {
+            // Fewer than `n` bits remain: the available bits land in the top
+            // positions, the missing low bits read as zero (`BIT_lookBits`
+            // past the start of the stream). This only happens on the final
+            // reads of a stream, so take the exact byte-addressed path and
+            // leave the cache alone. With `bits_remaining < n` the lowest
+            // requested bit is bit 0 of the stream.
+            let avail = self.bits_remaining as u32;
+            return self.extract(0, avail) << (n - avail);
+        }
+        let hi = self.bits_remaining as usize;
+        let lo = hi - n as usize;
+        if !self.has_cache || lo < 8 * self.cache_byte || hi > 8 * self.cache_byte + 64 {
+            self.reload_cache(hi);
+        }
+        let shift = (lo - 8 * self.cache_byte) as u32;
+        (self.cache >> shift) & mask64(n)
     }
 
+    #[inline]
     pub(crate) fn consume(&mut self, n: u32) {
         self.bits_remaining -= i64::from(n);
     }
 
+    #[inline]
     pub(crate) fn read(&mut self, n: u32) -> u64 {
         let v = self.peek(n);
         self.consume(n);
         v
+    }
+
+    /// Reposition the 64-bit cache so it covers the highest still-needed bit
+    /// (`hi - 1`) and extends as far downward as possible, maximising the
+    /// peeks served before the next reload — the port of `BIT_reloadDStream`
+    /// stepping the pointer back. The chosen `cache_byte` is the largest
+    /// byte-aligned start with `8 * cache_byte + 64 >= hi`, which (for
+    /// `n <= 56`) also guarantees `8 * cache_byte <= hi - n`, so every bit of
+    /// the requested `[hi - n, hi)` range lies inside the window.
+    fn reload_cache(&mut self, hi: usize) {
+        let byte = hi.saturating_sub(64).div_ceil(8);
+        self.cache = self.load8(byte);
+        self.cache_byte = byte;
+        self.has_cache = true;
+    }
+
+    /// Load eight little-endian bytes of `data` at `byte`, zero-padding past
+    /// the end exactly as the C decoder's zero-initialised scratch does.
+    fn load8(&self, byte: usize) -> u64 {
+        if byte + 8 <= self.data.len() {
+            u64::from_le_bytes(self.data[byte..byte + 8].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 8];
+            if byte < self.data.len() {
+                let tail = &self.data[byte..];
+                buf[..tail.len()].copy_from_slice(tail);
+            }
+            u64::from_le_bytes(buf)
+        }
     }
 
     /// Extract bits `[from_bit, from_bit + n)` of the stream, where bit `i`
@@ -131,10 +203,7 @@ impl<'a> ReverseBitReader<'a> {
     fn extract(&self, from_bit: usize, n: u32) -> u64 {
         let byte = from_bit / 8;
         let shift = from_bit % 8;
-        let mut buf = [0u8; 8];
-        let take = (self.data.len() - byte).min(8);
-        buf[..take].copy_from_slice(&self.data[byte..byte + take]);
-        (u64::from_le_bytes(buf) >> shift) & mask64(n)
+        (self.load8(byte) >> shift) & mask64(n)
     }
 }
 

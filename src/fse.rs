@@ -193,17 +193,25 @@ pub(crate) struct FseState<'t> {
 }
 
 impl<'t> FseState<'t> {
+    #[inline]
     pub(crate) fn new(table: &'t FseTable, br: &mut ReverseBitReader<'_>) -> Self {
         let state = br.read(table.table_log) as usize;
         FseState { table, state }
     }
 
+    /// `self.state` is always `< entries.len()` by construction, and the table
+    /// size is a power of two, so masking with `len - 1` is a no-op that lets
+    /// the compiler drop the bounds check on this per-sequence hot access.
+    #[inline]
     pub(crate) fn symbol(&self) -> u8 {
-        self.table.entries[self.state].symbol
+        let mask = self.table.entries.len() - 1;
+        self.table.entries[self.state & mask].symbol
     }
 
+    #[inline]
     pub(crate) fn advance(&mut self, br: &mut ReverseBitReader<'_>) {
-        let e = self.table.entries[self.state];
+        let mask = self.table.entries.len() - 1;
+        let e = self.table.entries[self.state & mask];
         self.state = e.base as usize + br.read(u32::from(e.nb_bits)) as usize;
     }
 }

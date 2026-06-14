@@ -155,8 +155,12 @@ fn decode_stream_into(
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
     let mut br = ReverseBitReader::new(src)?;
+    // `idx` is `table_log` bits wide, so it is always `< entries.len()`
+    // (`= 1 << table_log`); masking is a no-op that elides the bounds check on
+    // this per-symbol hot access.
+    let mask = table.entries.len() - 1;
     for _ in 0..count {
-        let idx = br.peek(table.table_log) as usize;
+        let idx = br.peek(table.table_log) as usize & mask;
         let e = table.entries[idx];
         br.consume(u32::from(e.nb_bits));
         out.push(e.symbol);

@@ -363,6 +363,7 @@ fn resolve_offset(of_value: u64, lit_len: u64, rep: &mut [u64; 3]) -> Result<u64
 /// in-buffer copy with the usual run-extending overlap; otherwise it begins in
 /// the dictionary window and is copied byte by byte (this only happens near
 /// the start of a dictionary-compressed frame).
+#[inline]
 fn copy_match(
     out: &mut Vec<u8>,
     frame_base: usize,

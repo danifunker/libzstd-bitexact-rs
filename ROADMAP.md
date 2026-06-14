@@ -406,11 +406,31 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
       toward parity at levels 19–22 where the optimal parser dominates the cost;
       **raw/random blocks already match C** (memcpy-bound). So the optimization
       priority is the decompression path.
-- [ ] Optimize hot loops (bit reader containers, 4-at-a-time Huffman
-      decode, sequence-execution wildcopies) without breaking the
-      `forbid(unsafe_code)` guarantee. **Decompression first** (~3x gap on real
-      data); compression's gap is widest at the fast levels (match-finder /
-      hashing bound).
+- [ ] Optimize hot loops without breaking `#![forbid(unsafe_code)]`.
+  - [x] Decompression **bit-reader container** (`ReverseBitReader`, the port of
+        `BIT_DStream_t` / `BIT_reloadDStream`): a register-resident 64-bit read
+        cache reloaded ≈once per eight bytes instead of rebuilding an 8-byte
+        buffer and re-reading memory on every `peek`, plus `#[inline]` on the
+        hot accessors and power-of-two-mask bounds-check elision on the
+        FSE/Huffman table lookups. ~3-6% faster decode, bit-exact (full
+        differential suite green); the cache is a pure read accelerator, so the
+        `BIT_DStream_overflow` (negative `bits_remaining`) semantics are
+        unchanged.
+  - **Profiling finding (the strategic one).** Decompression of entropy-coded
+        data is **~98% sequence decode+execution, ~2% Huffman literal decode**
+        (measured by phase-timing `decode_compressed_block`). The execution cost
+        is dominated by *many small* literal/match copies; C closes this with
+        **wildcopy** — unconditional overlapping 8/16-byte writes *past* the
+        needed length — which `#![forbid(unsafe_code)]` structurally prevents (it
+        needs writing into uninitialised spare capacity + `set_len`). So the
+        decode gap is largely a safe-Rust constraint, not a missing micro-op;
+        large copies (raw/random blocks) already run at C speed. A safe
+        cursor-based rewrite (resize-to-full + `copy_within` + manual overlap)
+        is possible but pays an extra full-buffer memset for uncertain net gain.
+  - [ ] **Compression is the higher-headroom target.** Its gap is widest at the
+        fast levels (L1 ≈ 0.37x of C — match-finder / hashing bound, *not*
+        wildcopy-bound), so far more is recoverable in safe Rust there than in
+        the decode execution path.
 
 ## Versioning note
 

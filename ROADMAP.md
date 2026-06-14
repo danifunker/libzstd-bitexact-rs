@@ -281,8 +281,8 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          `tests/mt_compress_differential.rs` against the `zstdmt`-built C oracle:
          byte-identical across every strategy, default and explicit
          `jobSize`/`overlapLog`, the single/multi-job boundary, and exact-multiple
-         sizes. Cross-job LDM, dictionaries, and streaming MT return a clean
-         error or are later increments.
+         sizes. (Cross-job LDM and streaming MT followed as the increments below;
+         a one-shot dictionary is still a later increment.)
    - [x] **Streaming `ZSTDMT` — BIT-EXACT** (`StreamEncoder::with_workers`).
          `ZSTD_compressStream2` with `nbWorkers >= 1` at an unknown content size:
          input is buffered into `section_size` jobs as it arrives
@@ -296,8 +296,8 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          Bounded memory (one `overlap + section` staging buffer). Gated by
          `tests/mt_stream_compress_differential.rs` across strategies, chunk
          schedules, exact-multiple boundaries, and the single-job / first-call
-         cases. `flush`, a pledged size, and dictionaries with workers return a
-         clean error.
+         cases. (`flush`, a pledged size, dictionaries, and cross-job LDM with
+         workers followed as the increments below.)
    - [x] **`ZSTDMT` content checksum — BIT-EXACT** (one-shot + streaming). The
          digest is over the whole input (C's serial state updates it per job
          segment); job 0 keeps the checksum flag so the frame header carries the
@@ -324,10 +324,34 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          cParams are the plain **no-dict** ones — only job 0's dict tables use the
          createCDict cParams (so job 0 is exactly `streaming_cdict_init`'s
          compressor). Gated by `mt_stream_raw_dict_is_bit_exact` /
-         `mt_stream_trained_dict_is_bit_exact`. The copy path (a known frame size
-         above the attach cutoff) is a clean error.
-   - [ ] One-shot `compress_mt` with a dictionary, the MT+dict **copy** path, and
-         cross-job LDM.
+         `mt_stream_trained_dict_is_bit_exact`.
+   - [x] **`ZSTDMT` streaming dictionary, COPY path — BIT-EXACT (raw).** A known
+         frame size above the attach cutoff resolves the frame cParams in
+         `cpm_noAttachDict` mode (dict-aware) and **copies** the de-tagged CDict
+         tables into job 0's context (the dict a contiguous extDict prefix) —
+         exactly `compress_with_cdict`'s copy branch. Reaching multi-block copy
+         unmasked the unported `loadedDictEnd` mechanism (`ZSTD_getLowestMatchIndex`'s
+         isDictionary branch + `checkDictValidity` + `enforceMaxDist`), now ported
+         across all extDict matchers (`Window::loaded_dict_end`). Gated by
+         `mt_stream_raw_dict_copy_is_bit_exact`; a **trained** dict on the copy path
+         is a separate pre-existing `compress_with_cdict` divergence, so it is a
+         clean error (`mt_stream_trained_dict_copy_errors_cleanly`).
+   - [x] **`ZSTDMT` cross-job LDM — BIT-EXACT (one-shot + streaming).** One
+         continuous `LdmState` (C's `ZSTDMT_serialState`) shared across all jobs
+         generates each segment's `rawSeqStore`, which the job consumes as its
+         externSeqStore (a cursor persisting across the job's blocks); the job's own
+         LDM is disabled. Auto-enables for `strategy >= btopt && windowLog >= 27` —
+         level 22 one-shot above 64 MiB, or *any* unknown-size streaming (windowLog
+         stays 27). Streaming keeps the serial history in an accumulated buffer back
+         to `maxDist` (C's serial round buffer), front-dropping older bytes (never
+         matched) and remapping absolute window indices via `seg_bias` — byte-identical
+         to C's round-buffer wrap + extDict flip because C's MT output is
+         worker-count-independent. Gated by `mt_cross_job_ldm_is_bit_exact`,
+         `mt_stream_cross_job_ldm_is_bit_exact`, and (manual, >128 MiB)
+         `mt_stream_cross_job_ldm_past_window`.
+   - [ ] Remaining `ZSTDMT`: one-shot `compress_mt` with a dictionary; the MT+dict
+         **copy** path for a **trained** dict; MT + dict + LDM together (the serial
+         state's dict-fill is unported) — all currently clean errors.
 
 ## M6 — Performance
 

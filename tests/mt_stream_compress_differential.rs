@@ -817,3 +817,80 @@ fn mt_stream_flush_is_bit_exact() {
         }
     }
 }
+
+/// Cross-job LDM in **streaming** mode: one `ZSTDMT_serialState` LDM state shared
+/// across every job, generating each segment's `rawSeqStore` for the job to consume
+/// as its externSeqStore (a cursor persisting across the job's blocks). The serial
+/// state reads from an accumulated-history buffer (C's serial round buffer), with
+/// `seg_bias` remapping absolute window indices to history positions.
+///
+/// Unlike one-shot — which needs a >64 MiB input for windowLog to resize up to 27 —
+/// *unknown-size* streaming keeps windowLog at the level-22 default of 27, so LDM
+/// auto-enables even for a small input (here ~6 MiB, driven through `MtStreamState`
+/// because the first call is `compress`, not the one-shot first-call-`finish`
+/// delegation). A repeated block smaller than the overlap makes the LDM find long
+/// matches reaching back across job boundaries (into the prefix = the previous
+/// segment) while keeping every offset inside `prefix ++ segment`, where C can
+/// represent it. Because C has LDM on, a wrong (or absent) externSeqStore diverges,
+/// so a pass confirms the serial-state plumbing. Release only (level 22 is slow in
+/// debug).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cross-job LDM at level 22 is slow; run in release"
+)]
+fn mt_stream_cross_job_ldm_is_bit_exact() {
+    // (repeat-block size, overlapLog -> overlap, jobSize): the block repeats below
+    // the overlap, so LDM matches reach across jobs but stay in `prefix ++ segment`.
+    let cases: &[(usize, u32, u32)] = &[
+        (768 * 1024, 2, 2 * 1024 * 1024), // 1 MiB overlap, 2 MiB jobs (~3 jobs)
+        (384 * 1024, 1, 1024 * 1024),     // 512 KiB overlap, 1 MiB jobs (~6 jobs)
+    ];
+    for &(block_len, overlap_log, job_size) in cases {
+        let block = word_salad(0x5D34_A210 ^ block_len as u64, block_len);
+        // ~6 MiB, deliberately not a section multiple: exercises the cross-job LDM
+        // plus a partial final job (rather than a trailing empty block).
+        let mut body = Vec::with_capacity(6 * 1024 * 1024 + block.len());
+        while body.len() < 6 * 1024 * 1024 + 123 {
+            body.extend_from_slice(&block);
+        }
+        let n = body.len();
+        let (q, h) = (n / 4, n / 2);
+        // Each schedule's first call is `compress` (Continue) ⇒ unknown-size
+        // streaming (windowLog 27, LDM on) through `MtStreamState`.
+        let scheds: &[(Vec<&[u8]>, &[u8])] = &[
+            (vec![&body[..]], &[]),                      // one push, finish empty
+            (vec![&body[..h]], &body[h..]),              // push + finish carries the tail
+            (vec![&body[..q], &body[q..h]], &body[h..]), // two pushes + finish tail
+        ];
+        for (chunks, finish) in scheds {
+            check(22, 2, job_size, overlap_log, chunks, finish);
+        }
+    }
+}
+
+/// Cross-job LDM streaming **past the window** (> `maxDist` = 128 MiB at level 22):
+/// the serial state's history buffer fills and then drops its front (bytes older
+/// than `maxDist` can never be matched), advancing `ldm_base` so `seg_bias` remaps
+/// later absolute indices to the (shifted) history. C reaches the same point by
+/// wrapping its round buffer and flipping the serial LDM window to extDict; both
+/// are byte-identical because C's MT output is worker-count-independent (so the
+/// wrap timing — which depends on the round-buffer capacity, hence on `nbWorkers`
+/// — cannot affect the sequences). Very heavy (>128 MiB at level 22); manual run:
+/// `cargo test --release -- --ignored mt_stream_cross_job_ldm_past_window`.
+#[test]
+#[ignore = "needs a >128 MiB level-22 input to exercise the history front-drop"]
+fn mt_stream_cross_job_ldm_past_window() {
+    // overlapLog 2 ⇒ 1 MiB overlap, 2 MiB jobs; a 768 KiB repeated block keeps LDM
+    // offsets inside the overlap. ~140 MiB ⇒ input_pos passes maxDist (128 MiB), so
+    // the last jobs run after at least one front-drop (`ldm_base > 0`).
+    let block = word_salad(0x5D34_A210 ^ (768 * 1024), 768 * 1024);
+    let target = 140 * 1024 * 1024 + 123;
+    let mut body = Vec::with_capacity(target + block.len());
+    while body.len() < target {
+        body.extend_from_slice(&block);
+    }
+    let h = body.len() / 2;
+    // First call `compress` ⇒ unknown-size streaming (windowLog 27, LDM on).
+    check(22, 2, 2 * 1024 * 1024, 2, &[&body[..h]], &body[h..]);
+}

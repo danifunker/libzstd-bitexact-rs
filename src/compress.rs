@@ -3790,7 +3790,7 @@ fn prime_contiguous_prefix(fc: &mut FrameCompressor, buf: &[u8], prefix_len: usi
 
 /// `ZSTDMT_JOBSIZE_MIN` (`zstdmt_compress.h:33`): inputs at or below this skip
 /// multithreading entirely (`ZSTD_CCtx_init_compressStream2`, zstd_compress.c).
-const ZSTDMT_JOBSIZE_MIN: u64 = 512 * 1024;
+pub(crate) const ZSTDMT_JOBSIZE_MIN: u64 = 512 * 1024;
 /// `ZSTDMT_JOBSIZE_MAX` on a 64-bit target (`zstdmt_compress.h:36`).
 const ZSTDMT_JOBSIZE_MAX: u64 = 1024 * 1024 * 1024;
 /// `ZSTDMT_JOBLOG_MAX` on a 64-bit target (`zstdmt_compress.h:35`).
@@ -3843,19 +3843,20 @@ fn mt_target_section_size(cp: &CParams, job_size: u64, overlap_size: usize) -> u
 
 /// Compress one ZSTDMT job: a fresh frame-compressor (reset entropy + repcodes,
 /// matching C's per-job `ZSTD_compressBegin_advanced_internal`) over the
-/// `prefix ++ segment` buffer. The first job writes the frame header (its real
-/// `pledgedSrcSize` is the whole frame); later jobs emit blocks only (their
-/// would-be header is suppressed). Only the last job writes the epilogue.
+/// `prefix ++ segment` buffer. The first job writes the frame header (its
+/// `pledgedSrcSize` is the whole frame: a known size one-shot, `None` for
+/// unknown-size streaming → a windowed header); later jobs emit blocks only
+/// (their would-be header is suppressed). Only the last job writes the epilogue.
 fn compress_mt_job(
     out: &mut Vec<u8>,
     cparams: CParams,
     buf: &[u8],
     prefix_len: usize,
-    pledged: u64,
+    pledged: Option<u64>,
     write_header: bool,
     is_last: bool,
 ) -> Result<(), Error> {
-    let mut fc = FrameCompressor::from_cparams(cparams, Some(pledged), false);
+    let mut fc = FrameCompressor::from_cparams(cparams, pledged, false);
     if prefix_len > 0 {
         prime_contiguous_prefix(&mut fc, buf, prefix_len);
     }
@@ -3968,11 +3969,13 @@ pub fn compress_mt(
             overlap_size.min(seg_start)
         };
         let buf = &src[seg_start - prefix_len..seg_end];
-        let pledged = if first {
+        // One-shot: the whole frame's content size is known, so job 0's pledged
+        // is the real `src_len` (FCS header); later jobs pledge their segment.
+        let pledged = Some(if first {
             src_len as u64
         } else {
             seg_len as u64
-        };
+        });
         compress_mt_job(&mut out, cparams, buf, prefix_len, pledged, first, is_last)?;
 
         if !more_after {
@@ -3982,6 +3985,139 @@ pub fn compress_mt(
         first = false;
     }
     Ok(out)
+}
+
+/// Streaming-mode ZSTDMT (`ZSTD_compressStream2` with `nbWorkers >= 1`,
+/// unknown content size): the input arrives in chunks, is buffered into
+/// `section_size` jobs, and each job after the first sees the previous job's
+/// overlap tail as a contiguous prefix — same per-job machinery as
+/// [`compress_mt`], driven by the [`ZSTDMT_compressStream_generic`] loop.
+///
+/// Bounded memory: one `overlap_size + section_size` staging buffer holding the
+/// carried prefix and the section currently filling. Job 0 writes a windowed
+/// (unknown-size) header; later jobs emit blocks only; the last job (or, when
+/// the input ended exactly on a section boundary, a separate empty block)
+/// closes the frame.
+pub(crate) struct MtStreamState {
+    cparams: CParams,
+    section_size: usize,
+    overlap_size: usize,
+    /// `[carried prefix (prefix_len)] [section being filled (filled)]`.
+    buf: Vec<u8>,
+    prefix_len: usize,
+    filled: usize,
+    first: bool,
+}
+
+impl MtStreamState {
+    /// Set up unknown-size MT streaming, or a clean [`Error::Encode`] for the
+    /// configurations not yet supported (the same LDM / `maxDictSize` gates as
+    /// the one-shot [`compress_mt`]).
+    pub(crate) fn new(level: i32, job_size: u64, overlap_log: i32) -> Result<Self, Error> {
+        // Streaming resolves cParams with an unknown content size (default class,
+        // no window resize) — exactly like single-threaded streaming.
+        let cparams = get_cparams(level, CONTENTSIZE_UNKNOWN, 0);
+        if crate::ldm::LdmParams::auto(&cparams).is_some() {
+            return Err(Error::Encode(
+                "long-distance matching with multithreading is not supported yet",
+            ));
+        }
+        let overlap_size = mt_overlap_size(&cparams, overlap_log);
+        let section_size = mt_target_section_size(&cparams, job_size, overlap_size);
+        let max_dict_size = 1u64 << ((cparams.hash_log + 3).max(cparams.chain_log + 1)).min(31);
+        if overlap_size as u64 > max_dict_size {
+            return Err(Error::Encode(
+                "multithreaded overlap larger than the indexable dictionary size \
+                 is not supported yet",
+            ));
+        }
+        Ok(MtStreamState {
+            cparams,
+            section_size,
+            overlap_size,
+            buf: vec![0u8; overlap_size + section_size],
+            prefix_len: 0,
+            filled: 0,
+            first: true,
+        })
+    }
+
+    /// `ZSTD_compressStream2(.., ZSTD_e_continue)`: buffer `input`, emitting a
+    /// (non-last) job each time a full section accumulates.
+    pub(crate) fn push(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+        while !input.is_empty() {
+            let n = (self.section_size - self.filled).min(input.len());
+            let dst = self.prefix_len + self.filled;
+            self.buf[dst..dst + n].copy_from_slice(&input[..n]);
+            self.filled += n;
+            input = &input[n..];
+            if self.filled == self.section_size {
+                self.emit(out, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `ZSTD_compressStream2(.., ZSTD_e_end)`: buffer `input`, emit full sections
+    /// (non-last) while input remains, then close the frame with the final
+    /// remainder as the last job — or, if the input ended exactly on a section
+    /// boundary (nothing buffered), a single trailing empty block.
+    pub(crate) fn end(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+        loop {
+            let n = (self.section_size - self.filled).min(input.len());
+            let dst = self.prefix_len + self.filled;
+            self.buf[dst..dst + n].copy_from_slice(&input[..n]);
+            self.filled += n;
+            input = &input[n..];
+            if input.is_empty() {
+                self.emit(out, true)?;
+                break;
+            }
+            // Input still remaining ⇒ this section is exactly full: a non-last job
+            // (C downgrades `e_end` to `e_flush` while input is left).
+            self.emit(out, false)?;
+        }
+        Ok(())
+    }
+
+    /// Compress the buffered section as one job (or close the frame with an empty
+    /// block), then carry its overlap tail forward as the next job's prefix.
+    fn emit(&mut self, out: &mut Vec<u8>, is_last: bool) -> Result<(), Error> {
+        if self.filled == 0 && !self.first {
+            // `ZSTDMT_writeLastEmptyBlock`: the input ended on a section boundary.
+            debug_assert!(is_last);
+            push_block_header(out, true, 0, 0);
+            return Ok(());
+        }
+        let job_filled = self.filled;
+        let total = self.prefix_len + job_filled;
+        // Job 0 carries the (unknown) whole-frame size → windowed header; later
+        // jobs pledge their own segment size (clamps that job's window).
+        let pledged = if self.first {
+            None
+        } else {
+            Some(job_filled as u64)
+        };
+        compress_mt_job(
+            out,
+            self.cparams,
+            &self.buf[..total],
+            self.prefix_len,
+            pledged,
+            self.first,
+            is_last,
+        )?;
+        if !is_last {
+            // Next job's prefix = this segment's overlap tail.
+            let new_prefix = self.overlap_size.min(job_filled);
+            let seg_end = self.prefix_len + job_filled;
+            self.buf.copy_within(seg_end - new_prefix..seg_end, 0);
+            self.prefix_len = new_prefix;
+        }
+        self.filled = 0;
+        self.first = false;
+        Ok(())
+    }
 }
 
 /// Parse a CDict's dictionary buffer (`ZSTD_compress_insertDictionary` for the

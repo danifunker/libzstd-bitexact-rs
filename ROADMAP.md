@@ -283,8 +283,24 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          `jobSize`/`overlapLog`, the single/multi-job boundary, and exact-multiple
          sizes. Cross-job LDM, dictionaries, content checksums, and streaming MT
          return a clean error or are later increments.
-   - [ ] Streaming `ZSTDMT` (trailing empty-block job; unknown-size engagement),
-         dictionaries, checksums, and cross-job LDM.
+   - [x] **Streaming `ZSTDMT` — BIT-EXACT** (`StreamEncoder::with_workers`).
+         `ZSTD_compressStream2` with `nbWorkers >= 1` at an unknown content size:
+         input is buffered into `section_size` jobs as it arrives
+         (`ZSTDMT_compressStream_generic`), each compressed by the same per-job
+         machinery as the one-shot path. Reproduces C's exact loop semantics: a
+         job is the frame end only when `e_end` arrives with the input fully
+         consumed (otherwise `e_end` is downgraded to `e_flush`), so the trailing
+         empty-block job appears precisely when the input ends on a section
+         boundary in a later call. A first-call `finish` delegates to the
+         single-threaded frame (≤ 512 KiB) or the one-shot MT frame (above).
+         Bounded memory (one `overlap + section` staging buffer). Gated by
+         `tests/mt_stream_compress_differential.rs` across strategies, chunk
+         schedules, exact-multiple boundaries, and the single-job / first-call
+         cases. `flush`, a pledged size, dictionaries, and checksums with workers
+         return a clean error.
+   - [ ] `ZSTDMT` with a dictionary on job 0, content checksums (multi-job
+         appends the xxh64 externally in job order), cross-job LDM, and the
+         `flush` / pledged-size streaming paths.
 
 ## M6 — Performance
 

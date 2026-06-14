@@ -334,3 +334,46 @@ fn cdict_copy_window_filling_is_bit_exact() {
         }
     }
 }
+
+/// Regression for `task_51d658f2`: the CDict **copy** path resolves the post-block
+/// splitter from the **frame** cParams, not the copied CDict strategy. The CDict
+/// carries createCDict params (sized for a 513-byte hint), whose strategy can sit
+/// at/above btopt while the frame strategy (sized for the real `src`) is below it —
+/// so gating the splitter on the CDict strategy splits the block where C (gating on
+/// the frame strategy) does not. It only surfaces on **multi-block** inputs
+/// (> 128 KiB, post-splitter territory): the other copy tests here use < 60 KiB
+/// single-block inputs. A **trained** dict's seeded entropy makes the wrongly-enabled
+/// splitter actually split, so trained diverged where raw usually did not — both are
+/// covered, across the affected levels (frame strategy < btopt, e.g. 12/13/15) plus
+/// controls where both strategies are >= btopt (17/19/22). Release only.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-hundred-KiB at high levels); run in release"
+)]
+fn cdict_copy_multiblock_post_split_is_bit_exact() {
+    for (label, dict) in [("raw", ws(0xD1C7, 16 * 1024)), ("trained", trained_dict())] {
+        let dict_obj = Dictionary::new(&dict).expect("dict parse");
+        for &level in &[3i32, 9, 12, 13, 15, 17, 19, 22] {
+            for &n in &[130 * 1024usize, 200 * 1024, 300 * 1024] {
+                for seed in 0..3u64 {
+                    let src = ws(0x5151 ^ level as u64 ^ n as u64 ^ (seed << 40), n);
+                    let theirs = oracle(&src, &dict, level);
+                    let mine = compress_with_cdict(&src, &dict, level).unwrap();
+                    assert_eq!(
+                        mine, theirs,
+                        "cdict copy multi-block mismatch: {label} level={level} n={n} seed={seed}"
+                    );
+                    let decoded = DecodeOptions::new()
+                        .dictionary(&dict_obj)
+                        .decompress(&mine)
+                        .expect("decode with dict");
+                    assert_eq!(
+                        decoded, src,
+                        "round-trip: {label} level={level} n={n} seed={seed}"
+                    );
+                }
+            }
+        }
+    }
+}

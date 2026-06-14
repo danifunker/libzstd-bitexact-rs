@@ -3185,6 +3185,16 @@ pub(crate) struct FrameCompressor {
     /// dictionary's own tagged match table(s), consulted by the dictMatchState
     /// match finders. `None` on every other path (no dict, extDict, or copy).
     dict_match_state: Option<DictMatchState>,
+    /// `cctx->appliedParams.postBlockSplitter`: whether the post-block splitter
+    /// runs. C resolves this once from the **frame** cParams
+    /// (`ZSTD_resolveBlockSplitterMode`: `strategy >= btopt && windowLog >= 17`)
+    /// *before* a CDict copy/attach overwrites `cParams` with the CDict's own
+    /// (`ZSTD_resetCCtx_byCopyingCDict` keeps the already-resolved switch). For
+    /// every non-dict path the frame cParams *are* `cparams`, so this defaults to
+    /// `block_splitter_enabled(&cparams)`; the CDict paths override it from the
+    /// frame cParams, whose strategy can differ from the copied CDict strategy
+    /// (the CDict uses createCDict params, sized for a 513-byte hint).
+    post_block_splitter: bool,
 }
 
 /// The dictionary's own (tagged) match table(s) referenced by an attached CDict
@@ -3286,6 +3296,7 @@ impl FrameCompressor {
             window_preloaded: false,
             dict_id: 0,
             dict_match_state: None,
+            post_block_splitter: crate::post_split::block_splitter_enabled(&cparams),
         }
     }
 
@@ -3626,7 +3637,7 @@ impl FrameCompressor {
                 // The post-block splitter (btopt+ with windowLog >= 17) takes
                 // over block emission entirely: it may emit several blocks
                 // from this one seqStore, with dRep/cRep reconciliation.
-                if crate::post_split::block_splitter_enabled(&cparams) {
+                if self.post_block_splitter {
                     let c_size = crate::post_split::compress_block_split(
                         out,
                         &mut store,
@@ -4194,10 +4205,9 @@ fn compress_maybe_checksum(src: &[u8], level: i32, checksum: bool) -> Result<Vec
 ///
 /// Engagement follows C's `ZSTD_CCtx_init_compressStream2`: `nbWorkers == 0` or an
 /// input at or below `ZSTDMT_JOBSIZE_MIN` runs single-threaded with the CDict
-/// ([`compress_with_cdict`], checksum-aware). A **trained** (ZDICT) dictionary on the
-/// copy path is a clean [`Error::Encode`] — the same pre-existing `compress_with_cdict`
-/// copy divergence the streaming path defers (`task_51d658f2`); raw dicts are fully
-/// supported. LDM with a dictionary (level 22 above 64 MiB) is also a clean error.
+/// ([`compress_with_cdict`], checksum-aware). Raw and trained (ZDICT) dictionaries are
+/// both bit-exact on the attach and copy paths. LDM with a dictionary (level 22 above
+/// 64 MiB) is still a clean [`Error::Encode`].
 #[allow(clippy::too_many_arguments)]
 pub fn compress_mt_with_dict(
     src: &[u8],
@@ -4213,21 +4223,10 @@ pub fn compress_mt_with_dict(
     }
     // `ZSTD_CCtx_init_compressStream2`: multithreading is not invoked without workers
     // or for an input at or below the floor — C runs single-threaded with the CDict
-    // (attach for a tiny input, copy otherwise; both honour the checksum flag).
+    // (attach for a tiny input, copy otherwise; both honour the checksum flag, and
+    // both raw and trained dicts are bit-exact now that the copy-path post-block
+    // splitter resolves from the frame cParams).
     if nb_workers == 0 || src.len() as u64 <= ZSTDMT_JOBSIZE_MIN {
-        // A trained (ZDICT) dict on the COPY side of the cutoff is the deferred
-        // `compress_with_cdict` divergence (`task_51d658f2`); the engaged path gates
-        // it (`build_dict_job0`), so gate it here too rather than let the fallback
-        // emit a divergent frame. Trained ATTACH and any raw dict are fully supported.
-        let is_trained = dict.len() >= 8 && read32(dict, 0) == MAGIC_DICTIONARY;
-        let attaches = src.len()
-            <= cdict_attach_cutoff(get_cparams_create_cdict(level, dict.len() as u64).strategy);
-        if is_trained && !attaches {
-            return Err(Error::Encode(
-                "multithreaded compression with a trained (ZDICT) dictionary on the copy \
-                 path is not supported yet",
-            ));
-        }
         return compress_with_cdict_checksum(src, dict, level, checksum);
     }
     // MT engaged: drive the streaming job-splitter with the whole input as a single
@@ -4389,6 +4388,9 @@ impl MtStreamState {
                 frame_pledged,
                 checksum,
                 attach,
+                // `self.cparams` is the frame cParams (attach zeroes the dict size,
+                // copy keeps it), so this is C's frame-resolved `postBlockSplitter`.
+                crate::post_split::block_splitter_enabled(&cparams),
             )?),
         };
 
@@ -4430,6 +4432,7 @@ impl MtStreamState {
         frame_pledged: Option<u64>,
         checksum: bool,
         attach: bool,
+        post_block_splitter: bool,
     ) -> Result<MtDictJob0, Error> {
         let (content, entropy, rep, dict_id) = parse_cdict(dict)?;
         if content.len() <= HASH_READ_SIZE {
@@ -4456,20 +4459,9 @@ impl MtStreamState {
             // de-tagged CDict tables (= a Path-A `load_dictionary` / `dtlm_full`
             // fill with the CDict's own cParams), the dict a contiguous extDict
             // prefix, and the windowLog overridden to the frame's (dict-aware)
-            // one. Mirrors the copy branch of [`compress_with_cdict`].
-            //
-            // A **trained** (ZDICT) dictionary on the copy path is deferred: the
-            // standalone `compress_with_cdict` copy of a multi-block input with a
-            // trained dict diverges from C at the higher strategies (a separate,
-            // pre-existing seeded-entropy / post-split issue, unrelated to the
-            // `loadedDictEnd` window-filling fix), so reject it cleanly here rather
-            // than reproduce that divergence. Raw-content dicts are fully supported.
-            if dict_id != 0 {
-                return Err(Error::Encode(
-                    "multithreaded streaming with a trained (ZDICT) dictionary on the \
-                     copy path is not supported yet",
-                ));
-            }
+            // one. Mirrors the copy branch of [`compress_with_cdict`] — trained and
+            // raw dicts both supported (the post-block-splitter is resolved from
+            // the frame cParams below, which was the trained-copy divergence).
             let mut working = cdict_cparams;
             working.window_log = frame_window_log;
             let mut fc0 = FrameCompressor::from_cparams(working, frame_pledged, checksum);
@@ -4513,6 +4505,11 @@ impl MtStreamState {
         fc0.entropy = entropy;
         fc0.rep = rep;
         fc0.dict_id = dict_id;
+        // The post-block splitter is resolved from the **frame** cParams (the
+        // caller's `self.cparams`), not the copied CDict strategy — see the field
+        // doc on [`FrameCompressor::post_block_splitter`] and the copy branch of
+        // [`compress_with_cdict`].
+        fc0.post_block_splitter = post_block_splitter;
         // Lazy/opt resume table insertion at the src start (attach: src begins at
         // `cdictEnd`; copy: at the dict/src seam — both == `dictLimit`).
         match &mut fc0.matcher {
@@ -4874,6 +4871,14 @@ pub(crate) fn streaming_cdict_init(
     fc.entropy = entropy;
     fc.rep = rep;
     fc.dict_id = dict_id;
+    // Post-block splitter resolved from the **frame** cParams (attach zeroes the
+    // dict size), not the copied CDict strategy — see the field doc on
+    // [`FrameCompressor::post_block_splitter`].
+    fc.post_block_splitter = crate::post_split::block_splitter_enabled(&get_cparams(
+        level,
+        pledged.unwrap_or(CONTENTSIZE_UNKNOWN),
+        0,
+    ));
     // Lazy/opt resume table insertion at the src start (the first contiguous
     // chunk's nextToUpdate floor also does this, but set it explicitly).
     match &mut fc.matcher {
@@ -5033,6 +5038,17 @@ fn compress_with_cdict_checksum(
         Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
         _ => {}
     }
+
+    // `ZSTD_resolveBlockSplitterMode` runs on the **frame** cParams (resolved
+    // before the CDict copy overwrites `cParams` with the CDict's own strategy):
+    // the copied CDict strategy — createCDict params, sized for a 513-byte hint —
+    // can sit at/above btopt while the frame strategy (sized for the real src)
+    // is below it, so gating on the working (CDict) strategy splits where C does
+    // not. Resolve from the frame cParams instead (attach zeroes the dict size;
+    // copy keeps it — exactly `ZSTD_getCParamMode`).
+    let frame_dict_size = if attach { 0 } else { dict.len() as u64 };
+    fc.post_block_splitter =
+        crate::post_split::block_splitter_enabled(&get_cparams(level, src_size, frame_dict_size));
 
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
     fc.compress_end(&mut out, &data, content_len, content_len + src_len)?;

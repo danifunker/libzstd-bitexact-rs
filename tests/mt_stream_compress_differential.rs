@@ -549,21 +549,17 @@ fn mt_stream_raw_dict_copy_is_bit_exact() {
     run_mt_dict_copy(&word_salad(0xD1C7, 16 * 1024));
 }
 
-/// A **trained** (ZDICT) dictionary on the MT copy path is deferred (a separate
-/// pre-existing seeded-entropy/post-split divergence in `compress_with_cdict`'s
-/// copy branch at the higher strategies); it must error cleanly, never diverge.
+/// A **trained** (ZDICT) dictionary on the MT copy path — bit-exact now that the
+/// copy path resolves the post-block splitter from the frame cParams (the trained
+/// dict's seeded entropy made the wrongly-enabled splitter actually split; the
+/// enablement, not the entropy, was the bug — `task_51d658f2`).
 #[test]
-fn mt_stream_trained_dict_copy_errors_cleanly() {
-    let dict = trained_dict();
-    let body = word_salad(0x1234, 1300 * 1024);
-    let mut out = Vec::new();
-    let r = StreamEncoder::with_dictionary(12, &dict)
-        .with_workers(2, 512 * 1024, 0)
-        .finish(&body, &mut out);
-    assert!(
-        r.is_err(),
-        "MT + trained-dict copy path must error cleanly (deferred)"
-    );
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-MiB across strategies); run in release"
+)]
+fn mt_stream_trained_dict_copy_is_bit_exact() {
+    run_mt_dict_copy(&trained_dict());
 }
 
 /// Drive C with a pledged content size set up front.

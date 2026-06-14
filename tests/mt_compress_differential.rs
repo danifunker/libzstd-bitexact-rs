@@ -434,22 +434,37 @@ fn mt_one_shot_trained_dict_attach_is_bit_exact() {
 }
 
 /// A trained (ZDICT) dictionary on the **copy** path (srcSize above the attach
-/// cutoff) is the deferred `compress_with_cdict` divergence (`task_51d658f2`); it
-/// must error cleanly, never diverge — both when MT engages and on the
-/// single-threaded fallback above the cutoff.
+/// cutoff) — bit-exact now that the copy path resolves the post-block splitter from
+/// the frame cParams (`task_51d658f2`: the copied CDict strategy could enable the
+/// splitter where the frame strategy does not; the trained dict's seeded entropy
+/// then made it actually split). Covers the engaged (multi-job) path and the
+/// single-threaded fallback above the cutoff, at the strategies that diverged
+/// (level 12 = btopt frame→cdict mismatch, level 15 = btlazy2→btultra).
 #[test]
-fn mt_one_shot_trained_dict_copy_errors_cleanly() {
+#[cfg_attr(
+    debug_assertions,
+    ignore = "heavy differential test (multi-MiB); run in release"
+)]
+fn mt_one_shot_trained_dict_copy_is_bit_exact() {
     let dict = trained_dict();
-    // Engaged (> 512 KiB) -> copy.
-    let big = word_salad(0x1234, 1300 * 1024);
-    assert!(
-        compress_mt_with_dict(&big, &dict, 12, 2, 512 * 1024, 0, false).is_err(),
-        "one-shot MT + trained-dict copy must error cleanly (deferred)"
-    );
-    // Non-engaged but above the cutoff (300 KiB > 128 KiB) -> copy -> also gated.
-    let mid = word_salad(0x5678, 300 * 1024);
-    assert!(
-        compress_mt_with_dict(&mid, &dict, 12, 2, 512 * 1024, 0, false).is_err(),
-        "non-engaged trained-dict copy must error cleanly too"
-    );
+    for &level in &[12i32, 15] {
+        // Engaged (> 512 KiB): job 0 copies the CDict (multi-job).
+        check_dict(
+            &word_salad(0x1234 ^ level as u64, 1300 * 1024),
+            &dict,
+            level,
+            2,
+            512 * 1024,
+            false,
+        );
+        // Non-engaged but above the cutoff (300 KiB): single-threaded copy.
+        check_dict(
+            &word_salad(0x5678 ^ level as u64, 300 * 1024),
+            &dict,
+            level,
+            2,
+            512 * 1024,
+            false,
+        );
+    }
 }

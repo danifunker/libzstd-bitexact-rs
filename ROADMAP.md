@@ -374,6 +374,11 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
 ## Versioning note
 
 "Bit-exact compression" is only meaningful against a pinned upstream
-version: zstd's compressed output changes between releases. The plan is to
-target the zstd version bundled by the `zstd-sys` oracle (currently 1.5.7)
-and record the pin explicitly once M3 work begins.
+version: zstd's compressed output changes between releases. The target is the
+zstd version bundled by the `zstd-sys` oracle — **zstd 1.5.7**
+(`zstd-sys 2.0.16+zstd.1.5.7`). The pin is now recorded explicitly: `Cargo.lock`
+is committed and CI builds with `--locked`, so the oracle version (and the whole
+resolved graph) can only move via a deliberate `cargo update`. A future
+`zstd-sys` release bundling a newer zstd will therefore not silently break the
+differential suite — adopting it is a conscious step (bump the lock, then update
+the Rust implementation to match the new upstream output).

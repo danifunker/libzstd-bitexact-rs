@@ -21,7 +21,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Release mode: the differential suite pushes megabytes through the
       # decoder. Debug-assert coverage comes from the debug job below.
-      - run: cargo test --release
+      # `--locked`: the committed Cargo.lock pins the oracle to a specific
+      # bundled zstd version (bit-exactness is only meaningful against one
+      # upstream release), so CI must use it verbatim and fail on any drift.
+      - run: cargo test --release --locked
 
   test-debug:
     runs-on: ubuntu-latest
@@ -29,7 +32,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      - run: cargo test --locked
 
   lint:
     runs-on: ubuntu-latest
@@ -40,7 +43,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo doc --no-deps
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

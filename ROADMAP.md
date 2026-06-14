@@ -281,8 +281,8 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          `tests/mt_compress_differential.rs` against the `zstdmt`-built C oracle:
          byte-identical across every strategy, default and explicit
          `jobSize`/`overlapLog`, the single/multi-job boundary, and exact-multiple
-         sizes. Cross-job LDM, dictionaries, content checksums, and streaming MT
-         return a clean error or are later increments.
+         sizes. Cross-job LDM, dictionaries, and streaming MT return a clean
+         error or are later increments.
    - [x] **Streaming `ZSTDMT` — BIT-EXACT** (`StreamEncoder::with_workers`).
          `ZSTD_compressStream2` with `nbWorkers >= 1` at an unknown content size:
          input is buffered into `section_size` jobs as it arrives
@@ -296,11 +296,18 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          Bounded memory (one `overlap + section` staging buffer). Gated by
          `tests/mt_stream_compress_differential.rs` across strategies, chunk
          schedules, exact-multiple boundaries, and the single-job / first-call
-         cases. `flush`, a pledged size, dictionaries, and checksums with workers
-         return a clean error.
-   - [ ] `ZSTDMT` with a dictionary on job 0, content checksums (multi-job
-         appends the xxh64 externally in job order), cross-job LDM, and the
-         `flush` / pledged-size streaming paths.
+         cases. `flush`, a pledged size, and dictionaries with workers return a
+         clean error.
+   - [x] **`ZSTDMT` content checksum — BIT-EXACT** (one-shot + streaming). The
+         digest is over the whole input (C's serial state updates it per job
+         segment); job 0 keeps the checksum flag so the frame header carries the
+         bit and a **single** job appends its own digest, while a multi-job frame
+         clears the flag on every job and appends the 4-byte digest once after
+         the last job (`ZSTDMT_flushProduced`, including after a trailing empty
+         block). Gated by `mt_checksum_is_bit_exact` /
+         `mt_stream_checksum_is_bit_exact`.
+   - [ ] `ZSTDMT` with a dictionary on job 0, cross-job LDM, and the `flush` /
+         pledged-size streaming paths.
 
 ## M6 — Performance
 

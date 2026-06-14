@@ -169,7 +169,7 @@ impl StreamEncoder {
     /// If streaming has already started (the flag applies at init time).
     pub fn with_checksum(mut self, on: bool) -> Self {
         assert!(
-            self.state.is_none(),
+            self.state.is_none() && self.mt_state.is_none(),
             "checksum flag must be set before streaming starts"
         );
         self.checksum = on;
@@ -182,11 +182,12 @@ impl StreamEncoder {
     /// **single-threaded** (see [`crate::compress_mt`]).
     ///
     /// Current scope: unknown-size streaming (the default) via
-    /// [`compress`](Self::compress) + [`finish`](Self::finish). A first-call
+    /// [`compress`](Self::compress) + [`finish`](Self::finish), with or without a
+    /// content checksum ([`with_checksum`](Self::with_checksum)). A first-call
     /// `finish` below `ZSTDMT_JOBSIZE_MIN` (512 KiB) produces the single-threaded
     /// frame, and above it the one-shot MT frame. [`flush`](Self::flush), a
-    /// pledged size, a dictionary, and a checksum with workers are not supported
-    /// yet (clean [`Error::Encode`]).
+    /// pledged size, and a dictionary with workers are not supported yet (clean
+    /// [`Error::Encode`]).
     ///
     /// # Panics
     /// If streaming has already started (workers apply at init time).
@@ -232,9 +233,9 @@ impl StreamEncoder {
         // normal streaming case — a first-call `finish` is handled in
         // `stream_op`). The supported scope is plain unknown-size streaming.
         if self.nb_workers > 0 && end_op != EndOp::End {
-            if self.dict.is_some() || self.checksum {
+            if self.dict.is_some() {
                 return Err(Error::Encode(
-                    "multithreaded streaming with a dictionary or checksum is not supported yet",
+                    "multithreaded streaming with a dictionary is not supported yet",
                 ));
             }
             if self.requested_pledged.is_some() {
@@ -246,6 +247,7 @@ impl StreamEncoder {
                 self.level,
                 self.job_size,
                 self.overlap_log,
+                self.checksum,
             )?);
             return Ok(());
         }
@@ -320,7 +322,6 @@ impl StreamEncoder {
             if op == EndOp::End
                 && self.nb_workers > 0
                 && self.dict.is_none()
-                && !self.checksum
                 && self.requested_pledged.is_none()
                 && input.len() as u64 > ZSTDMT_JOBSIZE_MIN
             {
@@ -330,6 +331,7 @@ impl StreamEncoder {
                     self.nb_workers,
                     self.job_size,
                     self.overlap_log,
+                    self.checksum,
                 )?);
                 self.frame_ended = true;
                 return Ok(());

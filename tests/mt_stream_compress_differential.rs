@@ -68,6 +68,7 @@ fn oracle(
     workers: u32,
     job_size: u32,
     overlap_log: u32,
+    checksum: bool,
     chunks: &[&[u8]],
     finish: &[u8],
 ) -> Vec<u8> {
@@ -83,6 +84,9 @@ fn oracle(
     if overlap_log != 0 {
         cctx.set_parameter(CParameter::OverlapSizeLog(overlap_log))
             .unwrap();
+    }
+    if checksum {
+        cctx.set_parameter(CParameter::ChecksumFlag(true)).unwrap();
     }
 
     let mut out = Vec::new();
@@ -123,10 +127,13 @@ fn ours(
     workers: u32,
     job_size: u64,
     overlap_log: i32,
+    checksum: bool,
     chunks: &[&[u8]],
     finish: &[u8],
 ) -> Vec<u8> {
-    let mut enc = StreamEncoder::new(level).with_workers(workers, job_size, overlap_log);
+    let mut enc = StreamEncoder::new(level)
+        .with_workers(workers, job_size, overlap_log)
+        .with_checksum(checksum);
     let mut out = Vec::new();
     for &data in chunks {
         enc.compress(data, &mut out).unwrap();
@@ -135,7 +142,7 @@ fn ours(
     out
 }
 
-/// Assert byte-identical to the oracle and round-tripping.
+/// Assert byte-identical to the oracle and round-tripping (no checksum).
 fn check(
     level: i32,
     workers: u32,
@@ -144,12 +151,34 @@ fn check(
     chunks: &[&[u8]],
     finish: &[u8],
 ) {
-    let theirs = oracle(level, workers, job_size, overlap_log, chunks, finish);
+    check_ck(level, workers, job_size, overlap_log, false, chunks, finish);
+}
+
+/// Assert byte-identical to the oracle and round-tripping, checksum-aware.
+fn check_ck(
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    overlap_log: u32,
+    checksum: bool,
+    chunks: &[&[u8]],
+    finish: &[u8],
+) {
+    let theirs = oracle(
+        level,
+        workers,
+        job_size,
+        overlap_log,
+        checksum,
+        chunks,
+        finish,
+    );
     let mine = ours(
         level,
         workers,
         job_size as u64,
         overlap_log as i32,
+        checksum,
         chunks,
         finish,
     );
@@ -267,8 +296,62 @@ fn mt_stream_single_and_first_call() {
     check(3, 4, 512 * 1024, 0, &[], &tiny);
 }
 
-/// `flush`, a pledged size, dictionaries, and checksums with workers are not
-/// supported yet — they must error cleanly, never diverge.
+/// Content checksum with multithreaded streaming: the whole-input digest is
+/// appended after the last job (multi-job) or by the single job itself. Covers
+/// the single-job, multi-job, and exact-multiple (empty block then checksum)
+/// cases, fed via several schedules.
+#[test]
+fn mt_stream_checksum_is_bit_exact() {
+    for &level in &[1i32, 3, 6, 9, 17] {
+        // Single job (< section): the job appends its own checksum.
+        let small = word_salad(0x71 ^ level as u64, 300 * 1024);
+        check_ck(level, 2, 512 * 1024, 0, true, &[&small[..]], &[]);
+        check_ck(
+            level,
+            2,
+            512 * 1024,
+            0,
+            true,
+            &[&small[..100 * 1024]],
+            &small[100 * 1024..],
+        );
+
+        // Multi-job: external append after the last job.
+        let body = word_salad(0x72 ^ level as u64, 1300 * 1024);
+        let h = body.len() / 2;
+        check_ck(level, 2, 512 * 1024, 0, true, &[&body[..]], &[]);
+        check_ck(level, 2, 512 * 1024, 0, true, &[&body[..h]], &body[h..]);
+        check_ck(
+            level,
+            2,
+            512 * 1024,
+            0,
+            true,
+            &[&body[..h], &body[h..]],
+            &[],
+        );
+
+        // Exact multiple via compress -> trailing empty block, then checksum.
+        let exact = word_salad(0x73 ^ level as u64, 1024 * 1024);
+        check_ck(level, 2, 512 * 1024, 0, true, &[&exact[..]], &[]);
+        check_ck(
+            level,
+            2,
+            512 * 1024,
+            0,
+            true,
+            &[&exact[..512 * 1024]],
+            &exact[512 * 1024..],
+        );
+    }
+
+    // First-call finish with checksum (one-shot delegation, above the MT floor).
+    let big = word_salad(0x74, 1500 * 1024);
+    check_ck(3, 4, 512 * 1024, 0, true, &[], &big);
+}
+
+/// `flush`, a pledged size, and dictionaries with workers are not supported yet
+/// — they must error cleanly, never diverge.
 #[test]
 fn mt_stream_unsupported_errors_cleanly() {
     let body = word_salad(0x44, 700 * 1024);

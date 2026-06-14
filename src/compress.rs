@@ -3625,15 +3625,9 @@ impl FrameCompressor {
 /// Bit-exact with C libzstd 1.5.7 for the supported scope (see module docs);
 /// unsupported configurations return [`Error::Encode`] rather than diverging.
 pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
-    if src.len() as u64 >= u64::from(u32::MAX) - 2 {
-        // Match indices are 32-bit; larger inputs need the C window-cycling
-        // (overflow correction) machinery.
-        return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
-    }
-    let mut fc = FrameCompressor::new(level, Some(src.len() as u64), false);
-    let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
-    fc.compress_end(&mut out, src, 0, src.len())?;
-    Ok(out)
+    // Match indices are 32-bit; larger inputs need the C window-cycling
+    // (overflow correction) machinery.
+    compress_maybe_checksum(src, level, false)
 }
 
 /// `ZSTD_compress_usingDict`: one-shot frame compression primed with a
@@ -3847,6 +3841,12 @@ fn mt_target_section_size(cp: &CParams, job_size: u64, overlap_size: usize) -> u
 /// `pledgedSrcSize` is the whole frame: a known size one-shot, `None` for
 /// unknown-size streaming → a windowed header); later jobs emit blocks only
 /// (their would-be header is suppressed). Only the last job writes the epilogue.
+///
+/// `checksum` is the *per-job* flag: C keeps it on only for job 0 (zstdmt
+/// `jobID != 0` clears it), so the frame header carries the checksum bit and a
+/// **single** job appends the digest itself; multi-job frames clear it on every
+/// job and append the whole-input digest externally (see the callers).
+#[allow(clippy::too_many_arguments)]
 fn compress_mt_job(
     out: &mut Vec<u8>,
     cparams: CParams,
@@ -3855,8 +3855,9 @@ fn compress_mt_job(
     pledged: Option<u64>,
     write_header: bool,
     is_last: bool,
+    checksum: bool,
 ) -> Result<(), Error> {
-    let mut fc = FrameCompressor::from_cparams(cparams, pledged, false);
+    let mut fc = FrameCompressor::from_cparams(cparams, pledged, checksum);
     if prefix_len > 0 {
         prime_contiguous_prefix(&mut fc, buf, prefix_len);
     }
@@ -3885,19 +3886,25 @@ fn compress_mt_job(
 /// job) produces exactly the single-threaded [`compress`] frame. `job_size` and
 /// `overlap_log` of `0` mean "use C's defaults".
 ///
-/// Current scope: no dictionary and no content checksum. Two rare
-/// configurations return a clean [`Error::Encode`] rather than diverging:
-/// long-distance matching with multithreading (`windowLog >= 27` at btopt+,
-/// only reached by very large inputs), and an explicit `overlap_log` whose
-/// overlap exceeds the indexable dictionary size (`maxDictSize`) — the default
-/// `overlap_log` never does. Streaming, dictionaries, checksums, and cross-job
-/// LDM are later increments.
+/// With `checksum`, the frame carries a content checksum exactly as C's MT path
+/// does: the digest is over the whole input (computed by the serial state), the
+/// frame header's checksum bit is set by job 0, and for a multi-job frame the
+/// 4-byte digest is appended once after the last job (a single job appends it
+/// itself).
+///
+/// Current scope: no dictionary. Two rare configurations return a clean
+/// [`Error::Encode`] rather than diverging: long-distance matching with
+/// multithreading (`windowLog >= 27` at btopt+, only reached by very large
+/// inputs), and an explicit `overlap_log` whose overlap exceeds the indexable
+/// dictionary size (`maxDictSize`) — the default `overlap_log` never does.
+/// Dictionaries and cross-job LDM are later increments.
 pub fn compress_mt(
     src: &[u8],
     level: i32,
     nb_workers: u32,
     job_size: u64,
     overlap_log: i32,
+    checksum: bool,
 ) -> Result<Vec<u8>, Error> {
     if src.len() as u64 >= u64::from(u32::MAX) - 2 {
         return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
@@ -3908,7 +3915,7 @@ pub fn compress_mt(
     // source is small (`pledged <= ZSTDMT_JOBSIZE_MIN`), and `nbWorkers == 0` is
     // plain single-threaded. Both produce the single-threaded frame.
     if nb_workers == 0 || src_len as u64 <= ZSTDMT_JOBSIZE_MIN {
-        return compress(src, level);
+        return compress_maybe_checksum(src, level, checksum);
     }
 
     // cParams are resolved exactly as single-threaded (nbWorkers is not an
@@ -3944,7 +3951,7 @@ pub fn compress_mt(
     // A single job (the whole input fits one section) is byte-identical to
     // single-threaded — including the `pledged <= 512 KiB` case handled above.
     if src_len < section_size {
-        return compress(src, level);
+        return compress_maybe_checksum(src, level, checksum);
     }
 
     // Multi-job: split into `section_size` segments; each non-first job sees the
@@ -3952,6 +3959,7 @@ pub fn compress_mt(
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
     let mut seg_start = 0usize;
     let mut first = true;
+    let mut job_count = 0usize;
     loop {
         let seg_end = (seg_start + section_size).min(src_len);
         let seg_len = seg_end - seg_start;
@@ -3976,7 +3984,19 @@ pub fn compress_mt(
         } else {
             seg_len as u64
         });
-        compress_mt_job(&mut out, cparams, buf, prefix_len, pledged, first, is_last)?;
+        // C keeps the checksum flag on for job 0 only (header bit; a single job
+        // appends the digest itself), and clears it on later jobs.
+        compress_mt_job(
+            &mut out,
+            cparams,
+            buf,
+            prefix_len,
+            pledged,
+            first,
+            is_last,
+            checksum && first,
+        )?;
+        job_count += 1;
 
         if !more_after {
             break;
@@ -3984,6 +4004,25 @@ pub fn compress_mt(
         seg_start = seg_end;
         first = false;
     }
+    // `ZSTDMT_flushProduced` writes the whole-input checksum after the last job
+    // of a *multi-job* frame (a single job already appended its own).
+    if checksum && job_count > 1 {
+        let mut xxh = crate::xxhash::Xxh64::new(0);
+        xxh.update(src);
+        out.extend_from_slice(&(xxh.digest() as u32).to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Single-threaded one-shot compression, optionally with a content checksum —
+/// the small / single-job fallback of [`compress_mt`].
+fn compress_maybe_checksum(src: &[u8], level: i32, checksum: bool) -> Result<Vec<u8>, Error> {
+    if src.len() as u64 >= u64::from(u32::MAX) - 2 {
+        return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
+    }
+    let mut fc = FrameCompressor::new(level, Some(src.len() as u64), checksum);
+    let mut out = Vec::with_capacity(src.len() + (src.len() >> 8) + 64);
+    fc.compress_end(&mut out, src, 0, src.len())?;
     Ok(out)
 }
 
@@ -4007,13 +4046,25 @@ pub(crate) struct MtStreamState {
     prefix_len: usize,
     filled: usize,
     first: bool,
+    /// `ZSTD_c_checksumFlag`: the whole-input digest (C's serial-state xxh,
+    /// updated per segment) appended after the last job of a multi-job frame.
+    checksum: bool,
+    xxh: crate::xxhash::Xxh64,
+    /// Number of jobs emitted (incl. the trailing empty block); a single-job
+    /// frame appends its own checksum so the external append is multi-job only.
+    job_count: usize,
 }
 
 impl MtStreamState {
     /// Set up unknown-size MT streaming, or a clean [`Error::Encode`] for the
     /// configurations not yet supported (the same LDM / `maxDictSize` gates as
     /// the one-shot [`compress_mt`]).
-    pub(crate) fn new(level: i32, job_size: u64, overlap_log: i32) -> Result<Self, Error> {
+    pub(crate) fn new(
+        level: i32,
+        job_size: u64,
+        overlap_log: i32,
+        checksum: bool,
+    ) -> Result<Self, Error> {
         // Streaming resolves cParams with an unknown content size (default class,
         // no window resize) — exactly like single-threaded streaming.
         let cparams = get_cparams(level, CONTENTSIZE_UNKNOWN, 0);
@@ -4039,6 +4090,9 @@ impl MtStreamState {
             prefix_len: 0,
             filled: 0,
             first: true,
+            checksum,
+            xxh: crate::xxhash::Xxh64::new(0),
+            job_count: 0,
         })
     }
 
@@ -4077,16 +4131,28 @@ impl MtStreamState {
             // (C downgrades `e_end` to `e_flush` while input is left).
             self.emit(out, false)?;
         }
+        // `ZSTDMT_flushProduced` appends the whole-input checksum after the last
+        // job of a multi-job frame (a single job appended its own).
+        if self.checksum && self.job_count > 1 {
+            out.extend_from_slice(&(self.xxh.digest() as u32).to_le_bytes());
+        }
         Ok(())
     }
 
     /// Compress the buffered section as one job (or close the frame with an empty
     /// block), then carry its overlap tail forward as the next job's prefix.
     fn emit(&mut self, out: &mut Vec<u8>, is_last: bool) -> Result<(), Error> {
+        // C's serial state accumulates the checksum over each job's segment (the
+        // new content, not the carried prefix), in order.
+        if self.checksum {
+            let seg = &self.buf[self.prefix_len..self.prefix_len + self.filled];
+            self.xxh.update(seg);
+        }
         if self.filled == 0 && !self.first {
             // `ZSTDMT_writeLastEmptyBlock`: the input ended on a section boundary.
             debug_assert!(is_last);
             push_block_header(out, true, 0, 0);
+            self.job_count += 1;
             return Ok(());
         }
         let job_filled = self.filled;
@@ -4106,7 +4172,11 @@ impl MtStreamState {
             pledged,
             self.first,
             is_last,
+            // C keeps the checksum flag on for job 0 only (header bit; a single
+            // job appends its own digest), clearing it on later jobs.
+            self.checksum && self.first,
         )?;
+        self.job_count += 1;
         if !is_last {
             // Next job's prefix = this segment's overlap tail.
             let new_prefix = self.overlap_size.min(job_filled);

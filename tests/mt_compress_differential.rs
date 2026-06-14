@@ -59,7 +59,14 @@ fn word_salad(seed: u64, len: usize) -> Vec<u8> {
 
 /// Oracle: C `ZSTD_compress2` with multithreading parameters set
 /// (`nbWorkers`/`jobSize`/`overlapLog`; `0` means "C default").
-fn oracle(src: &[u8], level: i32, workers: u32, job_size: u32, overlap_log: u32) -> Vec<u8> {
+fn oracle(
+    src: &[u8],
+    level: i32,
+    workers: u32,
+    job_size: u32,
+    overlap_log: u32,
+    checksum: bool,
+) -> Vec<u8> {
     let mut cctx = CCtx::create();
     cctx.set_parameter(CParameter::CompressionLevel(level))
         .unwrap();
@@ -72,22 +79,32 @@ fn oracle(src: &[u8], level: i32, workers: u32, job_size: u32, overlap_log: u32)
         cctx.set_parameter(CParameter::OverlapSizeLog(overlap_log))
             .unwrap();
     }
+    if checksum {
+        cctx.set_parameter(CParameter::ChecksumFlag(true)).unwrap();
+    }
     let mut dst = Vec::with_capacity(zstd_safe::compress_bound(src.len()));
     cctx.compress2(&mut dst, src).expect("oracle compress2");
     dst
 }
 
 /// Assert `compress_mt` is byte-identical to the oracle and round-trips.
-fn check(src: &[u8], level: i32, workers: u32, job_size: u32, overlap_log: u32) {
-    let theirs = oracle(src, level, workers, job_size, overlap_log);
-    let mine = compress_mt(src, level, workers, job_size as u64, overlap_log as i32)
-        .unwrap_or_else(|e| {
-            panic!(
-                "compress_mt errored: level={level} workers={workers} jobSize={job_size} \
-                 overlapLog={overlap_log} len={}: {e}",
-                src.len()
-            )
-        });
+fn check(src: &[u8], level: i32, workers: u32, job_size: u32, overlap_log: u32, checksum: bool) {
+    let theirs = oracle(src, level, workers, job_size, overlap_log, checksum);
+    let mine = compress_mt(
+        src,
+        level,
+        workers,
+        job_size as u64,
+        overlap_log as i32,
+        checksum,
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "compress_mt errored: level={level} workers={workers} jobSize={job_size} \
+                 overlapLog={overlap_log} checksum={checksum} len={}: {e}",
+            src.len()
+        )
+    });
     if mine != theirs {
         let first = mine
             .iter()
@@ -129,7 +146,7 @@ fn mt_small_jobs_are_bit_exact() {
     for &level in &[1i32, 3, 6, 9, 12, 15, 17] {
         for &len in &sizes {
             let src = word_salad(0xC0FFEE ^ (len as u64), len);
-            check(&src, level, 2, 512 * 1024, 0);
+            check(&src, level, 2, 512 * 1024, 0, false);
         }
     }
 }
@@ -141,14 +158,14 @@ fn mt_single_job_equals_single_threaded() {
         for &len in &[0usize, 1000, 256 * 1024, 512 * 1024, 700 * 1024] {
             // <=512 KiB -> MT disabled; 700 KiB with default jobSize -> one job.
             let src = word_salad(0xABCD ^ (len as u64), len);
-            let mt = compress_mt(&src, level, 4, 0, 0).unwrap();
+            let mt = compress_mt(&src, level, 4, 0, 0, false).unwrap();
             let st = libzstd_bitexact::compress(&src, level).unwrap();
             assert_eq!(
                 mt, st,
                 "single-job != single-threaded: level={level} len={len}"
             );
             // And it matches the oracle too.
-            check(&src, level, 4, 0, 0);
+            check(&src, level, 4, 0, 0, false);
         }
     }
 }
@@ -157,12 +174,12 @@ fn mt_single_job_equals_single_threaded() {
 #[test]
 fn mt_output_independent_of_worker_count() {
     let src = word_salad(0x5151, 1500 * 1024);
-    let base = compress_mt(&src, 6, 1, 512 * 1024, 0).unwrap();
+    let base = compress_mt(&src, 6, 1, 512 * 1024, 0, false).unwrap();
     for workers in [1u32, 2, 3, 4, 8] {
-        let c = compress_mt(&src, 6, workers, 512 * 1024, 0).unwrap();
+        let c = compress_mt(&src, 6, workers, 512 * 1024, 0, false).unwrap();
         assert_eq!(c, base, "worker count changed bytes: workers={workers}");
         // The oracle is likewise worker-independent.
-        check(&src, 6, workers, 512 * 1024, 0);
+        check(&src, 6, workers, 512 * 1024, 0, false);
     }
 }
 
@@ -173,7 +190,7 @@ fn mt_overlap_overrides_are_bit_exact() {
     for &len in &[700 * 1024usize, 1024 * 1024 + 7, 1500 * 1024] {
         let src = word_salad(0x0E12 ^ len as u64, len);
         for overlap_log in [1u32, 3, 6, 9] {
-            check(&src, 9, 2, 512 * 1024, overlap_log);
+            check(&src, 9, 2, 512 * 1024, overlap_log, false);
         }
     }
 }
@@ -192,7 +209,7 @@ fn mt_default_jobsize_is_bit_exact() {
     for &level in &[1i32, 2, 4, 6, 9, 12, 15, 17, 19, 22] {
         for &len in &[3 * 1024 * 1024usize, 6 * 1024 * 1024 + 123] {
             let src = word_salad(0xBEEF ^ len as u64, len);
-            check(&src, level, 4, 0, 0);
+            check(&src, level, 4, 0, 0, false);
         }
     }
 }
@@ -205,7 +222,26 @@ fn mt_default_jobsize_is_bit_exact() {
 fn mt_oversized_overlap_errors_cleanly() {
     let src = word_salad(0x9, 1024 * 1024 + 1);
     assert!(
-        compress_mt(&src, 1, 2, 0, 9).is_err(),
+        compress_mt(&src, 1, 2, 0, 9, false).is_err(),
         "oversized overlap at a fast level must be a clean error"
     );
+}
+
+/// Content checksum (`ZSTD_c_checksumFlag`) with multithreading: the whole-input
+/// digest is appended once after the last job (multi-job) or by the single job
+/// itself. Across strategies, the single/multi-job boundary, and exact multiples.
+#[test]
+fn mt_checksum_is_bit_exact() {
+    let sizes = [
+        300 * 1024usize, // single job (< 512 KiB section) -> self-appended
+        512 * 1024 + 1,  // 2 jobs
+        1024 * 1024,     // exact 2× -> last full job is the end (no empty block)
+        1300 * 1024,     // 3 jobs, partial last
+    ];
+    for &level in &[1i32, 3, 6, 9, 12, 17] {
+        for &len in &sizes {
+            let src = word_salad(0xC5 ^ (len as u64), len);
+            check(&src, level, 2, 512 * 1024, 0, true);
+        }
+    }
 }

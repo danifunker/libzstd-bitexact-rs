@@ -356,13 +356,24 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
          the engaged case drives the streaming `MtStreamState` with the whole input
          as a single `e_end`. `nbWorkers == 0` or an input at or below the MT floor
          runs single-threaded with the CDict (`compress_with_cdict`, now checksum-aware).
-         Gated by `mt_one_shot_dict_is_bit_exact` (raw, copy + non-engaged + checksum)
-         and `mt_one_shot_trained_dict_attach_is_bit_exact`; a **trained** dict on the
-         copy path is the deferred `compress_with_cdict` divergence and errors cleanly
-         on both the engaged and single-threaded paths (`mt_one_shot_trained_dict_copy_errors_cleanly`).
-   - [ ] Remaining `ZSTDMT`: the MT+dict **copy** path for a **trained** dict
-         (`task_51d658f2`); MT + dict + LDM together (the serial state's dict-fill is
-         unported) — both currently clean errors.
+         Gated by `mt_one_shot_dict_is_bit_exact`, `mt_one_shot_trained_dict_attach_is_bit_exact`,
+         and `mt_one_shot_trained_dict_copy_is_bit_exact`.
+   - [x] **CDict copy post-block-splitter resolves from the frame cParams — BIT-EXACT
+         trained-dict copy (`task_51d658f2`).** The copy path enabled the post-block
+         splitter on the *copied CDict* strategy, but C resolves `postBlockSplitter`
+         once from the **frame** cParams (`ZSTD_resolveBlockSplitterMode`) before
+         `ZSTD_resetCCtx_byCopyingCDict` overwrites cParams with the CDict's own. The
+         CDict uses createCDict params (513-byte hint), whose strategy can sit at/above
+         btopt while the frame strategy is below it (e.g. level 15: frame btlazy2, cdict
+         btultra) — so we split where C did not, and a trained dict's seeded entropy made
+         the wrongly-enabled splitter actually split. `FrameCompressor.post_block_splitter`
+         now mirrors C's resolved switch (default `block_splitter_enabled(&cparams)`,
+         overridden by the CDict attach/copy paths from the frame cParams). Fixes
+         standalone `compress_with_cdict` copy (any dict) and un-gates MT + trained-dict
+         copy. Gated by `cdict_copy_multiblock_post_split_is_bit_exact` (multi-block, the
+         prior CDict tests were single-block ≤ 60 KiB) + the MT trained-copy tests.
+   - [ ] Remaining `ZSTDMT`: MT + dict + LDM together (the serial state's dict-fill is
+         unported) — a clean error.
 
 ## M6 — Performance
 

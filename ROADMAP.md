@@ -256,8 +256,35 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
 - [ ] One-shot `compress` bit-exact verified against multiple upstream zstd
       releases, pinned per version (currently pinned to the single 1.5.7
       oracle bundled by `zstd-sys`).
-- [ ] Dictionary compression.
-- [ ] Multithreaded mode (`ZSTDMT`) — job splitting parity.
+- [x] Dictionary compression. Both C dict paths are bit-exact for all nine
+      strategies, raw and trained (`ZDICT`): `compress_with_dict`
+      (`ZSTD_compress_usingDict`, the extDict/prefix path), `compress_with_cdict`
+      (`ZSTD_compress_usingCDict` / `with_dictionary`, the CDict
+      `dictMatchState` path with the attach/copy heuristic), and
+      `StreamEncoder::with_dictionary` (streaming, the attach path). Deferred,
+      inert at tested sizes: `loadedDictEnd`-aware `enforceMaxDist` /
+      `checkDictValidity` (window-filling dict streams) and `maxDictSize`
+      suffix-truncation (dicts larger than the indexable table size).
+- [ ] Multithreaded mode (`ZSTDMT`) — job-splitting parity.
+   - [x] **One-shot `compress_mt` — BIT-EXACT.** `ZSTD_compress2` with
+         `nbWorkers >= 1`, reproduced **single-threaded** (C's MT output is
+         deterministic and worker-count-independent — only the job decomposition
+         matters, so no threads are needed and the library stays zero-dep). The
+         input is split into `jobSize`-byte jobs (`ZSTDMT_computeTargetJobLog`
+         + clamps); each job after the first sees the previous job's overlap tail
+         (`ZSTDMT_computeOverlapSize`) as a **contiguous raw-content prefix**
+         (noDict, in-window history — *not* extDict, since C's round buffer keeps
+         prefix and segment adjacent), with reset repcodes and fresh entropy; the
+         first job writes the frame header, later jobs emit blocks only, the last
+         writes the epilogue. Below `ZSTDMT_JOBSIZE_MIN` (512 KiB) or a single
+         job, the output is the single-threaded frame exactly. Gated by
+         `tests/mt_compress_differential.rs` against the `zstdmt`-built C oracle:
+         byte-identical across every strategy, default and explicit
+         `jobSize`/`overlapLog`, the single/multi-job boundary, and exact-multiple
+         sizes. Cross-job LDM, dictionaries, content checksums, and streaming MT
+         return a clean error or are later increments.
+   - [ ] Streaming `ZSTDMT` (trailing empty-block job; unknown-size engagement),
+         dictionaries, checksums, and cross-job LDM.
 
 ## M6 — Performance
 

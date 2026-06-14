@@ -14,7 +14,10 @@ categories = ["compression"]
 
 [dev-dependencies]
 # The real C libzstd, used exclusively as the differential-testing oracle.
-zstd = "0.13"
+# `zstdmt` builds the vendored C with multithreading so the ZSTDMT
+# (job-splitting) output can be differential-tested; the library itself stays
+# single-threaded and dependency-free.
+zstd = { version = "0.13", features = ["zstdmt"] }
 # Raw FFI to the same bundled libzstd, for oracle introspection in tests
 # (e.g. asking C which compression parameters it derives). `experimental`
 # exposes the ZSTD_STATIC_LINKING_ONLY API surface with pregenerated bindings.

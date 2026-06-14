@@ -518,6 +518,27 @@ impl Window {
         }
     }
 
+    /// The window state a ZSTDMT job (after the first) reaches: the previous
+    /// job's overlap tail is supplied as a raw-content prefix that is
+    /// **contiguous** with the segment in C's round buffer, so the window does
+    /// *not* flip to extDict — it stays noDict, with the prefix as ordinary
+    /// in-window history. (Contrast [`preloaded_ext_dict`](Self::preloaded_ext_dict),
+    /// where the dict is a separate buffer.) The whole `prefix ++ segment` buffer
+    /// is the current segment at indices `[2, 2 + total_len)`, with
+    /// `lowLimit == dictLimit == 2`, so the noDict matchers reach back into the
+    /// prefix as far as `maxDist` allows.
+    pub(crate) fn preloaded_contiguous_prefix(total_len: usize) -> Self {
+        let start = WINDOW_START_INDEX as u32;
+        Window {
+            seg_bias: start,
+            dict_bias: start,
+            low_limit: start,
+            dict_limit: start,
+            next_src_pos: total_len,
+            next_src_idx: start + total_len as u32,
+        }
+    }
+
     /// The window state `ZSTD_resetCCtx_byAttachingCDict` reaches: the
     /// dictionary lives in a *separate* match state (the attached CDict), so the
     /// working window is non-extDict with `src` as its only segment, starting at
@@ -3685,35 +3706,281 @@ pub fn compress_with_dict(src: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>
     data.extend_from_slice(content);
     data.extend_from_slice(src);
 
-    // Seed the strategy's dict table(s). Skipped when `dictContentSize <=
+    prime_raw_prefix(&mut fc, &data, content_len);
+
+    let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
+    fc.compress_end(&mut out, &data, content_len, content_len + src_len)?;
+    Ok(out)
+}
+
+/// `ZSTD_loadDictionaryContent` (raw content, `ZSTD_dtlm_fast`) followed by the
+/// non-contiguous append: lay the history as one buffer `prefix ++ input` (the
+/// prefix occupying `buf[..prefix_len]`), seed the strategy's match table(s)
+/// from the prefix, and put the window directly in the post-flip extDict state
+/// so the bit-exact extDict matchers run against it. Shared by
+/// [`compress_with_dict`] (Path A, the dict as prefix) and the ZSTDMT job driver
+/// ([`compress_mt`], where each non-first job sees the previous job's overlap
+/// tail as a raw-content prefix). The caller has already seeded `fc.entropy` /
+/// `fc.rep` (default `[1,4,8]` for raw content).
+fn prime_raw_prefix(fc: &mut FrameCompressor, buf: &[u8], prefix_len: usize) {
+    // Seed the strategy's table(s). Skipped when the prefix is `<=
     // HASH_READ_SIZE`, where C's `ZSTD_loadDictionaryContent` returns before
     // filling — the extDict is still live, just with empty tables.
-    if content_len > HASH_READ_SIZE {
+    if prefix_len > HASH_READ_SIZE {
         match &mut fc.matcher {
-            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, &data, content_len),
-            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, &data, content_len),
-            Matcher::Lazy(ctx) => ctx.load_dictionary(&data, content_len),
-            Matcher::Opt(ctx) => ctx.load_dictionary(&data, content_len),
+            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, buf, prefix_len),
+            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, buf, prefix_len),
+            Matcher::Lazy(ctx) => ctx.load_dictionary(buf, prefix_len),
+            Matcher::Opt(ctx) => ctx.load_dictionary(buf, prefix_len),
         }
     }
-    fc.window = Window::preloaded_ext_dict(content_len, src_len);
+    fc.window = Window::preloaded_ext_dict(prefix_len, buf.len() - prefix_len);
     fc.window_preloaded = true;
     // The window-preloaded path skips compress_continue's non-contiguous reset
     // (`ms->nextToUpdate = window.dictLimit`); apply it here so the lazy/opt
-    // matchers resume insertion at the start of `src` and never re-insert dict
-    // positions. (For a filled dict, load_dictionary already left nextToUpdate
-    // at dictLimit; this is what covers the no-fill `content_len ==
-    // HASH_READ_SIZE` case, where leaving it at the dict start would fabricate
-    // dict matches that C — whose post-flip base makes those indices hash
+    // matchers resume insertion at the start of the input and never re-insert
+    // prefix positions. (For a filled prefix, load_dictionary already left
+    // nextToUpdate at dictLimit; this is what covers the no-fill `prefix_len ==
+    // HASH_READ_SIZE` case, where leaving it at the prefix start would fabricate
+    // prefix matches that C — whose post-flip base makes those indices hash
     // unrelated bytes — never finds. Fast/dfast don't track nextToUpdate.)
     match &mut fc.matcher {
         Matcher::Lazy(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
         Matcher::Opt(ctx) => ctx.next_to_update = fc.window.dict_limit as usize,
         _ => {}
     }
+}
 
+/// Like [`prime_raw_prefix`] but for a ZSTDMT job: the prefix is **contiguous**
+/// with the segment (same round buffer in C), so the window stays **noDict**
+/// (the prefix is in-window history, not extDict). Seeds the same match
+/// table(s) from the prefix, then arranges the whole `prefix ++ segment` buffer
+/// as one in-window segment so the noDict matchers reach back into the prefix.
+fn prime_contiguous_prefix(fc: &mut FrameCompressor, buf: &[u8], prefix_len: usize) {
+    if prefix_len > HASH_READ_SIZE {
+        match &mut fc.matcher {
+            Matcher::Fast(ctx) => fill_fast_hash_table_for_cctx(ctx, buf, prefix_len),
+            Matcher::Dfast(ctx) => fill_dfast_hash_tables_for_cctx(ctx, buf, prefix_len),
+            Matcher::Lazy(ctx) => ctx.load_dictionary(buf, prefix_len),
+            Matcher::Opt(ctx) => ctx.load_dictionary(buf, prefix_len),
+        }
+    }
+    fc.window = Window::preloaded_contiguous_prefix(buf.len());
+    fc.window_preloaded = true;
+    // Resume table insertion at the segment start (the prefix is already
+    // filled); `ZSTD_loadDictionaryContent` leaves `nextToUpdate` here.
+    let seg_start_idx = WINDOW_START_INDEX + prefix_len;
+    match &mut fc.matcher {
+        Matcher::Lazy(ctx) => ctx.next_to_update = seg_start_idx,
+        Matcher::Opt(ctx) => ctx.next_to_update = seg_start_idx,
+        _ => {}
+    }
+}
+
+// --- ZSTDMT: multithreaded (job-splitting) compression -----------------------
+//
+// `zstdmt_compress.c`. C's multithreaded compressor splits the input into
+// fixed-size *jobs* and compresses each one largely independently, with the
+// previous job's tail supplied as a raw-content prefix ("overlap"). The
+// resulting bytes differ from single-threaded output but are **deterministic
+// and independent of the worker count** (job boundaries and per-job prefixes
+// are pure arithmetic, not thread timing — see `ZSTDMT_compressStream_generic`
+// / `ZSTDMT_createCompressionJob`). So we reproduce them by running the jobs
+// *sequentially*: the library stays single-threaded and dependency-free.
+
+/// `ZSTDMT_JOBSIZE_MIN` (`zstdmt_compress.h:33`): inputs at or below this skip
+/// multithreading entirely (`ZSTD_CCtx_init_compressStream2`, zstd_compress.c).
+const ZSTDMT_JOBSIZE_MIN: u64 = 512 * 1024;
+/// `ZSTDMT_JOBSIZE_MAX` on a 64-bit target (`zstdmt_compress.h:36`).
+const ZSTDMT_JOBSIZE_MAX: u64 = 1024 * 1024 * 1024;
+/// `ZSTDMT_JOBLOG_MAX` on a 64-bit target (`zstdmt_compress.h:35`).
+const ZSTDMT_JOBLOG_MAX: u32 = 30;
+
+/// `ZSTDMT_computeOverlapSize` (`zstdmt_compress.c:1226`): how many bytes of the
+/// previous job's tail each job loads as a raw-content prefix
+/// (`mtctx->targetPrefixSize`). The non-LDM branch only (LDM-with-MT is gated
+/// out before this is reached).
+fn mt_overlap_size(cp: &CParams, overlap_log: i32) -> usize {
+    // `ZSTDMT_overlapLog_default` (`:1198`) then `ZSTDMT_overlapLog` (`:1219`).
+    let default_overlap_log = match cp.strategy {
+        Strategy::Btultra2 => 9,
+        Strategy::Btultra | Strategy::Btopt => 8,
+        Strategy::Btlazy2 | Strategy::Lazy2 => 7,
+        _ => 6,
+    };
+    let eff = if overlap_log == 0 {
+        default_overlap_log
+    } else {
+        overlap_log
+    };
+    let overlap_rlog = 9 - eff;
+    let ov_log = if overlap_rlog >= 8 {
+        0
+    } else {
+        cp.window_log as i32 - overlap_rlog
+    };
+    if ov_log <= 0 { 0 } else { 1usize << ov_log }
+}
+
+/// `ZSTDMT_computeTargetJobLog` + the clamps in `ZSTDMT_initCStream_internal`
+/// (`zstdmt_compress.c:1184` / `:1266-1309`): the per-job input size
+/// (`mtctx->targetSectionSize`). Non-LDM branch only.
+fn mt_target_section_size(cp: &CParams, job_size: u64, overlap_size: usize) -> usize {
+    let mut tss = if job_size != 0 {
+        // Explicit `ZSTD_c_jobSize`: clamped to `[MIN, MAX]` (not rounded to a
+        // power of two, unlike the computed path).
+        job_size.clamp(ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX) as usize
+    } else {
+        let target_job_log = (cp.window_log + 2).clamp(20, ZSTDMT_JOBLOG_MAX);
+        1usize << target_job_log
+    };
+    // "job size must be >= overlap size" (`:1309`).
+    if tss < overlap_size {
+        tss = overlap_size;
+    }
+    tss
+}
+
+/// Compress one ZSTDMT job: a fresh frame-compressor (reset entropy + repcodes,
+/// matching C's per-job `ZSTD_compressBegin_advanced_internal`) over the
+/// `prefix ++ segment` buffer. The first job writes the frame header (its real
+/// `pledgedSrcSize` is the whole frame); later jobs emit blocks only (their
+/// would-be header is suppressed). Only the last job writes the epilogue.
+fn compress_mt_job(
+    out: &mut Vec<u8>,
+    cparams: CParams,
+    buf: &[u8],
+    prefix_len: usize,
+    pledged: u64,
+    write_header: bool,
+    is_last: bool,
+) -> Result<(), Error> {
+    let mut fc = FrameCompressor::from_cparams(cparams, Some(pledged), false);
+    if prefix_len > 0 {
+        prime_contiguous_prefix(&mut fc, buf, prefix_len);
+    }
+    if !write_header {
+        // Non-first jobs emit blocks only — C overwrites their frame header.
+        fc.stage = Stage::Ongoing;
+    }
+    let seg_start = prefix_len;
+    let seg_end = buf.len();
+    if is_last {
+        fc.compress_end(out, buf, seg_start, seg_end)
+    } else {
+        fc.compress_continue(out, buf, seg_start, seg_end, false)
+    }
+}
+
+/// `ZSTD_compress2` with `nbWorkers >= 1` (multithreaded / job-splitting mode).
+/// Bit-exact with C libzstd 1.5.7's MT output, reproduced **single-threaded**:
+/// the input is split into `jobSize`-byte jobs, each compressed with the
+/// previous job's overlap tail as a raw-content prefix and reset repcodes, then
+/// the per-job block streams are concatenated into one frame.
+///
+/// Because C's MT output is deterministic and independent of the actual worker
+/// count, `nb_workers` only selects MT-vs-single-threaded: `0` (and any input
+/// at or below `ZSTDMT_JOBSIZE_MIN` = 512 KiB, or any input that fits a single
+/// job) produces exactly the single-threaded [`compress`] frame. `job_size` and
+/// `overlap_log` of `0` mean "use C's defaults".
+///
+/// Current scope: no dictionary and no content checksum. Two rare
+/// configurations return a clean [`Error::Encode`] rather than diverging:
+/// long-distance matching with multithreading (`windowLog >= 27` at btopt+,
+/// only reached by very large inputs), and an explicit `overlap_log` whose
+/// overlap exceeds the indexable dictionary size (`maxDictSize`) — the default
+/// `overlap_log` never does. Streaming, dictionaries, checksums, and cross-job
+/// LDM are later increments.
+pub fn compress_mt(
+    src: &[u8],
+    level: i32,
+    nb_workers: u32,
+    job_size: u64,
+    overlap_log: i32,
+) -> Result<Vec<u8>, Error> {
+    if src.len() as u64 >= u64::from(u32::MAX) - 2 {
+        return Err(Error::Encode("inputs >= 4 GiB are not supported yet"));
+    }
+    let src_len = src.len();
+
+    // `ZSTD_CCtx_init_compressStream2`: multithreading is not invoked when the
+    // source is small (`pledged <= ZSTDMT_JOBSIZE_MIN`), and `nbWorkers == 0` is
+    // plain single-threaded. Both produce the single-threaded frame.
+    if nb_workers == 0 || src_len as u64 <= ZSTDMT_JOBSIZE_MIN {
+        return compress(src, level);
+    }
+
+    // cParams are resolved exactly as single-threaded (nbWorkers is not an
+    // input): the whole-frame `pledgedSrcSize` is the known input size.
+    let cparams = get_cparams(level, src_len as u64, 0);
+
+    // C's MT path seeds/​shares LDM state across jobs via the serial state; that
+    // is not ported, so reject the configs where `ZSTD_resolveEnableLdm` turns
+    // it on (btopt+ with `windowLog >= 27`). Unreachable at typical sizes.
+    if crate::ldm::LdmParams::auto(&cparams).is_some() {
+        return Err(Error::Encode(
+            "long-distance matching with multithreading is not supported yet",
+        ));
+    }
+
+    let overlap_size = mt_overlap_size(&cparams, overlap_log);
+    let section_size = mt_target_section_size(&cparams, job_size, overlap_size);
+
+    // `ZSTD_loadDictionaryContent` only indexes the *suffix* of a prefix larger
+    // than `maxDictSize` (zstd_compress.c:4962); that truncation isn't ported.
+    // With the default `overlapLog` the overlap is always smaller than
+    // `maxDictSize` for every strategy, so this never fires — but an explicit
+    // large `overlapLog` (e.g. 9 at a fast level) can exceed it, so bail cleanly
+    // there rather than diverge.
+    let max_dict_size = 1u64 << ((cparams.hash_log + 3).max(cparams.chain_log + 1)).min(31);
+    if overlap_size as u64 > max_dict_size {
+        return Err(Error::Encode(
+            "multithreaded overlap larger than the indexable dictionary size \
+             is not supported yet",
+        ));
+    }
+
+    // A single job (the whole input fits one section) is byte-identical to
+    // single-threaded — including the `pledged <= 512 KiB` case handled above.
+    if src_len < section_size {
+        return compress(src, level);
+    }
+
+    // Multi-job: split into `section_size` segments; each non-first job sees the
+    // last `overlap_size` bytes of the previous (full) segment as a raw prefix.
     let mut out = Vec::with_capacity(src_len + (src_len >> 8) + 64);
-    fc.compress_end(&mut out, &data, content_len, content_len + src_len)?;
+    let mut seg_start = 0usize;
+    let mut first = true;
+    loop {
+        let seg_end = (seg_start + section_size).min(src_len);
+        let seg_len = seg_end - seg_start;
+        let more_after = seg_end < src_len;
+        // The whole input is available at once (one-shot `e_end`), so the final
+        // segment — full or partial — is itself the last job: C marks it
+        // `endFrame` and writes the epilogue inline. (The separate trailing
+        // empty-block job only arises in *streaming* mode, when an exactly
+        // section-aligned input ends in a later call; that's a later increment.)
+        let is_last = !more_after;
+
+        let prefix_len = if first {
+            0
+        } else {
+            overlap_size.min(seg_start)
+        };
+        let buf = &src[seg_start - prefix_len..seg_end];
+        let pledged = if first {
+            src_len as u64
+        } else {
+            seg_len as u64
+        };
+        compress_mt_job(&mut out, cparams, buf, prefix_len, pledged, first, is_last)?;
+
+        if !more_after {
+            break;
+        }
+        seg_start = seg_end;
+        first = false;
+    }
     Ok(out)
 }
 

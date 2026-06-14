@@ -4630,10 +4630,12 @@ impl MtStreamState {
             // to history positions, so hash-table offsets stay in whole-input space
             // across jobs and front-drops. (LDM and a dictionary are mutually
             // exclusive — `new` gates the combination.)
-            let ext_seqs = if self.ldm_state.is_some() {
+            let ext_seqs = if let Some(ldm) = &mut self.ldm_state {
                 // Drop history older than `maxDist` before this segment: those
                 // bytes can never be matched (`enforceMaxDist` filters offsets
                 // below `idx - maxDist`), so the serial buffer stays bounded.
+                // (`ldm_history`/`ldm_base`/`buf` are disjoint fields from the
+                // borrowed `ldm_state`, so these stay borrow-checker clean.)
                 let max_dist = 1usize << self.cparams.window_log;
                 let keep_from = self.input_pos.saturating_sub(max_dist);
                 if keep_from > self.ldm_base {
@@ -4642,7 +4644,6 @@ impl MtStreamState {
                 }
                 self.ldm_history
                     .extend_from_slice(&self.buf[self.prefix_len..self.prefix_len + job_filled]);
-                let ldm = self.ldm_state.as_mut().expect("ldm present");
                 let seg_bias = (self.ldm_base + WINDOW_START_INDEX) as u32;
                 ldm.window.seg_bias = seg_bias;
                 ldm.window.dict_bias = seg_bias;

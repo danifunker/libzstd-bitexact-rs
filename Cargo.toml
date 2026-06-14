@@ -26,6 +26,12 @@ zstd-sys = { version = "2.0.16", default-features = false, features = [
     "std",
 ] }
 
+# Throughput benchmark (ours vs the C oracle). Custom timer harness, so it
+# pulls in no new dependencies and leaves the pinned Cargo.lock untouched.
+[[bench]]
+name = "throughput"
+harness = false
+
 [profile.dev]
 # The decoder is exercised on megabytes of data in tests; opt-level 1 keeps
 # debug test runs fast without hurting compile times much.

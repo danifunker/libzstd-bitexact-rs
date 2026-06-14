@@ -390,10 +390,27 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
 
 ## M6 — Performance
 
-- [ ] Benchmarks vs. C and vs. other Rust implementations.
+- [x] Benchmark harness (`benches/throughput.rs`, run with `cargo bench`): a
+      dependency-free fixed-budget timer comparing our `compress`/`decompress`
+      against the bundled C oracle (`zstd::bulk`) across levels and three corpora
+      (text / json / random), reporting throughput on the *original* size like
+      `zstd -b`. No Criterion — the custom harness keeps the pinned `Cargo.lock`
+      (CI `--locked`) untouched. Each cell also asserts bit-exactness so the
+      ratio column is trustworthy. Comparison against another *pure-Rust* zstd
+      crate is deferred: it would add a dev-dependency (a deliberate lock bump),
+      and no mature pure-Rust zstd *compressor* exists to compare against anyway.
+
+      Baseline (1 MiB/corpus, single-threaded, dev machine): **decompression of
+      entropy-coded data runs at ~0.28–0.46x of C** — the clearest target, and
+      exactly the hot loops below. **Compression is ~0.37–0.87x of C**, closing
+      toward parity at levels 19–22 where the optimal parser dominates the cost;
+      **raw/random blocks already match C** (memcpy-bound). So the optimization
+      priority is the decompression path.
 - [ ] Optimize hot loops (bit reader containers, 4-at-a-time Huffman
       decode, sequence-execution wildcopies) without breaking the
-      `forbid(unsafe_code)` guarantee.
+      `forbid(unsafe_code)` guarantee. **Decompression first** (~3x gap on real
+      data); compression's gap is widest at the fast levels (match-finder /
+      hashing bound).
 
 ## Versioning note
 

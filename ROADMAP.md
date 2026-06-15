@@ -447,6 +447,19 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
         suite + 48k-mutation fuzz-equivalence + error-parity all green).
         Cumulative decode gain this session (bit-reader + two-pass): **~+30%**
         (entropy-coded data now ~0.39–0.53x of C, from ~0.30x).
+  - **Execution half is `forbid(unsafe_code)`-capped (tried + reverted).** A
+        cursor + pre-zeroed-slack rewrite of sequence execution — C's wildcopy
+        (fixed 8-byte overshoot copies), expressed *safely* by resizing the
+        output (zero-filled) so overshoots land in valid memory, then truncating
+        — was **slower across the board** (text L19 1155→666, L9 649→490 MiB/s).
+        Wildcopy *is* expressible in safe Rust, but the mandatory zero-fill (you
+        cannot write uninitialised capacity without `unsafe` + `set_len`) costs
+        more than the overshoot saves, worst at high levels where long matches
+        are already one fast `extend_from_within` memcpy. So the execution half
+        (~50% of decode) is genuinely safe-Rust-bound; C's edge there needs
+        `set_len` on uninitialised memory. The committed extend-based two-pass is
+        the fastest safe form. Decode at **~0.40–0.59x of C** stands as the
+        practical safe-Rust ceiling (in line with other pure-Rust zstd decoders).
   - [x] **Compression match-extension `count_eq` word-at-a-time** (= `ZSTD_count`).
         Phase-timing `compress_continue` showed match-finding is **62% of the
         fast-level compress (L1), 88% at L6** (entropy is the rest), and within it

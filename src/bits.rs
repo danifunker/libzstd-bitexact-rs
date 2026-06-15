@@ -85,15 +85,19 @@ impl<'a> ForwardBitReader<'a> {
 /// for position and for the `BIT_DStream_overflow` (negative) and
 /// `BIT_endOfDStream` (zero) states, so the observable semantics are
 /// unchanged.
+///
+/// `top` is the count of still-unconsumed bits held in `cache` (the next
+/// `peek(n)` returns `cache` bits `[top - n, top)`), tracked incrementally so
+/// the hot path is a single `top < n` reload test and a shift — no
+/// recomputation of the absolute byte offset. The cache spans bits
+/// `[bits_remaining - top, bits_remaining + (64 - top))` of the stream;
+/// because `top` only ever grows on a reload (capped at 64) and shrinks on
+/// `consume`, the upper bound never needs re-checking.
 pub(crate) struct ReverseBitReader<'a> {
     data: &'a [u8],
     bits_remaining: i64,
-    /// The eight little-endian bytes of `data` at `cache_byte`, i.e. stream
-    /// bits `[8 * cache_byte, 8 * cache_byte + 64)`. Valid only when
-    /// `has_cache`.
     cache: u64,
-    cache_byte: usize,
-    has_cache: bool,
+    top: i64,
 }
 
 impl<'a> ReverseBitReader<'a> {
@@ -107,8 +111,8 @@ impl<'a> ReverseBitReader<'a> {
             data,
             bits_remaining: data.len() as i64 * 8 - padding,
             cache: 0,
-            cache_byte: 0,
-            has_cache: false,
+            // `top == 0 < n` forces the first `peek` to load the cache.
+            top: 0,
         })
     }
 
@@ -135,10 +139,13 @@ impl<'a> ReverseBitReader<'a> {
     #[inline]
     pub(crate) fn peek(&mut self, n: u32) -> u64 {
         debug_assert!(n <= 56);
-        if n == 0 || self.bits_remaining <= 0 {
+        if n == 0 {
             return 0;
         }
         if self.bits_remaining < i64::from(n) {
+            if self.bits_remaining <= 0 {
+                return 0;
+            }
             // Fewer than `n` bits remain: the available bits land in the top
             // positions, the missing low bits read as zero (`BIT_lookBits`
             // past the start of the stream). This only happens on the final
@@ -148,18 +155,17 @@ impl<'a> ReverseBitReader<'a> {
             let avail = self.bits_remaining as u32;
             return self.extract(0, avail) << (n - avail);
         }
-        let hi = self.bits_remaining as usize;
-        let lo = hi - n as usize;
-        if !self.has_cache || lo < 8 * self.cache_byte || hi > 8 * self.cache_byte + 64 {
-            self.reload_cache(hi);
+        if self.top < i64::from(n) {
+            self.reload_cache();
         }
-        let shift = (lo - 8 * self.cache_byte) as u32;
+        let shift = (self.top - i64::from(n)) as u32;
         (self.cache >> shift) & mask64(n)
     }
 
     #[inline]
     pub(crate) fn consume(&mut self, n: u32) {
         self.bits_remaining -= i64::from(n);
+        self.top -= i64::from(n);
     }
 
     #[inline]
@@ -170,17 +176,18 @@ impl<'a> ReverseBitReader<'a> {
     }
 
     /// Reposition the 64-bit cache so it covers the highest still-needed bit
-    /// (`hi - 1`) and extends as far downward as possible, maximising the
-    /// peeks served before the next reload — the port of `BIT_reloadDStream`
-    /// stepping the pointer back. The chosen `cache_byte` is the largest
-    /// byte-aligned start with `8 * cache_byte + 64 >= hi`, which (for
-    /// `n <= 56`) also guarantees `8 * cache_byte <= hi - n`, so every bit of
-    /// the requested `[hi - n, hi)` range lies inside the window.
-    fn reload_cache(&mut self, hi: usize) {
+    /// (`bits_remaining - 1`) and extends as far downward as possible,
+    /// maximising the peeks served before the next reload — the port of
+    /// `BIT_reloadDStream` stepping the pointer back. `byte` is the largest
+    /// byte-aligned start with `8 * byte + 64 >= bits_remaining`, which (for
+    /// `n <= 56`, and only called with `bits_remaining >= n`) guarantees the
+    /// resulting `top = bits_remaining - 8 * byte` is in `[n, 64]`.
+    #[cold]
+    fn reload_cache(&mut self) {
+        let hi = self.bits_remaining as usize;
         let byte = hi.saturating_sub(64).div_ceil(8);
         self.cache = self.load8(byte);
-        self.cache_byte = byte;
-        self.has_cache = true;
+        self.top = (hi - 8 * byte) as i64;
     }
 
     /// Load eight little-endian bytes of `data` at `byte`, zero-padding past

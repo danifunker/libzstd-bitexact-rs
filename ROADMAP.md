@@ -416,17 +416,24 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
         differential suite green); the cache is a pure read accelerator, so the
         `BIT_DStream_overflow` (negative `bits_remaining`) semantics are
         unchanged.
-  - **Profiling finding (the strategic one).** Decompression of entropy-coded
-        data is **~98% sequence decode+execution, ~2% Huffman literal decode**
-        (measured by phase-timing `decode_compressed_block`). The execution cost
-        is dominated by *many small* literal/match copies; C closes this with
-        **wildcopy** — unconditional overlapping 8/16-byte writes *past* the
-        needed length — which `#![forbid(unsafe_code)]` structurally prevents (it
-        needs writing into uninitialised spare capacity + `set_len`). So the
-        decode gap is largely a safe-Rust constraint, not a missing micro-op;
-        large copies (raw/random blocks) already run at C speed. A safe
-        cursor-based rewrite (resize-to-full + `copy_within` + manual overlap)
-        is possible but pays an extra full-buffer memset for uncertain net gain.
+  - **Profiling finding.** Decompression of entropy-coded data is **~98%
+        sequence decode+execution, ~2% Huffman literal decode**; phase-timing the
+        sequence loop further splits it **~50/50 between FSE/bit-reader decode and
+        match/literal execution**. The decode half is pure compute (not
+        wildcopy-bound), so it has real safe-Rust headroom; the execution half is
+        many small copies (raw/random blocks, being large copies, already run at
+        C speed).
+  - [x] Decompression **bit-reader `top` tracking** (`ReverseBitReader`). The
+        container above made `peek` re-read memory only every ~8 bytes, but it
+        still recomputed the absolute byte offset and a compound reload test on
+        every call. Now the count of unconsumed bits in the cache (`top`) is
+        tracked incrementally, so the hot path is a single `top < n` test (the
+        reload is `#[cold]`) plus a shift — much closer to C's `BIT_lookBits` /
+        `BIT_skipBits`. **+15–30% faster decode** (text L1 0.30→0.33x, L3
+        0.30→0.34x, json L9 0.39→0.45x), bit-exact (full release suite + debug
+        decode pass green); `bits_remaining` still carries the
+        `BIT_DStream_overflow`/`endOfDStream` semantics. Feeds both FSE decode
+        and Huffman literals.
   - [x] **Compression match-extension `count_eq` word-at-a-time** (= `ZSTD_count`).
         Phase-timing `compress_continue` showed match-finding is **62% of the
         fast-level compress (L1), 88% at L6** (entropy is the rest), and within it

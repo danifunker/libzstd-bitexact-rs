@@ -145,6 +145,16 @@ Both properties also run deterministically over a generated corpus in
 `tests/fuzz_smoke.rs`, so plain `cargo test` exercises them without a nightly
 toolchain.
 
+## Versioning
+
+The crate version encodes the upstream zstd release it is bit-exact with:
+`0.<zstd digits>.<patch>`. So **`0.157.x` targets zstd 1.5.7**, and the patch
+component (`0.157.0`, `0.157.1`, …) counts this crate's own fixes against that
+target. Retargeting a newer zstd bumps the minor (zstd 1.5.8 → `0.158.0`). The
+leading `0.` marks the public API as still pre-1.0. Bit-exactness is only
+meaningful against a single upstream release, so the targeted version is pinned
+(see `Cargo.lock` and the `zstd-sys` dev-dependency).
+
 ## License
 
 [BSD 3-Clause](LICENSE), matching upstream zstd. This is an independent

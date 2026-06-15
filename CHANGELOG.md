@@ -4,9 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+The version number encodes the targeted upstream zstd release: `0.157.0` is
+bit-exact with zstd **1.5.7**, and the patch component counts this crate's own
+fixes against that target.
+
 ## [Unreleased]
 
-## [0.1.0]
+## [0.157.0]
 
 First release. A pure-Rust, `#![forbid(unsafe_code)]`, zero-runtime-dependency
 Zstandard implementation that is **byte-identical to C libzstd 1.5.7**, enforced
@@ -47,5 +51,5 @@ by differential testing against the real library on every code path.
 - Word-at-a-time match extension (compression) and a register-resident
   bit-reader plus two-pass sequence decoding (decompression).
 
-[Unreleased]: https://github.com/danifunker/libzstd-bitexact-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/danifunker/libzstd-bitexact-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/danifunker/libzstd-bitexact-rs/compare/v0.157.0...HEAD
+[0.157.0]: https://github.com/danifunker/libzstd-bitexact-rs/releases/tag/v0.157.0

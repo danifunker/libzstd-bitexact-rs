@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish (must already exist, e.g. v0.1.0)'
+        description: 'Tag to publish (must already exist, e.g. v0.157.0)'
         required: true
       dry_run:
         description: 'Validate only — do not publish'

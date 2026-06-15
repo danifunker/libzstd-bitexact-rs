@@ -1,6 +1,12 @@
 [package]
 name = "libzstd-bitexact"
-version = "0.1.0"
+# Version scheme: 0.<zstd-version-digits>.<our-patch>. The minor encodes the
+# upstream zstd release this crate is bit-exact with (1.5.7 -> 157); the patch
+# counts our own fixes against that target (0.157.1, 0.157.2, ...). The leading
+# 0 marks the public API as still unstable. Retargeting a new zstd bumps the
+# minor (1.5.8 -> 0.158.0). Keep in sync with the git tag (v0.157.0) and the
+# zstd-sys pin in dev-dependencies.
+version = "0.157.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Pure-Rust reimplementation of Zstandard, aiming for bit-exact parity with the C libzstd"

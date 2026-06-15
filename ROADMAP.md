@@ -434,6 +434,19 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
         decode pass green); `bits_remaining` still carries the
         `BIT_DStream_overflow`/`endOfDStream` semantics. Feeds both FSE decode
         and Huffman literals.
+  - [x] Decompression **two-pass sequence loop** (`decode_and_execute_sequences`).
+        Decode *all* sequences into a small `(lit_len, offset, match_len)` buffer
+        first, then execute them — instead of C's interleaved decode-then-execute
+        per sequence. Splitting the phases keeps the bit reader and the three FSE
+        states resident in registers across the whole decode loop (an interleaved
+        execution's `out` writes spill them every sequence); the lengths are
+        packed to `u32` to shrink the buffer's memory traffic. **+6–18% decode**
+        (text L1 0.33→0.39x, L3 0.34→0.40x, L9 0.46→0.53x). Bit-exact and
+        accept/reject-identical: the FSE decode never reads `out` and execution
+        never touches the bit reader, so the passes are independent (full release
+        suite + 48k-mutation fuzz-equivalence + error-parity all green).
+        Cumulative decode gain this session (bit-reader + two-pass): **~+30%**
+        (entropy-coded data now ~0.39–0.53x of C, from ~0.30x).
   - [x] **Compression match-extension `count_eq` word-at-a-time** (= `ZSTD_count`).
         Phase-timing `compress_continue` showed match-finding is **62% of the
         fast-level compress (L1), 88% at L6** (entropy is the rest), and within it

@@ -482,7 +482,16 @@ fn decode_and_execute_sequences(
     let mut of_state = FseState::new(of_table, &mut br);
     let mut ml_state = FseState::new(ml_table, &mut br);
 
-    let mut lit_pos = 0usize;
+    // Decode all sequences first, then execute them — a deliberate two-pass
+    // split (C interleaves the two). Keeping decode and execution in separate
+    // loops lets the backward bit reader and the three FSE states stay in
+    // registers across the whole decode loop instead of being spilled by the
+    // output-buffer writes of an interleaved execution; it measurably speeds up
+    // decompression. Accept/reject and the emitted bytes are unchanged: the FSE
+    // decode never reads `out` and the execution never touches the bit reader,
+    // so the two passes are independent. (`lit_len`/`match_len` fit a `u32` —
+    // each is bounded by the 128 KiB block size — while `offset` can exceed it.)
+    let mut decoded: Vec<(u32, usize, u32)> = Vec::with_capacity(nb_seq);
     for i in 0..nb_seq {
         let ll_code = ll_state.symbol() as usize;
         let of_code = of_state.symbol() as u32;
@@ -505,7 +514,11 @@ fn decode_and_execute_sequences(
         if br.bits_remaining() < 0 {
             return Err(Error::Corrupted("sequence bitstream overdrawn"));
         }
+        decoded.push((lit_len as u32, offset as usize, match_len as u32));
+    }
 
+    let mut lit_pos = 0usize;
+    for (lit_len, offset, match_len) in decoded {
         let lit_len = lit_len as usize;
         if lit_len > literals.len() - lit_pos {
             return Err(Error::Corrupted(
@@ -518,16 +531,10 @@ fn decode_and_execute_sequences(
         // Available history is the frame output so far plus the dictionary
         // window that precedes it (`oLitEnd - virtualStart` in the C decoder).
         let history = (out.len() - frame_base) as u64 + dict_content.len() as u64;
-        if offset > history {
+        if offset as u64 > history {
             return Err(Error::Corrupted("match offset beyond frame history"));
         }
-        copy_match(
-            out,
-            frame_base,
-            dict_content,
-            offset as usize,
-            match_len as usize,
-        );
+        copy_match(out, frame_base, dict_content, offset, match_len as usize);
 
         if out.len() - block_start > block_size_max {
             return Err(Error::Corrupted("block output exceeds block size limit"));

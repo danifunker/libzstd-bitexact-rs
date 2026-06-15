@@ -1,0 +1,101 @@
+name: Publish to crates.io
+
+# Mirrors the sibling libchdman-rs publish pipeline, minus the prebuilt-asset
+# machinery: this crate is pure Rust with no build.rs, so there is no prebuilt
+# GitHub Release to confirm and the normal `cargo publish` verification build
+# runs (it is dependency-free and fast).
+#
+# Flow: tag the release (vX.Y.Z, matching Cargo.toml), then dispatch this
+# workflow with that tag (dry_run first, then for real). Requires the
+# CARGO_REGISTRY_TOKEN repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (must already exist, e.g. v0.1.0)'
+        required: true
+      dry_run:
+        description: 'Validate only — do not publish'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight (version matches tag, slim tarball)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Cargo.toml version matches tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          tag_no_v="${tag#v}"
+          crate_version=$(grep -E '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag_no_v" != "$crate_version" ]; then
+            echo "::error::Tag $tag (=$tag_no_v) does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+          echo "Tag and version agree: $tag_no_v"
+
+      - name: Verify slim tarball contents
+        run: |
+          set -euo pipefail
+          cargo package --locked --list > /tmp/package-files.txt
+          echo "--- Files in tarball ---"
+          cat /tmp/package-files.txt
+          # Internal/dev files must never ship (enforced by [package.exclude]).
+          if grep -E '^(CLAUDE\.md|\.github/|fuzz/|target/)' /tmp/package-files.txt; then
+            echo "::error::Internal files leaked into the package — check [package.exclude] in Cargo.toml."
+            exit 1
+          fi
+          # Pure-Rust source crate: produce the tarball and cap its size, so a
+          # stray large file (vendored data, target/, …) fails the release.
+          cargo package --no-verify --locked
+          size=$(stat -c%s target/package/libzstd-bitexact-*.crate)
+          echo "Tarball size: $size bytes"
+          if [ "$size" -gt 2097152 ]; then
+            echo "::error::Tarball exceeds 2 MB cap."
+            exit 1
+          fi
+
+      - name: Upload tarball as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: crate-tarball
+          path: target/package/libzstd-bitexact-*.crate
+
+  publish:
+    name: cargo publish
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # The verification build runs (no prebuilt-download path to dodge);
+          # --locked keeps the pinned oracle graph that bit-exactness depends on.
+          if [ "$DRY_RUN" = "true" ]; then
+            cargo publish --dry-run --locked
+          else
+            cargo publish --locked
+          fi

@@ -12,7 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-libzstd-bitexact = { path = ".." }
+libzstd-bitexact-rs = { path = ".." }
 # The C libzstd, used as the differential oracle in the equivalence target.
 zstd = "0.13"
 

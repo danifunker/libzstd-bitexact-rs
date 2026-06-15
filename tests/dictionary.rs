@@ -3,7 +3,7 @@
 //! compresses with a dictionary, we must decompress to identical bytes, and
 //! our accept/reject decisions for oversized windows must match its own.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, Error};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, Error};
 use std::io::Write;
 use zstd::zstd_safe::CParameter;
 

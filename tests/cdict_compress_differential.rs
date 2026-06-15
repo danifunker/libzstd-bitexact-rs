@@ -13,7 +13,7 @@
 //! ≤ 14, the row finder above it), btlazy2's binary tree, and the optimal
 //! parser — plus a round-trip through our own decoder.
 
-use libzstd_bitexact::{
+use libzstd_bitexact_rs::{
     DecodeOptions, Dictionary, compress_with_cdict, cparams_create_cdict_for_testing,
 };
 

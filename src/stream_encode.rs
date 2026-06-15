@@ -54,11 +54,11 @@ enum EndOp {
 ///
 /// ```
 /// let mut out = Vec::new();
-/// let mut enc = libzstd_bitexact::StreamEncoder::new(3);
+/// let mut enc = libzstd_bitexact_rs::StreamEncoder::new(3);
 /// enc.compress(b"hello ", &mut out).unwrap();
 /// enc.compress(b"world", &mut out).unwrap();
 /// enc.finish(b"", &mut out).unwrap();
-/// assert_eq!(libzstd_bitexact::decompress(&out).unwrap(), b"hello world");
+/// assert_eq!(libzstd_bitexact_rs::decompress(&out).unwrap(), b"hello world");
 /// ```
 pub struct StreamEncoder {
     level: i32,

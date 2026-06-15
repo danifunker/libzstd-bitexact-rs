@@ -18,11 +18,11 @@
 //!   the wrap, and this matrix exercises it via the `src == 0` rows.
 //!
 //! The oracle is raw FFI (`unsafe`), so this lives in `tests/`: the library is
-//! `#![forbid(unsafe_code)]`. `libzstd_bitexact::cparams_for_testing` is the
+//! `#![forbid(unsafe_code)]`. `libzstd_bitexact_rs::cparams_for_testing` is the
 //! doc-hidden hook surfacing our derivation as plain integers (integration tests
 //! cannot see the `pub(crate)` `get_cparams` / `CParams` / `Strategy`).
 
-use libzstd_bitexact::cparams_for_testing;
+use libzstd_bitexact_rs::cparams_for_testing;
 
 /// `ZSTD_CONTENTSIZE_UNKNOWN` — what `ZSTD_getCParams` substitutes for a 0 hint.
 const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;

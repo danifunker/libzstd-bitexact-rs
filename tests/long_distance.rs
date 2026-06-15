@@ -5,7 +5,7 @@
 //! through both the one-shot and streaming decoders, and that a window log
 //! above 27 (128 MiB) is accepted.
 
-use libzstd_bitexact::{DecodeOptions, StreamDecoder};
+use libzstd_bitexact_rs::{DecodeOptions, StreamDecoder};
 use std::io::{Read, Write};
 use zstd::zstd_safe::CParameter;
 
@@ -79,7 +79,7 @@ fn long_distance_matches_decode_correctly() {
     // Window logs that do and do not span the 4 MiB repeat distance.
     for window_log in [21u32, 23, 24] {
         let frame = compress_ldm(&data, window_log, 19);
-        let one_shot = libzstd_bitexact::decompress(&frame)
+        let one_shot = libzstd_bitexact_rs::decompress(&frame)
             .unwrap_or_else(|e| panic!("one-shot LDM wlog {window_log}: {e}"));
         assert_eq!(one_shot, data, "one-shot LDM wlog {window_log}");
         assert_eq!(
@@ -104,7 +104,7 @@ fn windows_beyond_128_mib_are_accepted() {
         if actual > 27 {
             saw_large = true;
         }
-        let one_shot = libzstd_bitexact::decompress(&frame)
+        let one_shot = libzstd_bitexact_rs::decompress(&frame)
             .unwrap_or_else(|e| panic!("one-shot wlog {window_log} (actual {actual}): {e}"));
         assert_eq!(one_shot, data, "one-shot large window {actual}");
         assert_eq!(

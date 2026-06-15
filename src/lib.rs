@@ -22,7 +22,7 @@
 //! // A tiny handcrafted frame: single-segment, content size 5, one RLE
 //! // block repeating `a` five times.
 //! let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x2B, 0x00, 0x00, b'a'];
-//! assert_eq!(libzstd_bitexact::decompress(&frame).unwrap(), b"aaaaa");
+//! assert_eq!(libzstd_bitexact_rs::decompress(&frame).unwrap(), b"aaaaa");
 //! ```
 
 #![forbid(unsafe_code)]

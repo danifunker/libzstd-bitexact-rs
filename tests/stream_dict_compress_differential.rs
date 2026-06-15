@@ -10,7 +10,7 @@
 //! window (where C drops the attached dict) returns a clean error — covered by
 //! `large_dict_stream_errors_cleanly`.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, StreamEncoder};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, StreamEncoder};
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
 
 /// xorshift64* — deterministic, dependency-free test data generator.

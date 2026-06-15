@@ -8,13 +8,13 @@
 //! * *targeted* cases that pin each `ZSTD_ErrorCode` class to the specific
 //!   [`Error`] variant we report, documenting the mapping.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, Error};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, Error};
 use std::io::Write;
 
 const CAP: usize = 64 << 20;
 
 fn our_decode(frame: &[u8]) -> Result<Vec<u8>, Error> {
-    libzstd_bitexact::decompress_with_limit(frame, CAP)
+    libzstd_bitexact_rs::decompress_with_limit(frame, CAP)
 }
 
 fn c_decode(frame: &[u8]) -> Result<Vec<u8>, String> {

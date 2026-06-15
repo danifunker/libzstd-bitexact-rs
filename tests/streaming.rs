@@ -2,7 +2,7 @@
 //! whatever it compresses, `StreamDecoder` must reproduce byte-for-byte, and
 //! the result must not depend on how the compressed input is chunked.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, StreamDecoder};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, StreamDecoder};
 use std::io::{self, Read, Write};
 use zstd::zstd_safe::CParameter;
 

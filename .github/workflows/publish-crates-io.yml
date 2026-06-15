@@ -62,7 +62,7 @@ jobs:
           # Pure-Rust source crate: produce the tarball and cap its size, so a
           # stray large file (vendored data, target/, …) fails the release.
           cargo package --no-verify --locked
-          size=$(stat -c%s target/package/libzstd-bitexact-*.crate)
+          size=$(stat -c%s target/package/libzstd-bitexact-rs-*.crate)
           echo "Tarball size: $size bytes"
           if [ "$size" -gt 2097152 ]; then
             echo "::error::Tarball exceeds 2 MB cap."
@@ -73,7 +73,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: crate-tarball
-          path: target/package/libzstd-bitexact-*.crate
+          path: target/package/libzstd-bitexact-rs-*.crate
 
   publish:
     name: cargo publish

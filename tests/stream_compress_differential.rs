@@ -12,7 +12,7 @@
 //! content size) is bit-exact, covered by `ldm_streams_are_bit_exact` and
 //! `ldm_one_shot_above_64mib_is_bit_exact`.
 
-use libzstd_bitexact::StreamEncoder;
+use libzstd_bitexact_rs::StreamEncoder;
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
 
 /// xorshift64* — deterministic test data generator.
@@ -174,7 +174,7 @@ fn our_stream(
     checksum: bool,
     steps: &[Step],
     finish_input: &[u8],
-) -> Result<Vec<u8>, libzstd_bitexact::Error> {
+) -> Result<Vec<u8>, libzstd_bitexact_rs::Error> {
     let mut enc = match pledged {
         Some(n) => StreamEncoder::with_pledged_src_size(level, n),
         None => StreamEncoder::new(level),
@@ -227,7 +227,7 @@ fn assert_stream_bit_exact(
         }
     }
     full.extend_from_slice(finish_input);
-    let back = libzstd_bitexact::decompress(&ours).expect("our frame must decode");
+    let back = libzstd_bitexact_rs::decompress(&ours).expect("our frame must decode");
     assert_eq!(back, full, "{label}: round-trip mismatch");
 }
 
@@ -244,7 +244,7 @@ fn empty_streams_are_bit_exact() {
         // First call is `end`: auto-pledge of 0 — single-segment empty frame,
         // identical to the one-shot.
         assert_stream_bit_exact(level, None, false, &[], b"", "finish-only-empty");
-        let one_shot = libzstd_bitexact::compress(b"", level).unwrap();
+        let one_shot = libzstd_bitexact_rs::compress(b"", level).unwrap();
         assert_eq!(
             our_stream(level, None, false, &[], b"").unwrap(),
             one_shot,
@@ -288,7 +288,7 @@ fn first_call_finish_equals_one_shot() {
         for level in [1, 3, 9, 13, 19, 22] {
             assert_stream_bit_exact(level, None, false, &[], &data, "first-call-finish");
             let ours = our_stream(level, None, false, &[], &data).unwrap();
-            let one_shot = libzstd_bitexact::compress(&data, level).unwrap();
+            let one_shot = libzstd_bitexact_rs::compress(&data, level).unwrap();
             assert_eq!(ours, one_shot, "auto-pledged finish must equal one-shot");
         }
     }
@@ -435,7 +435,7 @@ fn pledged_size_streams_are_bit_exact() {
             "pledged-chunked",
         );
         let ours = our_stream(level, Some(100_000), false, &chunked(&data, 30_000), b"").unwrap();
-        let one_shot = libzstd_bitexact::compress(&data, level).unwrap();
+        let one_shot = libzstd_bitexact_rs::compress(&data, level).unwrap();
         assert_eq!(ours, one_shot, "pledged stream must equal one-shot");
     }
 
@@ -1088,7 +1088,7 @@ fn ldm_streams_are_bit_exact() {
 #[ignore = "compresses 64 MiB+ at level 22 to exercise the one-shot LDM cliff; minutes-long"]
 fn ldm_one_shot_above_64mib_is_bit_exact() {
     let data = word_salad(0x1D40, (64 << 20) + 1);
-    let ours = libzstd_bitexact::compress(&data, 22).expect("LDM one-shot must succeed");
+    let ours = libzstd_bitexact_rs::compress(&data, 22).expect("LDM one-shot must succeed");
     let theirs = zstd::bulk::compress(&data, 22).expect("C one-shot oracle");
     assert_eq!(
         ours.len(),
@@ -1099,7 +1099,7 @@ fn ldm_one_shot_above_64mib_is_bit_exact() {
         ours == theirs,
         "one-shot > 64 MiB at level 22 (LDM): not bit-exact"
     );
-    let back = libzstd_bitexact::decompress(&ours).expect("round-trip");
+    let back = libzstd_bitexact_rs::decompress(&ours).expect("round-trip");
     assert_eq!(back, data, "round-trip mismatch");
 }
 

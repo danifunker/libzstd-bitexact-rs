@@ -35,7 +35,7 @@ fn main() {
             let compressed =
                 zstd::bulk::compress(&data, level).expect("C libzstd failed to compress");
             let decompressed =
-                libzstd_bitexact::decompress(&compressed).expect("our decoder failed");
+                libzstd_bitexact_rs::decompress(&compressed).expect("our decoder failed");
             assert_eq!(decompressed, data, "round-trip mismatch!");
             println!(
                 "  level {level:>2}: {:>7} bytes compressed by C zstd -> decompressed by us: {} bytes, identical ✓",
@@ -49,7 +49,7 @@ fn main() {
         encoder.include_checksum(true).unwrap();
         encoder.write_all(&data).unwrap();
         let compressed = encoder.finish().unwrap();
-        let decompressed = libzstd_bitexact::decompress(&compressed).expect("checksum frame");
+        let decompressed = libzstd_bitexact_rs::decompress(&compressed).expect("checksum frame");
         assert_eq!(decompressed, data);
         println!("  checksummed frame: XXH64 verified ✓");
     }

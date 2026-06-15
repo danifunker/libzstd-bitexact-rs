@@ -63,14 +63,14 @@ cannot express without a compensating zeroing pass. Compressed and decompressed
 ## Usage
 
 ```rust
-let data = libzstd_bitexact::decompress(&compressed_bytes)?;
+let data = libzstd_bitexact_rs::decompress(&compressed_bytes)?;
 
 // On untrusted input, cap the output size to defuse decompression bombs:
-let data = libzstd_bitexact::decompress_with_limit(&compressed_bytes, 64 << 20)?;
+let data = libzstd_bitexact_rs::decompress_with_limit(&compressed_bytes, 64 << 20)?;
 
 // Dictionaries, output limits, and a maximum window log compose through the
 // DecodeOptions builder:
-use libzstd_bitexact::{DecodeOptions, Dictionary};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary};
 let dict = Dictionary::new(&dictionary_bytes)?;
 let data = DecodeOptions::new()
     .dictionary(&dict)
@@ -81,19 +81,19 @@ let data = DecodeOptions::new()
 // Streaming: wrap any Read source; memory stays bounded by the frame's
 // window rather than its content.
 use std::io::Read;
-use libzstd_bitexact::StreamDecoder;
+use libzstd_bitexact_rs::StreamDecoder;
 let mut out = Vec::new();
 StreamDecoder::new(compressed_reader).read_to_end(&mut out)?;
 
 // Compression: byte-identical to ZSTD_compress at every level (1-22,
 // and negative levels for faster-than-1 modes).
-let frame = libzstd_bitexact::compress(&data, 19)?;
+let frame = libzstd_bitexact_rs::compress(&data, 19)?;
 
 // Streaming compression: byte-identical to ZSTD_compressStream2 for the
 // same sequence of operations (continue/flush/end, pledged sizes,
 // checksums). Note that without a pledged size, parameters resolve as
 // "content size unknown", exactly as in C.
-let mut enc = libzstd_bitexact::StreamEncoder::new(3);
+let mut enc = libzstd_bitexact_rs::StreamEncoder::new(3);
 let mut frame = Vec::new();
 enc.compress(&data, &mut frame)?;
 enc.flush(&mut frame)?;

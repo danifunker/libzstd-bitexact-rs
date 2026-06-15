@@ -8,7 +8,7 @@
 //! later call — both schedule-dependent behaviors this exercises. The oracle is
 //! the bundled C library built with the `zstdmt` feature.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, StreamEncoder};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, StreamEncoder};
 use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer};
 
 struct Rng(u64);

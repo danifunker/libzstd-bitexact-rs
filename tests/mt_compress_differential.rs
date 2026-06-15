@@ -1,4 +1,4 @@
-//! Differential tests for [`libzstd_bitexact::compress_mt`] against C libzstd's
+//! Differential tests for [`libzstd_bitexact_rs::compress_mt`] against C libzstd's
 //! multithreaded compressor (`ZSTD_compress2` with `nbWorkers >= 1`).
 //!
 //! The oracle is the bundled C library built with the `zstdmt` feature; its MT
@@ -7,7 +7,7 @@
 //! span the single-job/​multi-job boundary, exact-multiple (trailing empty
 //! block) sizes, explicit `jobSize`/​`overlapLog` overrides, and every strategy.
 
-use libzstd_bitexact::{DecodeOptions, Dictionary, compress_mt, compress_mt_with_dict};
+use libzstd_bitexact_rs::{DecodeOptions, Dictionary, compress_mt, compress_mt_with_dict};
 use zstd::zstd_safe::{self, CCtx, CParameter};
 
 struct Rng(u64);
@@ -159,7 +159,7 @@ fn mt_single_job_equals_single_threaded() {
             // <=512 KiB -> MT disabled; 700 KiB with default jobSize -> one job.
             let src = word_salad(0xABCD ^ (len as u64), len);
             let mt = compress_mt(&src, level, 4, 0, 0, false).unwrap();
-            let st = libzstd_bitexact::compress(&src, level).unwrap();
+            let st = libzstd_bitexact_rs::compress(&src, level).unwrap();
             assert_eq!(
                 mt, st,
                 "single-job != single-threaded: level={level} len={len}"

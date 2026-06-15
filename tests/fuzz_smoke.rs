@@ -4,7 +4,7 @@
 //! targets: it must never panic on arbitrary input, and whenever we accept an
 //! input the C oracle must accept it and agree byte-for-byte.
 
-use libzstd_bitexact::{DecodeOptions, StreamDecoder};
+use libzstd_bitexact_rs::{DecodeOptions, StreamDecoder};
 use std::io::Read;
 
 const LIMIT: usize = 16 << 20;

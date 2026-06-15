@@ -59,7 +59,7 @@ fn word_salad(seed: u64, len: usize) -> Vec<u8> {
 fn assert_bit_exact(data: &[u8], level: i32, label: &str) {
     let theirs = zstd::bulk::compress(data, level)
         .unwrap_or_else(|e| panic!("oracle failed on {label} at level {level}: {e}"));
-    let ours = libzstd_bitexact::compress(data, level)
+    let ours = libzstd_bitexact_rs::compress(data, level)
         .unwrap_or_else(|e| panic!("we failed on {label} at level {level}: {e}"));
     if ours != theirs {
         // Find the first divergence for a useful failure message.
@@ -77,7 +77,7 @@ fn assert_bit_exact(data: &[u8], level: i32, label: &str) {
             &theirs[at..(at + 8).min(theirs.len())],
         );
     }
-    let back = libzstd_bitexact::decompress(&ours).expect("our frame must decode");
+    let back = libzstd_bitexact_rs::decompress(&ours).expect("our frame must decode");
     assert_eq!(back, data, "{label}: round-trip mismatch");
 }
 

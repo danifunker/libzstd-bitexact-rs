@@ -1,5 +1,5 @@
 [package]
-name = "libzstd-bitexact"
+name = "libzstd-bitexact-rs"
 # Version scheme: 0.<zstd-version-digits>.<our-patch>. The minor encodes the
 # upstream zstd release this crate is bit-exact with (1.5.7 -> 157); the patch
 # counts our own fixes against that target (0.157.1, 0.157.2, ...). The leading
@@ -15,7 +15,7 @@ repository = "https://github.com/danifunker/libzstd-bitexact-rs"
 keywords = ["zstd", "zstandard", "compression", "decompression"]
 categories = ["compression"]
 readme = "README.md"
-documentation = "https://docs.rs/libzstd-bitexact"
+documentation = "https://docs.rs/libzstd-bitexact-rs"
 # Keep the published package to the library and its proof: ship src, tests,
 # benches, examples, README/ROADMAP/LICENSE. Drop the AI dev guide and the CI
 # config (fuzz/ is a separate package cargo already excludes).

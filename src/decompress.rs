@@ -25,7 +25,7 @@ pub const WINDOW_LOG_MAX: u32 = 31;
 /// log, and an optional dictionary.
 ///
 /// ```
-/// use libzstd_bitexact::DecodeOptions;
+/// use libzstd_bitexact_rs::DecodeOptions;
 /// let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x2B, 0x00, 0x00, b'a'];
 /// let out = DecodeOptions::new().limit(1 << 20).decompress(&frame).unwrap();
 /// assert_eq!(out, b"aaaaa");

@@ -125,7 +125,7 @@ fn c_bulk_compress_rust_decompress() {
         for level in LEVELS {
             let compressed = zstd::bulk::compress(&data, level)
                 .unwrap_or_else(|e| panic!("oracle failed compressing {name} at {level}: {e}"));
-            let decompressed = libzstd_bitexact::decompress(&compressed)
+            let decompressed = libzstd_bitexact_rs::decompress(&compressed)
                 .unwrap_or_else(|e| panic!("failed to decompress {name} at level {level}: {e}"));
             assert_eq!(decompressed, data, "mismatch on {name} at level {level}");
         }
@@ -140,7 +140,7 @@ fn c_streaming_compress_rust_decompress() {
     for (name, data) in datasets() {
         for level in [1, 3, 9, 19] {
             let compressed = zstd::stream::encode_all(&data[..], level).unwrap();
-            let decompressed = libzstd_bitexact::decompress(&compressed)
+            let decompressed = libzstd_bitexact_rs::decompress(&compressed)
                 .unwrap_or_else(|e| panic!("failed on streaming {name} at {level}: {e}"));
             assert_eq!(
                 decompressed, data,
@@ -157,7 +157,7 @@ fn checksummed_frames_verify() {
         encoder.include_checksum(true).unwrap();
         encoder.write_all(&data).unwrap();
         let compressed = encoder.finish().unwrap();
-        let decompressed = libzstd_bitexact::decompress(&compressed)
+        let decompressed = libzstd_bitexact_rs::decompress(&compressed)
             .unwrap_or_else(|e| panic!("failed on checksummed {name}: {e}"));
         assert_eq!(decompressed, data, "mismatch on checksummed {name}");
     }
@@ -174,8 +174,8 @@ fn corrupted_checksum_is_rejected() {
     let last = compressed.len() - 1;
     compressed[last] ^= 0xFF;
     assert!(matches!(
-        libzstd_bitexact::decompress(&compressed),
-        Err(libzstd_bitexact::Error::ChecksumMismatch { .. })
+        libzstd_bitexact_rs::decompress(&compressed),
+        Err(libzstd_bitexact_rs::Error::ChecksumMismatch { .. })
     ));
 }
 
@@ -190,7 +190,7 @@ fn multi_frame_and_skippable_concatenation() {
     stream.extend_from_slice(b"skip!");
     stream.extend_from_slice(&zstd::bulk::compress(&b, 19).unwrap());
 
-    let decompressed = libzstd_bitexact::decompress(&stream).unwrap();
+    let decompressed = libzstd_bitexact_rs::decompress(&stream).unwrap();
     let expected: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
     assert_eq!(decompressed, expected);
 }
@@ -200,7 +200,7 @@ fn every_truncation_errors_and_never_panics() {
     let data = b"truncation test corpus ".repeat(2000);
     let compressed = zstd::bulk::compress(&data, 3).unwrap();
     for len in 1..compressed.len() {
-        let r = libzstd_bitexact::decompress(&compressed[..len]);
+        let r = libzstd_bitexact_rs::decompress(&compressed[..len]);
         assert!(
             r.is_err(),
             "truncation to {len} bytes unexpectedly succeeded"
@@ -223,7 +223,7 @@ fn random_corruptions_never_panic() {
         // Must terminate without panicking; both Ok and Err are acceptable
         // (a flipped bit can land in an unused or self-correcting spot, and
         // this frame carries no checksum).
-        let _ = libzstd_bitexact::decompress_with_limit(&copy, 16 << 20);
+        let _ = libzstd_bitexact_rs::decompress_with_limit(&copy, 16 << 20);
     }
 }
 
@@ -232,11 +232,11 @@ fn output_limit_is_enforced() {
     let data = vec![7u8; 1 << 20];
     let compressed = zstd::bulk::compress(&data, 3).unwrap();
     assert!(matches!(
-        libzstd_bitexact::decompress_with_limit(&compressed, 1000),
-        Err(libzstd_bitexact::Error::OutputTooLarge)
+        libzstd_bitexact_rs::decompress_with_limit(&compressed, 1000),
+        Err(libzstd_bitexact_rs::Error::OutputTooLarge)
     ));
     assert_eq!(
-        libzstd_bitexact::decompress_with_limit(&compressed, 1 << 20).unwrap(),
+        libzstd_bitexact_rs::decompress_with_limit(&compressed, 1 << 20).unwrap(),
         data
     );
 }
@@ -253,7 +253,7 @@ fn no_false_accepts_on_random_input() {
             *b = (rng.next_u64() & 0xFF) as u8;
         }
         soup[..4].copy_from_slice(&magic);
-        if let Ok(ours) = libzstd_bitexact::decompress_with_limit(&soup, 1 << 20) {
+        if let Ok(ours) = libzstd_bitexact_rs::decompress_with_limit(&soup, 1 << 20) {
             let theirs = zstd::bulk::decompress(&soup, 1 << 20)
                 .unwrap_or_else(|e| panic!("we accepted {soup:02X?} but C rejects it: {e}"));
             assert_eq!(ours, theirs, "divergent decode of {soup:02X?}");

@@ -18,8 +18,8 @@
 //! against another pure-Rust zstd crate would add a dev-dependency — a
 //! deliberate lock bump — and is left as a follow-up.
 //!
-//! [`compress`]: libzstd_bitexact::compress
-//! [`decompress`]: libzstd_bitexact::decompress
+//! [`compress`]: libzstd_bitexact_rs::compress
+//! [`decompress`]: libzstd_bitexact_rs::decompress
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -218,7 +218,7 @@ fn main() {
     ];
 
     println!();
-    println!("libzstd-bitexact throughput — ours vs C libzstd 1.5.7 (both single-threaded)");
+    println!("libzstd-bitexact-rs throughput — ours vs C libzstd 1.5.7 (both single-threaded)");
     println!(
         "input {} KiB/corpus · budget {} ms/cell · speeds on original size · ours/C < 1.0 = slower",
         size / 1024,
@@ -231,12 +231,12 @@ fn main() {
         let data = data.as_slice();
         for &level in &levels {
             let theirs = zstd::bulk::compress(data, level).expect("oracle compress");
-            let ours = libzstd_bitexact::compress(data, level).expect("our compress");
+            let ours = libzstd_bitexact_rs::compress(data, level).expect("our compress");
             assert_eq!(ours, theirs, "{name} L{level}: compression not bit-exact");
             let ratio = data.len() as f64 / theirs.len() as f64;
 
             let s_ours = seconds_per_op(budget, || {
-                black_box(libzstd_bitexact::compress(black_box(data), level).unwrap());
+                black_box(libzstd_bitexact_rs::compress(black_box(data), level).unwrap());
             });
             let s_c = seconds_per_op(budget, || {
                 black_box(zstd::bulk::compress(black_box(data), level).unwrap());
@@ -259,7 +259,7 @@ fn main() {
             let frame = zstd::bulk::compress(data, level).expect("oracle compress");
             let frame = frame.as_slice();
             let cap = data.len();
-            let back = libzstd_bitexact::decompress(frame).expect("our decompress");
+            let back = libzstd_bitexact_rs::decompress(frame).expect("our decompress");
             assert_eq!(
                 back.len(),
                 data.len(),
@@ -267,7 +267,7 @@ fn main() {
             );
 
             let s_ours = seconds_per_op(budget, || {
-                black_box(libzstd_bitexact::decompress(black_box(frame)).unwrap());
+                black_box(libzstd_bitexact_rs::decompress(black_box(frame)).unwrap());
             });
             let s_c = seconds_per_op(budget, || {
                 black_box(zstd::bulk::decompress(black_box(frame), cap).unwrap());

@@ -67,7 +67,7 @@ enum Phase {
 ///
 /// ```no_run
 /// use std::io::Read;
-/// use libzstd_bitexact::StreamDecoder;
+/// use libzstd_bitexact_rs::StreamDecoder;
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let file = std::fs::File::open("data.zst")?;

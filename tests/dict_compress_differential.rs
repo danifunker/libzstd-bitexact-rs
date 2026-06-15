@@ -12,7 +12,7 @@
 //!   * any other strategy -> `compress_with_dict` must reject cleanly (the
 //!     current gate), with no divergent output.
 
-use libzstd_bitexact::{
+use libzstd_bitexact_rs::{
     DecodeOptions, Dictionary, compress, compress_with_dict, cparams_for_testing,
 };
 

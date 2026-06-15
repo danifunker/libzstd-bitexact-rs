@@ -1,7 +1,7 @@
 //! Handcrafted format vectors: byte-level frames built by hand from
 //! RFC 8878, exercising paths and error cases independently of the oracle.
 
-use libzstd_bitexact::{Error, decompress, decompress_with_limit};
+use libzstd_bitexact_rs::{Error, decompress, decompress_with_limit};
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 

@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use libzstd_bitexact::{DecodeOptions, StreamDecoder};
+use libzstd_bitexact_rs::{DecodeOptions, StreamDecoder};
 use std::io::Read;
 
 const LIMIT: usize = 64 << 20;

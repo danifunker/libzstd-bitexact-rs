@@ -8,6 +8,12 @@ license = "BSD-3-Clause"
 repository = "https://github.com/danifunker/libzstd-bitexact-rs"
 keywords = ["zstd", "zstandard", "compression", "decompression"]
 categories = ["compression"]
+readme = "README.md"
+documentation = "https://docs.rs/libzstd-bitexact"
+# Keep the published package to the library and its proof: ship src, tests,
+# benches, examples, README/ROADMAP/LICENSE. Drop the AI dev guide and the CI
+# config (fuzz/ is a separate package cargo already excludes).
+exclude = ["/.github", "/CLAUDE.md"]
 
 [dependencies]
 # Intentionally empty: the implementation is dependency-free.

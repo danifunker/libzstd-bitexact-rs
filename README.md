@@ -24,7 +24,9 @@ differential-testing every code path against the real libzstd, not by review.
 | Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
 | **Compression, bit-exact with C — every level (1–22 and negatives)** | ✅ byte-identical, differential-tested |
 | Streaming compression (`ZSTD_compressStream2` flush/end parity) | ✅ byte-identical; unlimited length at every level¹ |
-| Dictionary compression, multithreaded mode | ⬜ planned — see [ROADMAP.md](ROADMAP.md) |
+| Dictionary compression (raw + trained/ZDICT, all 9 strategies, `usingDict` + `CDict` paths) | ✅ byte-identical |
+| Multithreaded mode (`ZSTDMT` job-splitting: one-shot + streaming, with dictionary and LDM) | ✅ byte-identical² |
+| Long-distance matching (LDM) compression | ✅ byte-identical |
 
 ¹ Streams longer than `windowSize + blockSize` turn the C window into an
 *extDict*; the extDict match finders are ported for all nine strategies, and
@@ -34,6 +36,29 @@ where C auto-enables long-distance matching (`strategy >= btopt && windowLog
 >= 27` — level 22 at unknown or > 64 MiB content sizes): LDM is ported and
 bit-exact, including a faithful reproduction of zstd 1.5.7's no-op
 `ZSTD_ldm_gear_reset`.
+
+² C's multithreaded output is deterministic and worker-count-independent — only
+the job decomposition matters — so this crate reproduces it **single-threaded**,
+keeping the library zero-dependency. One-shot and streaming, content checksums,
+flush and pledged sizes, dictionaries, and cross-job long-distance matching are
+all byte-identical to the C `zstdmt` oracle.
+
+## Performance
+
+Correctness is the headline; speed is being worked level by level (`cargo bench`
+runs a throughput comparison against the bundled C oracle, reporting MiB/s like
+`zstd -b`). Single-threaded on a typical x86-64 desktop, both directions are
+within ~2–2.5x of C libzstd while remaining `#![forbid(unsafe_code)]`:
+
+- **Compression** ≈ 0.4–0.6x of C at the fast levels, closing to ~parity (≈1.0x)
+  at the highest levels, where the optimal parser dominates the cost.
+- **Decompression** ≈ 0.4–0.6x of C on entropy-coded data; at C speed on
+  incompressible input and large copies.
+
+The residual decompression gap is structural: C's hot loop relies on *wildcopy*
+— writing past the end of each match into uninitialized output — which safe Rust
+cannot express without a compensating zeroing pass. Compressed and decompressed
+*bytes* are, of course, identical to C regardless of speed.
 
 ## Usage
 

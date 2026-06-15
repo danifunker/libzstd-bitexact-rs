@@ -427,10 +427,21 @@ compressed bytes against the C oracle's directly. **Complete: one-shot
         large copies (raw/random blocks) already run at C speed. A safe
         cursor-based rewrite (resize-to-full + `copy_within` + manual overlap)
         is possible but pays an extra full-buffer memset for uncertain net gain.
-  - [ ] **Compression is the higher-headroom target.** Its gap is widest at the
-        fast levels (L1 ≈ 0.37x of C — match-finder / hashing bound, *not*
-        wildcopy-bound), so far more is recoverable in safe Rust there than in
-        the decode execution path.
+  - [x] **Compression match-extension `count_eq` word-at-a-time** (= `ZSTD_count`).
+        Phase-timing `compress_continue` showed match-finding is **62% of the
+        fast-level compress (L1), 88% at L6** (entropy is the rest), and within it
+        the *search* dominates — but the byte-at-a-time `count_eq` (the
+        match-extension primitive every strategy calls) was a clear, byte-exact
+        win: comparing eight bytes at a time (XOR two `u64`s, first diff at
+        `trailing_zeros / 8`) plus `#[inline]` on `read32`/`read64`/`hash_ptr`
+        for the cross-module match finders. **+12–30% compression at the
+        fast/mid levels** (text L3 0.48→0.62x, L1 0.37→0.43x), biggest at L3/dfast
+        where extension is heaviest; bit-exact (full differential suite green).
+  - [ ] Further compression headroom is in the **search loop** itself
+        (hash-chain / row / binary-tree candidate walking), which *is* the
+        algorithm — only its per-iteration cost (table-access bounds checks,
+        candidate compares) is reducible without changing the byte-exact match
+        decisions. Diminishing returns and higher risk than `count_eq`.
 
 ## Versioning note
 

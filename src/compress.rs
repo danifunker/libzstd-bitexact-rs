@@ -414,18 +414,36 @@ pub fn cparams_create_cdict_for_testing(level: i32, dict_size: u64) -> [u32; 7] 
 
 // --- Small shared helpers ------------------------------------------------------
 
+#[inline]
 pub(crate) fn read32(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
 }
 
+#[inline]
 pub(crate) fn read64(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(data[at..at + 8].try_into().unwrap())
 }
 
 /// `ZSTD_count`: length of the common run of `data[a..]` and `data[b..]`,
 /// reading no further than `limit` for the `a` cursor.
+///
+/// Hot match-extension primitive (every match across every strategy). Compares
+/// eight bytes at a time like `ZSTD_count`: XOR two little-endian `u64`s and the
+/// first differing byte is at `trailing_zeros / 8` (LSB ⇒ lowest offset). The
+/// word loop only runs while `a + 8 <= limit`, so it reads no further than the
+/// byte loop would (callers always pass `limit <= data.len()` and a match source
+/// `b < a`), and the count is identical to the byte-at-a-time version.
+#[inline]
 pub(crate) fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) -> usize {
     let start = a;
+    while a + 8 <= limit {
+        let diff = read64(data, a) ^ read64(data, b);
+        if diff != 0 {
+            return a - start + (diff.trailing_zeros() / 8) as usize;
+        }
+        a += 8;
+        b += 8;
+    }
     while a < limit && data[a] == data[b] {
         a += 1;
         b += 1;
@@ -435,6 +453,7 @@ pub(crate) fn count_eq(data: &[u8], mut a: usize, mut b: usize, limit: usize) ->
 
 /// `ZSTD_hashPtr` for `mls` in 4..=8 (8 is the double-fast long hash), hashing
 /// the bytes of `data` at `at`.
+#[inline]
 pub(crate) fn hash_ptr(data: &[u8], at: usize, hlog: u32, mls: u32) -> usize {
     const PRIME4: u32 = 2654435761;
     const PRIME5: u64 = 889523592379;

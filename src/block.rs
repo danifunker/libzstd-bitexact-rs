@@ -463,9 +463,12 @@ fn decode_and_execute_sequences(
         .get(pos)
         .ok_or(Error::Corrupted("missing sequence modes"))?;
     pos += 1;
-    if modes & 3 != 0 {
-        return Err(Error::Corrupted("reserved sequence mode bits set"));
-    }
+    // zstd 1.5.5 does NOT validate the two reserved low bits of the
+    // symbol-compression-modes byte: `RETURN_ERROR_IF(*ip & 3, corruption_detected)`
+    // was only added in 1.5.6. They don't affect decoding — the LL/OF/ML types
+    // come from bits 7..2 — so 1.5.5 silently accepts (and decodes) a frame with
+    // them set. Match that leniency for 1.5.5 parity; `tests/error_parity.rs`
+    // pins the accept/reject decision against the oracle.
     let mut input = &src[pos..];
     build_sequence_table(&mut ctx.ll, modes >> 6, &mut input, &LL_SPEC)?;
     build_sequence_table(&mut ctx.of, (modes >> 4) & 3, &mut input, &OF_SPEC)?;

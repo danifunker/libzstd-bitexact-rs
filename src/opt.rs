@@ -6,15 +6,13 @@
 //!
 //! The parser prices every reachable position of a lookahead window using
 //! adaptive symbol statistics (literals, literal lengths, match lengths,
-//! offset codes), finds the cheapest "stretch" chain, and emits it. Match
-//! candidates come from a binary tree (`ZSTD_insertBt1` / `ZSTD_updateTree` /
-//! `ZSTD_insertBtAndGetAllMatches`), plus a 3-byte hash table when
-//! `minMatch == 3`, plus the speculative repcode set.
-//!
-//! Port note: in 1.5.7 the shortest-path traversal contains `} {` (not
-//! `} else {`) after the `lastStretch.litlen > 0` branch, making that branch
-//! dead code — the unconditional block always wins. We reproduce the
-//! *effective* behavior.
+//! offset codes), finds the cheapest *sequence* chain, and emits it. In 1.5.5
+//! a DP cell is a sequence = "N literals then a match" (`mlen == 0` means
+//! literals only); 1.5.6 later reformulated this into "stretches" (a match
+//! then N literals). Match candidates come from a binary tree
+//! (`ZSTD_insertBt1` / `ZSTD_updateTree` / `ZSTD_insertBtAndGetAllMatches`),
+//! plus a 3-byte hash table when `minMatch == 3`, plus the speculative repcode
+//! set.
 
 use crate::block::{LL_BITS, ML_BITS};
 use crate::compress::{CParams, Strategy, Window, count_2segments, count_eq, hash_ptr, read32};
@@ -1281,9 +1279,9 @@ fn compress_block_opt_generic(
     ip += (ip == prefix_start) as usize;
 
     while (ip as i64) < i_limit {
-        let mut last_stretch = Optimal::default();
+        let mut last_sequence = Optimal::default();
         let mut cur: u32 = 0;
-        let mut last_pos: u32 = 0;
+        let mut last_pos: u32;
 
         // Labeled block standing in for the C `goto _shortestPath`.
         let found = 'forward: {
@@ -1314,33 +1312,37 @@ fn compress_block_opt_generic(
                 break 'forward false;
             }
 
-            // Initialize opt[0].
+            // Initialize opt[0]. In 1.5.5 a DP cell is a *sequence* = N
+            // literals then a match; `mlen == 0` means "literals only".
+            ctx.opt[0].rep = *rep;
             ctx.opt[0].mlen = 0;
             ctx.opt[0].litlen = litlen;
+            // The literals' actual price is static across the forward pass and
+            // included in every price; we carry only the litlen here.
             ctx.opt[0].price = ll_price(ctx, litlen);
-            ctx.opt[0].rep = *rep;
 
             // Large match -> immediate encoding.
             {
                 let max_ml = ctx.matches[nb_matches - 1].len;
-                let max_off = ctx.matches[nb_matches - 1].off;
+                let max_off_base = ctx.matches[nb_matches - 1].off;
                 if max_ml as usize > sufficient_len {
-                    last_stretch.litlen = 0;
-                    last_stretch.mlen = max_ml;
-                    last_stretch.off = max_off;
+                    last_sequence.litlen = litlen;
+                    last_sequence.mlen = max_ml;
+                    last_sequence.off = max_off_base;
                     cur = 0;
-                    last_pos = max_ml;
+                    // C also sets last_pos here, but it only feeds a DEBUGLOG we
+                    // drop; the backward traversal uses cur, not last_pos.
                     break 'forward true;
                 }
             }
 
-            // Set prices for first matches at position 0.
+            // Set prices for first matches starting position == 0.
             {
+                let literals_price = ctx.opt[0].price + ll_price(ctx, 0);
                 let mut pos = 1u32;
                 while pos < min_match {
+                    // mlen/litlen/price fixed during forward scanning.
                     ctx.opt[pos as usize].price = ZSTD_MAX_PRICE;
-                    ctx.opt[pos as usize].mlen = 0;
-                    ctx.opt[pos as usize].litlen = litlen + pos;
                     pos += 1;
                 }
                 for match_nb in 0..nb_matches {
@@ -1348,76 +1350,52 @@ fn compress_block_opt_generic(
                     let end = ctx.matches[match_nb].len;
                     while pos <= end {
                         let match_price = get_match_price(ctx, off_base, pos);
-                        let sequence_price = ctx.opt[0].price + match_price;
+                        let sequence_price = literals_price + match_price;
                         ctx.opt[pos as usize].mlen = pos;
                         ctx.opt[pos as usize].off = off_base;
-                        ctx.opt[pos as usize].litlen = 0;
-                        ctx.opt[pos as usize].price = sequence_price + ll_price(ctx, 0);
+                        ctx.opt[pos as usize].litlen = litlen;
+                        ctx.opt[pos as usize].price = sequence_price;
                         pos += 1;
                     }
                 }
                 last_pos = pos - 1;
-                ctx.opt[pos as usize].price = ZSTD_MAX_PRICE;
             }
 
             // Check further positions.
             cur = 1;
-            let mut went_to_shortest = false;
             while cur <= last_pos {
                 let inr = ip + cur as usize;
 
                 // Fix current position with one literal if cheaper.
                 {
-                    let litlen = ctx.opt[cur as usize - 1].litlen + 1;
+                    let litlen = if ctx.opt[cur as usize - 1].mlen == 0 {
+                        ctx.opt[cur as usize - 1].litlen + 1
+                    } else {
+                        1
+                    };
                     let price = ctx.opt[cur as usize - 1].price
                         + lit_price(ctx, data[to_pos(ip + cur as usize - 1)])
                         + ll_incprice(ctx, litlen);
                     if price <= ctx.opt[cur as usize].price {
-                        let prev_match = ctx.opt[cur as usize];
-                        ctx.opt[cur as usize] = ctx.opt[cur as usize - 1];
+                        ctx.opt[cur as usize].mlen = 0;
+                        ctx.opt[cur as usize].off = 0;
                         ctx.opt[cur as usize].litlen = litlen;
                         ctx.opt[cur as usize].price = price;
-                        if opt_level >= 1
-                            && prev_match.litlen == 0
-                            && ll_incprice(ctx, 1) < 0
-                            && ip + (cur as usize) < iend
-                        {
-                            let with1literal = prev_match.price
-                                + lit_price(ctx, data[to_pos(ip + cur as usize)])
-                                + ll_incprice(ctx, 1);
-                            let with_more = price
-                                + lit_price(ctx, data[to_pos(ip + cur as usize)])
-                                + ll_incprice(ctx, litlen + 1);
-                            if with1literal < with_more
-                                && with1literal < ctx.opt[cur as usize + 1].price
-                            {
-                                let prev = cur - prev_match.mlen;
-                                let new_reps = new_rep(
-                                    ctx.opt[prev as usize].rep,
-                                    prev_match.off,
-                                    ctx.opt[prev as usize].litlen == 0,
-                                );
-                                ctx.opt[cur as usize + 1] = prev_match;
-                                ctx.opt[cur as usize + 1].rep = new_reps;
-                                ctx.opt[cur as usize + 1].litlen = 1;
-                                ctx.opt[cur as usize + 1].price = with1literal;
-                                if last_pos < cur + 1 {
-                                    last_pos = cur + 1;
-                                }
-                            }
-                        }
                     }
                 }
 
-                // Offset history materializes once the position is settled.
-                if ctx.opt[cur as usize].litlen == 0 {
+                // Set the repcodes of the current position. We must do it here
+                // because the backward traversal relies on them being correct.
+                if ctx.opt[cur as usize].mlen != 0 {
                     let prev = cur - ctx.opt[cur as usize].mlen;
                     let new_reps = new_rep(
                         ctx.opt[prev as usize].rep,
                         ctx.opt[cur as usize].off,
-                        ctx.opt[prev as usize].litlen == 0,
+                        ctx.opt[cur as usize].litlen == 0,
                     );
                     ctx.opt[cur as usize].rep = new_reps;
+                } else {
+                    ctx.opt[cur as usize].rep = ctx.opt[cur as usize - 1].rep;
                 }
 
                 // Last match must start at a minimum distance of 8 from oend.
@@ -1437,7 +1415,12 @@ fn compress_block_opt_generic(
                 }
 
                 {
-                    let ll0 = ctx.opt[cur as usize].litlen == 0;
+                    let ll0 = ctx.opt[cur as usize].mlen != 0;
+                    let litlen = if ctx.opt[cur as usize].mlen == 0 {
+                        ctx.opt[cur as usize].litlen
+                    } else {
+                        0
+                    };
                     let base_price = ctx.opt[cur as usize].price + ll_price(ctx, 0);
                     let opt_rep = ctx.opt[cur as usize].rep;
                     let mut nb_matches = get_all_matches(
@@ -1465,19 +1448,25 @@ fn compress_block_opt_generic(
                         continue;
                     }
 
+                    let max_ml = ctx.matches[nb_matches - 1].len;
+                    if max_ml as usize > sufficient_len
+                        || cur as usize + max_ml as usize >= ZSTD_OPT_NUM
                     {
-                        let longest_ml = ctx.matches[nb_matches - 1].len;
-                        if longest_ml as usize > sufficient_len
-                            || cur as usize + longest_ml as usize >= ZSTD_OPT_NUM
-                            || (ip + cur as usize + longest_ml as usize) >= iend
-                        {
-                            last_stretch.mlen = longest_ml;
-                            last_stretch.off = ctx.matches[nb_matches - 1].off;
-                            last_stretch.litlen = 0;
-                            last_pos = cur + longest_ml;
-                            went_to_shortest = true;
-                            break;
+                        last_sequence.mlen = max_ml;
+                        last_sequence.off = ctx.matches[nb_matches - 1].off;
+                        last_sequence.litlen = litlen;
+                        // Last sequence is actually only literals: fix cur back
+                        // to the last match. May underflow => first match, ok.
+                        // `last_pos` is dead past here, so it is not recomputed.
+                        cur = cur.wrapping_sub(if ctx.opt[cur as usize].mlen == 0 {
+                            ctx.opt[cur as usize].litlen
+                        } else {
+                            0
+                        });
+                        if cur as usize > ZSTD_OPT_NUM {
+                            cur = 0;
                         }
+                        break 'forward true;
                     }
 
                     // Set prices using matches found at position cur.
@@ -1497,11 +1486,10 @@ fn compress_block_opt_generic(
                                 while last_pos < pos {
                                     last_pos += 1;
                                     ctx.opt[last_pos as usize].price = ZSTD_MAX_PRICE;
-                                    ctx.opt[last_pos as usize].litlen = 1; // != 0: not an end of match
                                 }
                                 ctx.opt[pos as usize].mlen = mlen;
                                 ctx.opt[pos as usize].off = offset;
-                                ctx.opt[pos as usize].litlen = 0;
+                                ctx.opt[pos as usize].litlen = litlen;
                                 ctx.opt[pos as usize].price = price;
                             } else if opt_level == 0 {
                                 break; // early update abort
@@ -1510,14 +1498,13 @@ fn compress_block_opt_generic(
                         }
                     }
                 }
-                ctx.opt[last_pos as usize + 1].price = ZSTD_MAX_PRICE;
                 cur += 1;
             }
 
-            if !went_to_shortest {
-                last_stretch = ctx.opt[last_pos as usize];
-                cur = last_pos - last_stretch.mlen;
-            }
+            last_sequence = ctx.opt[last_pos as usize];
+            let total_len = last_sequence.litlen + last_sequence.mlen;
+            // C: `last_pos > totalLen ? last_pos - totalLen : 0`.
+            cur = last_pos.saturating_sub(total_len);
             break 'forward true;
         };
 
@@ -1525,44 +1512,33 @@ fn compress_block_opt_generic(
             continue;
         }
 
-        // _shortestPath:
-        if last_stretch.mlen == 0 {
-            // No solution: all matches were converted into literals.
-            ip += last_pos as usize;
-            continue;
-        }
-
-        // Update offset history.
-        if last_stretch.litlen == 0 {
+        // _shortestPath: set the next chunk's repcodes from the repcodes at the
+        // start of the last match and the last sequence, so the backward
+        // traversal need not update them.
+        if last_sequence.mlen != 0 {
             let reps = new_rep(
                 ctx.opt[cur as usize].rep,
-                last_stretch.off,
-                ctx.opt[cur as usize].litlen == 0,
+                last_sequence.off,
+                last_sequence.litlen == 0,
             );
             *rep = reps;
         } else {
-            *rep = last_stretch.rep;
-            cur -= last_stretch.litlen;
+            *rep = ctx.opt[cur as usize].rep;
         }
 
-        // Reverse traversal: convert stretches into sequences. Note: the
-        // 1.5.7 source's `lastStretch.litlen > 0` branch here is dead code
-        // (`} {`, not `} else {`), so only the unconditional form survives.
+        // Reverse traversal: pack the chosen sequences into opt[storeStart..=
+        // storeEnd] back to front, then emit them front to back.
         {
-            let store_end = cur as usize + 2;
-            ctx.opt[store_end] = last_stretch;
+            let store_end = cur as usize + 1;
             let mut store_start = store_end;
-            let mut stretch_pos = cur as usize;
-
-            loop {
-                let next_stretch = ctx.opt[stretch_pos];
-                ctx.opt[store_start].litlen = next_stretch.litlen;
-                if next_stretch.mlen == 0 {
-                    break; // reached beginning of segment
-                }
+            let mut seq_pos = cur as usize;
+            ctx.opt[store_end] = last_sequence;
+            while seq_pos > 0 {
+                let back_dist = (ctx.opt[seq_pos].litlen + ctx.opt[seq_pos].mlen) as usize;
                 store_start -= 1;
-                ctx.opt[store_start] = next_stretch;
-                stretch_pos -= (next_stretch.litlen + next_stretch.mlen) as usize;
+                ctx.opt[store_start] = ctx.opt[seq_pos];
+                // C: `seqPos > backDist ? seqPos - backDist : 0`.
+                seq_pos = seq_pos.saturating_sub(back_dist);
             }
 
             // Save sequences.
@@ -1572,7 +1548,8 @@ fn compress_block_opt_generic(
                 let off_base = ctx.opt[store_pos].off;
 
                 if mlen == 0 {
-                    // Only literals: last "sequence" starts a new stream.
+                    // Only literals => must be the last "sequence"; do not
+                    // advance anchor (these literals lead the next match).
                     ip = anchor + llen as usize;
                     continue;
                 }

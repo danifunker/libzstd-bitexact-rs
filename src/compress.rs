@@ -2588,27 +2588,23 @@ fn compress_block_dfast(
             if idxs0 as usize >= prefix_start_index
                 && read32(data, to_pos(idxs0 as usize)) == read32(data, to_pos(ip))
             {
-                // _search_next_long: extend the short match, then probe the
-                // long table at ip1 for something better (validity strictly `>`).
-                let mut matchs0 = idxs0 as usize;
-                let mut len = count_eq(data, to_pos(ip) + 4, to_pos(matchs0) + 4, to_pos(iend)) + 4;
-                let mut offset = (ip - matchs0) as u32;
-
+                // _search_next_long: 1.5.5 takes the long match at ip1 (+1)
+                // whenever it exists, regardless of the short match's length.
+                // (1.5.6+ instead keeps whichever of the two is longer.)
+                let mut matchs0;
+                let mut len;
+                let offset;
                 if idxl1 as usize > prefix_start_index
                     && read64(data, to_pos(idxl1 as usize)) == read64(data, to_pos(ip1))
                 {
-                    let l1len = count_eq(
-                        data,
-                        to_pos(ip1) + 8,
-                        to_pos(idxl1 as usize) + 8,
-                        to_pos(iend),
-                    ) + 8;
-                    if l1len > len {
-                        ip = ip1;
-                        len = l1len;
-                        offset = (ip - idxl1 as usize) as u32;
-                        matchs0 = idxl1 as usize;
-                    }
+                    ip = ip1;
+                    matchs0 = idxl1 as usize;
+                    len = count_eq(data, to_pos(ip) + 8, to_pos(matchs0) + 8, to_pos(iend)) + 8;
+                    offset = (ip - matchs0) as u32;
+                } else {
+                    matchs0 = idxs0 as usize;
+                    len = count_eq(data, to_pos(ip) + 4, to_pos(matchs0) + 4, to_pos(iend)) + 4;
+                    offset = (ip - matchs0) as u32;
                 }
 
                 while ip > anchor

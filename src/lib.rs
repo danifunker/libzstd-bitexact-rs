@@ -44,6 +44,9 @@ mod ldm;
 mod literals_encode;
 mod opt;
 mod post_split;
+// Retained for parity with the 1.5.7 line; zstd 1.5.5 has no pre-block
+// splitter (`zstd_preSplit.c` is new in 1.5.6), so nothing calls it here.
+#[allow(dead_code)]
 mod pre_split;
 mod sequences_encode;
 mod stream;

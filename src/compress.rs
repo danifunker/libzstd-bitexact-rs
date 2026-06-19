@@ -14,13 +14,12 @@
 //! 27`, i.e. level 22 beyond 64 MiB), whose match finder ([`crate::ldm`]) is
 //! bit-exact. All nine strategies are implemented: fast and
 //! dfast here, greedy/lazy/lazy2/btlazy2 in [`crate::lazy`], and
-//! btopt/btultra/btultra2 in [`crate::opt`]. Block boundaries follow
-//! `ZSTD_optimalBlockSize` (the 1.5.7 pre-block splitter,
-//! [`crate::pre_split`]); the bt-opt strategies additionally run the
-//! post-block splitter ([`crate::post_split`]).
+//! btopt/btultra/btultra2 in [`crate::opt`]. zstd 1.5.5 predates the
+//! pre-block splitter (`zstd_preSplit.c`, new in 1.5.6), so input blocks
+//! are always full 128 KiB chunks (capped by what remains); the bt-opt
+//! strategies still post-split the resulting seqStore ([`crate::post_split`]).
 
 use crate::error::Error;
-use crate::pre_split;
 use crate::sequences_encode::{self, FseEntropyState, SeqStore};
 
 /// `ZSTD_WINDOW_START_INDEX`: indices 0 and 1 are reserved, so a hash-table
@@ -3164,11 +3163,10 @@ pub(crate) struct FrameCompressor {
     rep: [u32; 3],
     entropy: FseEntropyState,
     is_first_block: bool,
-    /// `cctx->consumedSrcSize` / `cctx->producedCSize`. Their difference seeds
-    /// the pre-splitter `savings` at each frame-chunk call; `produced`
-    /// includes the frame header, exactly as in C.
+    /// `cctx->consumedSrcSize`, tracked so streaming can enforce the pledged
+    /// source size. (zstd 1.5.5 predates the pre-block splitter, so the C
+    /// `producedCSize` / `savings` accounting it fed is dropped here.)
     consumed: u64,
-    produced: u64,
     /// `windowSize` per `ZSTD_resetCCtx_internal`:
     /// `max(1, min(1 << windowLog, pledgedSrcSize))`.
     window_size: usize,
@@ -3301,7 +3299,6 @@ impl FrameCompressor {
             entropy: FseEntropyState::new(),
             is_first_block: true,
             consumed: 0,
-            produced: 0,
             window_size: window_size_u64 as usize,
             block_size_max,
             pledged,
@@ -3355,7 +3352,6 @@ impl FrameCompressor {
         chunk_end: usize,
         last_frame_chunk: bool,
     ) -> Result<(), Error> {
-        let out_start = out.len();
         if self.stage == Stage::Init {
             write_frame_header(
                 out,
@@ -3367,8 +3363,7 @@ impl FrameCompressor {
             self.stage = Stage::Ongoing;
         }
         if chunk_start == chunk_end {
-            // Do not generate an empty block, but do count the header.
-            self.produced += (out.len() - out_start) as u64;
+            // Do not generate an empty block.
             return Ok(());
         }
 
@@ -3400,23 +3395,14 @@ impl FrameCompressor {
         }
 
         let cparams = self.cparams;
-        let mut savings: i64 = self.consumed as i64 - self.produced as i64;
         let mut pos = chunk_start;
         while pos < chunk_end {
             let remaining = chunk_end - pos;
-            // ZSTD_optimalBlockSize: only full 128 KiB blocks are candidates
-            // for pre-splitting, and only once at least 3 bytes of savings
-            // are verified (so the first full block is never split). The
-            // auto split level is `splitLevels[strategy]`.
-            let block_size = if remaining < BLOCK_SIZE_MAX || self.block_size_max < BLOCK_SIZE_MAX {
-                remaining.min(self.block_size_max)
-            } else if savings < 3 {
-                BLOCK_SIZE_MAX
-            } else {
-                const SPLIT_LEVELS: [usize; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
-                let split_level = SPLIT_LEVELS[cparams.strategy as usize];
-                pre_split::split_block(&data[pos..pos + BLOCK_SIZE_MAX], split_level)
-            };
+            // zstd 1.5.5 predates the pre-block splitter (`zstd_preSplit.c` is
+            // new in 1.5.6): every input block is a full `block_size_max` chunk
+            // (at most 128 KiB), capped only by what remains. The bt-opt
+            // strategies still post-split the resulting seqStore (below).
+            let block_size = remaining.min(self.block_size_max);
             let last_block = last_frame_chunk && block_size == remaining;
             let block = &data[pos..pos + block_size];
 
@@ -3657,7 +3643,7 @@ impl FrameCompressor {
                 // over block emission entirely: it may emit several blocks
                 // from this one seqStore, with dRep/cRep reconciliation.
                 if self.post_block_splitter {
-                    let c_size = crate::post_split::compress_block_split(
+                    crate::post_split::compress_block_split(
                         out,
                         &mut store,
                         &mut self.entropy,
@@ -3668,7 +3654,6 @@ impl FrameCompressor {
                         last_block,
                         self.is_first_block,
                     )?;
-                    savings += block_size as i64 - c_size as i64;
                     advance_ext_seqs(&mut self.ext_seqs, block_size);
                     pos += block_size;
                     self.is_first_block = false;
@@ -3701,25 +3686,21 @@ impl FrameCompressor {
                 }
             }
 
-            let c_size = match c_size_kind {
+            match c_size_kind {
                 BlockKind::Raw => {
                     push_block_header(out, last_block, 0, block_size);
                     out.extend_from_slice(block);
-                    BLOCK_HEADER_SIZE + block_size
                 }
                 BlockKind::Rle => {
                     push_block_header(out, last_block, 1, block_size);
                     out.push(block[0]);
-                    BLOCK_HEADER_SIZE + 1
                 }
                 BlockKind::Compressed => {
                     push_block_header(out, last_block, 2, body.len());
                     out.extend_from_slice(&body);
-                    BLOCK_HEADER_SIZE + body.len()
                 }
-            };
+            }
 
-            savings += block_size as i64 - c_size as i64;
             advance_ext_seqs(&mut self.ext_seqs, block_size);
             pos += block_size;
             self.is_first_block = false;
@@ -3731,7 +3712,6 @@ impl FrameCompressor {
             self.stage = Stage::Ending;
         }
         self.consumed += (chunk_end - chunk_start) as u64;
-        self.produced += (out.len() - out_start) as u64;
         if self.pledged.is_some_and(|n| self.consumed > n) {
             // `srcSize_wrong`: more input than pledged.
             return Err(Error::Encode("pledged source size exceeded"));

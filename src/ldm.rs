@@ -28,8 +28,13 @@ use crate::compress::{CParams, Strategy, Window, count_2segments, count_eq};
 use crate::error::Error;
 use crate::xxhash::xxh64;
 
-const LDM_BUCKET_SIZE_LOG: u32 = 4;
+// zstd 1.5.5 defaults. 1.5.6 retuned LDM_BUCKET_SIZE_LOG to 4 and made the
+// effective bucket/rate/minMatch strategy-derived (see `LdmParams::auto`).
+const LDM_BUCKET_SIZE_LOG: u32 = 3;
 const LDM_MIN_MATCH_LENGTH: u32 = 64;
+/// `LDM_HASH_RLOG`: the fixed window-to-hash log reduction 1.5.5 uses to size
+/// the LDM hash table (1.5.6 replaced it with the strategy-derived hashRateLog).
+const LDM_HASH_RLOG: u32 = 7;
 const LDM_BATCH_SIZE: usize = 64;
 const HASH_READ_SIZE: usize = 8;
 const ZSTD_HASHLOG_MIN: u32 = 6;
@@ -127,16 +132,21 @@ impl LdmParams {
             return None;
         }
         let window_log = cparams.window_log;
-        // hashRateLog: "mapping from [fast, rate7] to [btultra2, rate4]".
-        let hash_rate_log = 7 - (cparams.strategy as u32) / 3;
-        let hash_log = (window_log - hash_rate_log).clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
-        let mut min_match_length = LDM_MIN_MATCH_LENGTH;
-        if cparams.strategy >= Strategy::Btultra {
-            min_match_length /= 2;
-        }
-        let bucket_size_log = (cparams.strategy as u32)
-            .clamp(LDM_BUCKET_SIZE_LOG, ZSTD_LDM_BUCKETSIZELOG_MAX)
-            .min(hash_log);
+        // `ZSTD_ldm_adjustParameters` (1.5.5) with all-zero requested params.
+        // 1.5.6 retuned every default to be strategy-derived (hashRateLog =
+        // 7 - strategy/3, minMatch halved at btultra+, bucketSizeLog from the
+        // strategy); 1.5.5 uses fixed constants:
+        //   hashLog     = MAX(HASHLOG_MIN, windowLog - LDM_HASH_RLOG)
+        //   hashRateLog = windowLog < hashLog ? 0 : windowLog - hashLog
+        //   minMatch    = LDM_MIN_MATCH_LENGTH        (never halved)
+        //   bucketSize  = MIN(LDM_BUCKET_SIZE_LOG, hashLog)
+        const _: () = assert!(LDM_BUCKET_SIZE_LOG <= ZSTD_LDM_BUCKETSIZELOG_MAX);
+        let hash_log = (window_log - LDM_HASH_RLOG).max(ZSTD_HASHLOG_MIN);
+        debug_assert!(hash_log <= ZSTD_HASHLOG_MAX);
+        // C: `windowLog < hashLog ? 0 : windowLog - hashLog`.
+        let hash_rate_log = window_log.saturating_sub(hash_log);
+        let min_match_length = LDM_MIN_MATCH_LENGTH;
+        let bucket_size_log = LDM_BUCKET_SIZE_LOG.min(hash_log);
         Some(LdmParams {
             hash_log,
             bucket_size_log,

@@ -2208,8 +2208,12 @@ fn compress_block_dfast_dict_match_state(
                     }
                     break 'found (off, ml);
                 }
-                // dict long match
-                if dict_tags_match_l {
+                // dict long match. 1.5.5 reaches this only when the working long
+                // index is *not* above the prefix (C's `else if (dictTagsMatchL)`,
+                // bound to `matchIndexL > prefixLowestIndex`); 1.5.6 merged that
+                // index test into the prefix byte-compare, which also lets the dict
+                // arm run after a prefix-byte miss.
+                if match_index_l <= prefix_lowest_index && dict_tags_match_l {
                     let dml = dict_idx_tag_l >> SHORT_CACHE_TAG_BITS;
                     if dml > dict_start_index
                         && read64(data, dml as usize - bias) == read64(data, ip - bias)
@@ -2284,8 +2288,10 @@ fn compress_block_dfast_dict_match_state(
                     }
                     break 'found (off, ml);
                 }
-                // dict long +1 match
-                if dict_tags_match_l3 {
+                // dict long +1 match — same 1.5.5 `else if` gating as the long
+                // match above (only when the working long index isn't above the
+                // prefix; 1.5.6 merged the index test into the byte-compare).
+                if match_index_l3 <= prefix_lowest_index && dict_tags_match_l3 {
                     let dml3 = dict_idx_tag_l3 >> SHORT_CACHE_TAG_BITS;
                     if dml3 > dict_start_index
                         && read64(data, dml3 as usize - bias) == read64(data, (ip + 1) - bias)

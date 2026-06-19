@@ -1078,8 +1078,10 @@ fn compress_block_fast_dict_match_state(
                 }
             }
 
-            // 3. ordinary match in the working context.
-            if match_index >= prefix_start_index
+            // 3. ordinary match in the working context. 1.5.5 requires the
+            // match index strictly past the prefix start; 1.5.6 relaxed this to
+            // `>=` (matching exactly at the boundary), via `ZSTD_match4Found`.
+            if match_index > prefix_start_index
                 && read32(data, match_index as usize - bias) == read32(data, ip0 - bias)
             {
                 let offset = curr - match_index;
@@ -2184,8 +2186,8 @@ fn compress_block_dfast_dict_match_state(
             // (offset, matchLength) with `ip` already rewound by the catch-up,
             // or `continue`s the outer loop when nothing is found.
             let (offset, ml) = 'found: {
-                // prefix long match
-                if match_index_l >= prefix_lowest_index
+                // prefix long match (1.5.5: strictly `>`; 1.5.6+ relaxed to `>=`)
+                if match_index_l > prefix_lowest_index
                     && read64(data, match_index_l as usize - bias) == read64(data, ip - bias)
                 {
                     let mut ml = 8 + count_eq(
@@ -2259,8 +2261,8 @@ fn compress_block_dfast_dict_match_state(
                     (dict_idx_tag_l3 & tag_mask) == (dict_hat_l3 as u32 & tag_mask);
                 ctx.hash_long[hl3] = curr + 1;
 
-                // prefix long +1 match
-                if match_index_l3 >= prefix_lowest_index
+                // prefix long +1 match (1.5.5: strictly `>`; 1.5.6+ `>=`)
+                if match_index_l3 > prefix_lowest_index
                     && read64(data, match_index_l3 as usize - bias) == read64(data, (ip + 1) - bias)
                 {
                     let mut ml = 8 + count_eq(

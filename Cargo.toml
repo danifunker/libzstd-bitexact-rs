@@ -1,12 +1,15 @@
 [package]
 name = "libzstd-bitexact-rs"
 # Version scheme: 0.<zstd-version-digits>.<our-patch>. The minor encodes the
-# upstream zstd release this crate is bit-exact with (1.5.7 -> 157); the patch
-# counts our own fixes against that target (0.157.1, 0.157.2, ...). The leading
+# upstream zstd release this crate is bit-exact with (1.5.5 -> 155); the patch
+# counts our own fixes against that target (0.155.1, 0.155.2, ...). The leading
 # 0 marks the public API as still unstable. Retargeting a new zstd bumps the
-# minor (1.5.8 -> 0.158.0). Keep in sync with the git tag (v0.157.0) and the
+# minor (1.5.8 -> 0.158.0). Keep in sync with the git tag (v0.155.0) and the
 # zstd-sys pin in dev-dependencies.
-version = "0.157.0"
+#
+# This is the zstd-1.5.5 line (parallel to main's 1.5.7 / 0.157.x). The decoder
+# is format-stable and shared; only the compressor is retargeted to 1.5.5.
+version = "0.155.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Pure-Rust reimplementation of Zstandard, aiming for bit-exact parity with the C libzstd"
@@ -29,11 +32,14 @@ exclude = ["/.github", "/CLAUDE.md"]
 # `zstdmt` builds the vendored C with multithreading so the ZSTDMT
 # (job-splitting) output can be differential-tested; the library itself stays
 # single-threaded and dependency-free.
-zstd = { version = "0.13", features = ["zstdmt"] }
+#
+# Pinned to the 1.5.5-bundling releases: zstd 0.13.0 / zstd-sys 2.0.9+zstd.1.5.5
+# (the 1.5.7 line on main uses zstd 0.13.x / zstd-sys 2.0.16+zstd.1.5.7).
+zstd = { version = "=0.13.0", features = ["zstdmt"] }
 # Raw FFI to the same bundled libzstd, for oracle introspection in tests
 # (e.g. asking C which compression parameters it derives). `experimental`
 # exposes the ZSTD_STATIC_LINKING_ONLY API surface with pregenerated bindings.
-zstd-sys = { version = "2.0.16", default-features = false, features = [
+zstd-sys = { version = "=2.0.9", default-features = false, features = [
     "experimental",
     "std",
 ] }

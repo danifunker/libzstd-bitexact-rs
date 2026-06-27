@@ -1,5 +1,5 @@
 //! Streaming compression with `ZSTD_compressStream2` semantics, aiming for
-//! **byte-identical output to C libzstd 1.5.7** for the same sequence of
+//! **byte-identical output to C libzstd 1.5.5** for the same sequence of
 //! compress/flush/finish operations.
 //!
 //! This is a port of the buffered-mode path (`ZSTD_bm_buffered`, the
@@ -49,7 +49,7 @@ enum EndOp {
 ///
 /// Output produced by a given sequence of [`compress`](Self::compress),
 /// [`flush`](Self::flush) and [`finish`](Self::finish) calls is byte-identical
-/// to C libzstd 1.5.7 fed the same input chunks with the same
+/// to C libzstd 1.5.5 fed the same input chunks with the same
 /// `ZSTD_e_continue` / `ZSTD_e_flush` / `ZSTD_e_end` directives.
 ///
 /// ```

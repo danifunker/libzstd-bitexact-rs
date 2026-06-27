@@ -10,7 +10,7 @@ name = "libzstd-bitexact-rs"
 #
 # This is the zstd-1.5.5 line (parallel to main's 1.5.7 / 0.157.x). The decoder
 # is format-stable and shared; only the compressor is retargeted to 1.5.5.
-version = "0.155.0"
+version = "0.155.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Pure-Rust reimplementation of Zstandard, aiming for bit-exact parity with the C libzstd"

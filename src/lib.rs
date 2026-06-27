@@ -4,7 +4,7 @@
 //! Decompression is complete: dictionaries (raw-content and trained/`ZDICT`),
 //! a configurable `windowLogMax`, and a [`Read`]-based [`StreamDecoder`] with
 //! a bounded sliding window. [`compress`] produces frames **byte-identical to
-//! C libzstd 1.5.7 at every level** (1–22 and the negative levels), and
+//! C libzstd 1.5.5 at every level** (1–22 and the negative levels), and
 //! [`StreamEncoder`] mirrors `ZSTD_compressStream2` flush/end behavior (see
 //! its docs for the current streaming length scope). Every table and loop is
 //! a faithful port of its counterpart in the C sources, and the crate is

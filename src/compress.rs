@@ -1,5 +1,5 @@
 //! One-shot compression (`ZSTD_compress`), aiming for **byte-identical output
-//! to C libzstd 1.5.7**: parameter derivation (`ZSTD_getCParams` /
+//! to C libzstd 1.5.5**: parameter derivation (`ZSTD_getCParams` /
 //! `ZSTD_adjustCParams`), the match finders, and frame assembly
 //! (`ZSTD_writeFrameHeader` / `ZSTD_compress_frameChunk` /
 //! `ZSTD_compressBlock_internal`).
@@ -3753,7 +3753,7 @@ impl FrameCompressor {
 /// `ZSTD_compress`: one-shot frame compression with the simple-API defaults
 /// (contentSize known and flagged, no checksum, no dictionary).
 ///
-/// Bit-exact with C libzstd 1.5.7 for the supported scope (see module docs);
+/// Bit-exact with C libzstd 1.5.5 for the supported scope (see module docs);
 /// unsupported configurations return [`Error::Encode`] rather than diverging.
 pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
     // Match indices are 32-bit; larger inputs need the C window-cycling
@@ -3763,7 +3763,7 @@ pub fn compress(src: &[u8], level: i32) -> Result<Vec<u8>, Error> {
 
 /// `ZSTD_compress_usingDict`: one-shot frame compression primed with a
 /// dictionary, so the start of `src` can reference `dict`. Bit-exact with C
-/// libzstd 1.5.7 for the supported scope; unsupported configurations return
+/// libzstd 1.5.5 for the supported scope; unsupported configurations return
 /// [`Error::Encode`] rather than diverging.
 ///
 /// Current scope: raw / content-only **and** trained (`ZDICT`) dictionaries at
@@ -4031,7 +4031,7 @@ fn compress_mt_job(
 }
 
 /// `ZSTD_compress2` with `nbWorkers >= 1` (multithreaded / job-splitting mode).
-/// Bit-exact with C libzstd 1.5.7's MT output, reproduced **single-threaded**:
+/// Bit-exact with C libzstd 1.5.5's MT output, reproduced **single-threaded**:
 /// the input is split into `jobSize`-byte jobs, each compressed with the
 /// previous job's overlap tail as a raw-content prefix and reset repcodes, then
 /// the per-job block streams are concatenated into one frame.

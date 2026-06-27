@@ -39,16 +39,19 @@ carries the full differential suite and the pinned C oracle:
   `cparams_differential`, `differential`, `dictionary`, `streaming`,
   `long_distance`, `error_parity`, `fuzz_smoke`.
 
-The **library source (`src/`) is byte-identical between the current `HEAD` and
-`v0.155.0`** — only tests, the bench, the fuzz package, and the dev-deps were
-removed afterward. Confirm it for yourself:
+The **compiled library is unchanged** between the current `HEAD` and the proven
+`v0.155.0`: the only differences in `src/` since the tag are documentation
+comments (the `1.5.7`→`1.5.5` doc-string corrections shipped in `0.155.1`), which
+the compiler ignores. Tests, the bench, the fuzz package, and the dev-deps were
+removed afterward, but no compressor or decoder code changed. Confirm there is no
+behavioral change for yourself:
 
 ```sh
-git diff v0.155.0 HEAD -- src/      # empty output = library code is unchanged
+git diff v0.155.0 HEAD -- src/      # only //! / /// comment lines, no code
 ```
 
-Because the compressor/decoder code is unchanged, the proof recorded at the tag
-applies verbatim to the current code.
+Because the compiled compressor/decoder is identical, the proof recorded at the
+tag applies verbatim to the current code.
 
 ## Reproducing the proof (out-of-tree)
 

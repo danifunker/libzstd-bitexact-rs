@@ -5,11 +5,13 @@ is implemented; compression parity is the long-term goal (see ROADMAP.md).
 
 ## Commands
 
-- `cargo test` — full suite (unit + handcrafted vectors + differential).
-- `cargo test --release` — what CI gates on for the heavy differential tests.
+- `cargo test` — pure-Rust suite (in-crate unit tests + `tests/format.rs` decode
+  vectors + `tests/fuzz_smoke.rs` robustness). No C toolchain or dependencies.
+- `cargo test --release` — same, optimized (what CI runs).
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` — CI lints.
-- The differential tests build the bundled C libzstd via the `zstd` crate, so
-  a C toolchain (MSVC here) must be available.
+- The C-oracle **differential suite** that proves bit-exactness is archived in
+  git at tag `v0.155.0` (removed from the tree to keep it C-free); reproduce it
+  out-of-tree per `docs/validating-bit-exactness.md`.
 
 ## Architecture
 
@@ -32,9 +34,11 @@ FSE tables for repeat mode, repeat-offset history).
 - Sequence-code constants in `block.rs` were verified verbatim against
   `lib/common/zstd_internal.h` and `lib/decompress/zstd_decompress_internal.h`
   of facebook/zstd — don't "fix" them by intuition.
-- New decoder behavior needs a differential test against the C oracle, not
-  just a hand-written expectation. When accept/reject behavior differs from
-  C intentionally (e.g. unsupported features), note it in the code.
+- New behavior needs a differential test against the C oracle, not just a
+  hand-written expectation. The oracle suite lives in git at tag `v0.155.0` —
+  restore it to re-validate (see `docs/validating-bit-exactness.md`). When
+  accept/reject behavior differs from C intentionally (e.g. unsupported
+  features), note it in the code.
 
 ## Gotchas
 

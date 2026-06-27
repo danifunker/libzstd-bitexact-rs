@@ -4,8 +4,9 @@ name = "libzstd-bitexact-rs"
 # upstream zstd release this crate is bit-exact with (1.5.5 -> 155); the patch
 # counts our own fixes against that target (0.155.1, 0.155.2, ...). The leading
 # 0 marks the public API as still unstable. Retargeting a new zstd bumps the
-# minor (1.5.8 -> 0.158.0). Keep in sync with the git tag (v0.155.0) and the
-# zstd-sys pin in dev-dependencies.
+# minor (1.5.8 -> 0.158.0). Keep in sync with the git tag (v0.155.0); the C
+# oracle that proved this target was removed from the tree — see
+# docs/validating-bit-exactness.md.
 #
 # This is the zstd-1.5.5 line (parallel to main's 1.5.7 / 0.157.x). The decoder
 # is format-stable and shared; only the compressor is retargeted to 1.5.5.
@@ -19,36 +20,24 @@ keywords = ["zstd", "zstandard", "compression", "decompression"]
 categories = ["compression"]
 readme = "README.md"
 documentation = "https://docs.rs/libzstd-bitexact-rs"
-# Keep the published package to the library and its proof: ship src, tests,
-# benches, examples, README/ROADMAP/LICENSE. Drop the AI dev guide and the CI
-# config (fuzz/ is a separate package cargo already excludes).
+# Keep the published package lean: ship src, the decode tests, examples, docs,
+# and README/ROADMAP/LICENSE. Drop the AI dev guide and the CI config.
 exclude = ["/.github", "/CLAUDE.md"]
 
 [dependencies]
 # Intentionally empty: the implementation is dependency-free.
 
-[dev-dependencies]
-# The real C libzstd, used exclusively as the differential-testing oracle.
-# `zstdmt` builds the vendored C with multithreading so the ZSTDMT
-# (job-splitting) output can be differential-tested; the library itself stays
-# single-threaded and dependency-free.
+# No [dev-dependencies]. The C-libzstd differential oracle (the `zstd` /
+# `zstd-sys` dev-deps) was removed once this 1.5.5-bit-exact line was proven and
+# published as 0.155.0: the whole project — library, the decode tests in
+# tests/format.rs, the in-crate unit tests, and examples — now builds and tests
+# with zero C and no third-party crates, so no C toolchain is required.
 #
-# Pinned to the 1.5.5-bundling releases: zstd 0.13.0 / zstd-sys 2.0.9+zstd.1.5.5
-# (the 1.5.7 line on main uses zstd 0.13.x / zstd-sys 2.0.16+zstd.1.5.7).
-zstd = { version = "=0.13.0", features = ["zstdmt"] }
-# Raw FFI to the same bundled libzstd, for oracle introspection in tests
-# (e.g. asking C which compression parameters it derives). `experimental`
-# exposes the ZSTD_STATIC_LINKING_ONLY API surface with pregenerated bindings.
-zstd-sys = { version = "=2.0.9", default-features = false, features = [
-    "experimental",
-    "std",
-] }
-
-# Throughput benchmark (ours vs the C oracle). Custom timer harness, so it
-# pulls in no new dependencies and leaves the pinned Cargo.lock untouched.
-[[bench]]
-name = "throughput"
-harness = false
+# The differential suite that proved bit-exactness against C libzstd 1.5.5 is
+# preserved in git history at tag v0.155.0. If a future 0.155.x patch ever needs
+# re-verification, restore it with:
+#     git checkout v0.155.0 -- tests benches Cargo.toml Cargo.lock
+# (re-adds the zstd/zstd-sys dev-deps), verify, then revert.
 
 [profile.dev]
 # The decoder is exercised on megabytes of data in tests; opt-level 1 keeps

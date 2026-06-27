@@ -7,9 +7,10 @@ Most Rust compression ports settle for "produces valid output". This project
 holds itself to a stricter standard: for any input, behavior indistinguishable
 from C libzstd — identical decompressed bytes, matching accept/reject
 decisions on malformed data, and identical *compressed* bytes at **every
-compression level** (pinned to the zstd version bundled by `zstd-sys`,
-currently 1.5.7). Bit-exactness is enforced mechanically, by
-differential-testing every code path against the real libzstd, not by review.
+compression level** — this is the **zstd 1.5.5** line (see
+[Versioning](#versioning)). Bit-exactness is enforced mechanically, by
+differential-testing every code path against the real libzstd, not by review
+(reproduce the proof: [validating bit-exactness](docs/validating-bit-exactness.md)).
 
 ## Status
 
@@ -21,7 +22,7 @@ differential-testing every code path against the real libzstd, not by review.
 | Dictionaries (raw-content and trained/ZDICT) | ✅ implemented |
 | `windowLogMax` enforcement | ✅ implemented |
 | Streaming decompression (`Read`-based, bounded sliding window) | ✅ implemented |
-| Differential harness, error-parity audit, `cargo-fuzz` targets | ✅ in CI |
+| Differential proof vs C libzstd 1.5.5, error-parity audit | ✅ proven for 0.155.0 — reproduce via [the validation doc](docs/validating-bit-exactness.md) |
 | **Compression, bit-exact with C — every level (1–22 and negatives)** | ✅ byte-identical, differential-tested |
 | Streaming compression (`ZSTD_compressStream2` flush/end parity) | ✅ byte-identical; unlimited length at every level¹ |
 | Dictionary compression (raw + trained/ZDICT, all 9 strategies, `usingDict` + `CDict` paths) | ✅ byte-identical |
@@ -45,10 +46,9 @@ all byte-identical to the C `zstdmt` oracle.
 
 ## Performance
 
-Correctness is the headline; speed is being worked level by level (`cargo bench`
-runs a throughput comparison against the bundled C oracle, reporting MiB/s like
-`zstd -b`). Single-threaded on a typical x86-64 desktop, both directions are
-within ~2–2.5x of C libzstd while remaining `#![forbid(unsafe_code)]`:
+Correctness is the headline; speed was worked level by level. Single-threaded on
+a typical x86-64 desktop, both directions measured within ~2–2.5x of C libzstd
+while remaining `#![forbid(unsafe_code)]`:
 
 - **Compression** ≈ 0.4–0.6x of C at the fast levels, closing to ~parity (≈1.0x)
   at the highest levels, where the optimal parser dominates the cost.
@@ -117,43 +117,43 @@ enc.finish(b"", &mut frame)?;
   for accept/reject parity against C's streaming decoder. Random-input probes
   assert we never accept data the C decoder rejects.
 - **No `unsafe`, no dependencies.** The library is `#![forbid(unsafe_code)]`
-  and dependency-free; the C oracle appears only as a dev-dependency.
+  and dependency-free — and on this 1.5.5 line so is the whole project: the C
+  oracle that proves bit-exactness lives only in git history now, reproduced
+  out-of-tree (see [validating bit-exactness](docs/validating-bit-exactness.md)).
 - **Correctness first, speed second.** Optimizations come only after parity
   is locked in by tests.
 
 ## Testing
 
+This crate builds and tests in **pure Rust — no C toolchain, no dependencies**:
+
 ```sh
-cargo test            # unit + handcrafted vectors + differential suite
+cargo test            # in-crate unit tests + tests/format.rs decode vectors + tests/fuzz_smoke.rs robustness
 cargo test --release  # same, optimized (used in CI)
 ```
 
-The differential suite (`tests/differential.rs`) needs to build the bundled C
-libzstd, so a C compiler is required for development — but not to use the
-crate.
+`tests/fuzz_smoke.rs` builds frames with this crate's own compressor, then
+mutates and truncates them to assert the decoder never panics or runs away on
+arbitrary input.
 
-There are also `cargo-fuzz` targets under `fuzz/` that compare against the C
-decoder — `decode_never_panic` (arbitrary input must never panic or run away
-on memory) and `decode_equivalence` (anything we accept, C must accept and
-decode identically):
-
-```sh
-cargo +nightly fuzz run decode_equivalence
-```
-
-Both properties also run deterministically over a generated corpus in
-`tests/fuzz_smoke.rs`, so plain `cargo test` exercises them without a nightly
-toolchain.
+The **bit-exactness claims above** — identical compressed and decompressed bytes
+vs C libzstd 1.5.5, at every level, with dictionaries, LDM, and ZSTDMT — are
+proven by a differential suite that runs this crate against the real C libzstd
+1.5.5 as an oracle. To keep the repository C-free, that suite was archived in git
+history at tag `v0.155.0` once `0.155.0` was published and CI-green. Reproducing
+the proof is a two-command worktree checkout that never adds C to this repo — see
+**[validating bit-exactness](docs/validating-bit-exactness.md)**.
 
 ## Versioning
 
 The crate version encodes the upstream zstd release it is bit-exact with:
-`0.<zstd digits>.<patch>`. So **`0.157.x` targets zstd 1.5.7**, and the patch
-component (`0.157.0`, `0.157.1`, …) counts this crate's own fixes against that
-target. Retargeting a newer zstd bumps the minor (zstd 1.5.8 → `0.158.0`). The
-leading `0.` marks the public API as still pre-1.0. Bit-exactness is only
-meaningful against a single upstream release, so the targeted version is pinned
-(see `Cargo.lock` and the `zstd-sys` dev-dependency).
+`0.<zstd digits>.<patch>`. **This is the `0.155.x` line — bit-exact with zstd
+1.5.5** (the parallel `0.157.x` line targets zstd 1.5.7); the patch component
+(`0.155.0`, `0.155.1`, …) counts this crate's own fixes against that target.
+Retargeting a newer zstd bumps the minor (zstd 1.5.8 → `0.158.0`). The leading
+`0.` marks the public API as still pre-1.0. Bit-exactness is only meaningful
+against a single upstream release, so the target is fixed at 1.5.5 — see
+[validating bit-exactness](docs/validating-bit-exactness.md).
 
 ## License
 

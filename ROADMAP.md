@@ -4,6 +4,12 @@ The destination: a drop-in pure-Rust libzstd whose observable behavior —
 decompressed bytes, compressed bytes at every level, and accept/reject
 decisions — is bit-identical to the C implementation.
 
+> Note (0.155.x / zstd 1.5.5 line): the milestones below were each gated by a
+> differential test against C libzstd 1.5.5 (the `tests/*_differential.rs`
+> files referenced throughout). That C-oracle suite was archived in git at tag
+> `v0.155.0` to keep the repository C-free; the milestone records stand, and the
+> proof is reproducible out-of-tree per `docs/validating-bit-exactness.md`.
+
 ## M0 — Project skeleton ✅
 
 - [x] Crate scaffolding, CI, differential-test harness against C libzstd.
